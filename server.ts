@@ -25,8 +25,22 @@ import {
   chmodSync,
   existsSync,
   renameSync,
-  unlinkSync,
 } from 'fs'
+import {
+  defaultAccess,
+  pruneExpired,
+  generateCode as _generateCode,
+  assertSendable as libAssertSendable,
+  assertOutboundAllowed as libAssertOutboundAllowed,
+  chunkText,
+  sanitizeFilename,
+  gate as libGate,
+  type Access,
+  type GateResult,
+} from './lib.ts'
+
+// Re-export constants so they stay in one place (lib.ts)
+export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,47 +51,6 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DEFAULT_CHUNK_LIMIT = 4000
-const MAX_PENDING = 3
-const MAX_PAIRING_REPLIES = 2
-const PAIRING_EXPIRY_MS = 60 * 60 * 1000 // 1 hour
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-type DmPolicy = 'pairing' | 'allowlist' | 'disabled'
-
-interface ChannelPolicy {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-interface PendingEntry {
-  senderId: string
-  chatId: string
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-interface Access {
-  dmPolicy: DmPolicy
-  allowFrom: string[]
-  channels: Record<string, ChannelPolicy>
-  pending: Record<string, PendingEntry>
-  ackReaction?: string
-  textChunkLimit?: number
-  chunkMode?: 'length' | 'newline'
-}
-
-type GateAction = 'deliver' | 'drop' | 'pair'
-
-interface GateResult {
-  action: GateAction
-  access?: Access
-  code?: string
-  isResend?: boolean
-}
 
 // ---------------------------------------------------------------------------
 // Bootstrap — tokens & state directory
@@ -143,15 +116,6 @@ let botUserId = ''
 // Access control — load / save / prune
 // ---------------------------------------------------------------------------
 
-function defaultAccess(): Access {
-  return {
-    dmPolicy: 'pairing',
-    allowFrom: [],
-    channels: {},
-    pending: {},
-  }
-}
-
 function loadAccess(): Access {
   if (!existsSync(ACCESS_FILE)) return defaultAccess()
   try {
@@ -172,24 +136,6 @@ function saveAccess(access: Access): void {
   writeFileSync(tmp, JSON.stringify(access, null, 2), 'utf-8')
   chmodSync(tmp, 0o600)
   renameSync(tmp, ACCESS_FILE)
-}
-
-function pruneExpired(access: Access): void {
-  const now = Date.now()
-  for (const [code, entry] of Object.entries(access.pending)) {
-    if (entry.expiresAt <= now) {
-      delete access.pending[code]
-    }
-  }
-}
-
-function generateCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // No 0/O/1/I confusion
-  let code = ''
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)]
-  }
-  return code
 }
 
 // ---------------------------------------------------------------------------
@@ -220,158 +166,31 @@ function getAccess(): Access {
 // ---------------------------------------------------------------------------
 
 function assertSendable(filePath: string): void {
-  const resolved = resolve(filePath)
-  const stateResolved = resolve(STATE_DIR)
-  const inboxResolved = resolve(INBOX_DIR)
-
-  if (resolved.startsWith(stateResolved) && !resolved.startsWith(inboxResolved)) {
-    throw new Error(
-      `Blocked: cannot send files from state directory (${stateResolved}). ` +
-        'Only files in inbox/ are sendable.',
-    )
-  }
+  libAssertSendable(filePath, resolve(STATE_DIR), resolve(INBOX_DIR))
 }
 
 // ---------------------------------------------------------------------------
 // Security — outbound gate
 // ---------------------------------------------------------------------------
 
-function assertOutboundAllowed(chatId: string): void {
-  const access = getAccess()
-
-  // Check DM allowlist
-  if (access.allowFrom.length > 0) {
-    // We can't know if chatId is a DM just from the ID, but we track allowed channels
-    // For DMs, the chatId is the DM channel ID — we rely on inbound gate having delivered from it
-  }
-
-  // Check channel opt-in
-  if (access.channels[chatId]) return
-
-  // For DMs from allowlisted users, the channel ID won't be in access.channels
-  // but was accepted by inbound gate. Track delivered channels.
-  if (deliveredChannels.has(chatId)) return
-
-  throw new Error(
-    `Outbound gate: channel ${chatId} is not in the allowlist or opted-in channels.`,
-  )
-}
-
 // Track channels that passed inbound gate (session-lifetime cache)
 const deliveredChannels = new Set<string>()
 
-// ---------------------------------------------------------------------------
-// Text chunking
-// ---------------------------------------------------------------------------
-
-function chunkText(text: string, limit: number, mode: 'length' | 'newline'): string[] {
-  if (text.length <= limit) return [text]
-
-  const chunks: string[] = []
-
-  if (mode === 'newline') {
-    let current = ''
-    for (const line of text.split('\n')) {
-      if (current.length + line.length + 1 > limit && current.length > 0) {
-        chunks.push(current)
-        current = ''
-      }
-      current += (current ? '\n' : '') + line
-    }
-    if (current) chunks.push(current)
-  } else {
-    for (let i = 0; i < text.length; i += limit) {
-      chunks.push(text.slice(i, i + limit))
-    }
-  }
-
-  return chunks
+function assertOutboundAllowed(chatId: string): void {
+  libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
 }
 
 // ---------------------------------------------------------------------------
-// Attachment sanitization
+// Gate function (wires up getAccess/saveAccess/botUserId for production use)
 // ---------------------------------------------------------------------------
 
-function sanitizeFilename(name: string): string {
-  return name.replace(/[\[\]\n\r;]/g, '_').replace(/\.\./g, '_')
-}
-
-// ---------------------------------------------------------------------------
-// Gate function
-// ---------------------------------------------------------------------------
-
-async function gate(event: any): Promise<GateResult> {
-  // 1. Drop bot messages immediately
-  if (event.bot_id) return { action: 'drop' }
-
-  // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (event.subtype && event.subtype !== 'file_share') return { action: 'drop' }
-
-  // 3. No user ID = drop
-  if (!event.user) return { action: 'drop' }
-
-  // 4. Load access, prune expired codes
-  const access = getAccess()
-
-  // 5. DM handling
-  if (event.channel_type === 'im') {
-    if (access.allowFrom.includes(event.user)) {
-      return { action: 'deliver', access }
-    }
-    if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
-      return { action: 'drop' }
-    }
-
-    // Pairing mode
-    // Check if there's already a pending code for this user
-    for (const [code, entry] of Object.entries(access.pending)) {
-      if (entry.senderId === event.user) {
-        if (entry.replies < MAX_PAIRING_REPLIES) {
-          entry.replies++
-          if (!STATIC_MODE) saveAccess(access)
-          return { action: 'pair', code, isResend: true }
-        }
-        return { action: 'drop' } // Hit reply cap
-      }
-    }
-
-    // Cap total pending
-    if (Object.keys(access.pending).length >= MAX_PENDING) {
-      return { action: 'drop' }
-    }
-
-    // Generate new pairing code
-    const code = generateCode()
-    access.pending[code] = {
-      senderId: event.user,
-      chatId: event.channel,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + PAIRING_EXPIRY_MS,
-      replies: 1,
-    }
-    if (!STATIC_MODE) saveAccess(access)
-    return { action: 'pair', code, isResend: false }
-  }
-
-  // 6. Channel handling — opt-in per channel ID
-  const policy = access.channels[event.channel]
-  if (!policy) return { action: 'drop' }
-
-  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(event.user)) {
-    return { action: 'drop' }
-  }
-
-  if (policy.requireMention && !isMentioned(event)) {
-    return { action: 'drop' }
-  }
-
-  return { action: 'deliver', access }
-}
-
-function isMentioned(event: any): boolean {
-  if (!botUserId) return false
-  const text: string = event.text || ''
-  return text.includes(`<@${botUserId}>`)
+async function gate(event: unknown): Promise<GateResult> {
+  return libGate(event, {
+    access: getAccess(),
+    staticMode: STATIC_MODE,
+    saveAccess,
+    botUserId,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -719,8 +538,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Inbound message handler
 // ---------------------------------------------------------------------------
 
-async function handleMessage(event: any): Promise<void> {
+async function handleMessage(event: unknown): Promise<void> {
   const result = await gate(event)
+
+  const ev = event as Record<string, unknown>
 
   switch (result.action) {
     case 'drop':
@@ -732,7 +553,7 @@ async function handleMessage(event: any): Promise<void> {
         : `Hi! I need to verify you before connecting.\nYour pairing code: *${result.code}*\nAsk the Claude Code user to run: \`/slack:access pair ${result.code}\``
 
       await web.chat.postMessage({
-        channel: event.channel,
+        channel: ev['channel'] as string,
         text: msg,
         unfurl_links: false,
         unfurl_media: false,
@@ -742,17 +563,17 @@ async function handleMessage(event: any): Promise<void> {
 
     case 'deliver': {
       // Track this channel as delivered (for outbound gate)
-      deliveredChannels.add(event.channel)
+      deliveredChannels.add(ev['channel'] as string)
 
       const access = result.access!
-      const userName = await resolveUserName(event.user)
+      const userName = await resolveUserName(ev['user'] as string)
 
       // Ack reaction
       if (access.ackReaction) {
         try {
           await web.reactions.add({
-            channel: event.channel,
-            timestamp: event.ts,
+            channel: ev['channel'] as string,
+            timestamp: ev['ts'] as string,
             name: access.ackReaction,
           })
         } catch { /* non-critical */ }
@@ -760,25 +581,26 @@ async function handleMessage(event: any): Promise<void> {
 
       // Build attachment metadata (don't download yet — Claude will if needed)
       let attachmentInfo = ''
-      if (event.files?.length) {
-        const fileDescs = event.files.map((f: any) => {
+      const evFiles = ev['files'] as any[] | undefined
+      if (evFiles?.length) {
+        const fileDescs = evFiles.map((f: any) => {
           const name = sanitizeFilename(f.name || 'unnamed')
           return `${name} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`
         })
-        attachmentInfo = ` attachment_count="${event.files.length}" attachments="${fileDescs.join('; ')}"`
+        attachmentInfo = ` attachment_count="${evFiles.length}" attachments="${fileDescs.join('; ')}"`
       }
 
       // Strip bot mention from text if present
-      let text = event.text || ''
+      let text = (ev['text'] as string | undefined) || ''
       if (botUserId) {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
 
       // Build channel notification content
-      const threadAttr = event.thread_ts ? ` thread_ts="${event.thread_ts}"` : ''
+      const threadAttr = ev['thread_ts'] ? ` thread_ts="${ev['thread_ts']}"` : ''
       const content =
-        `<channel source="slack" chat_id="${event.channel}" message_id="${event.ts}" ` +
-        `user="${userName}"${threadAttr} ts="${event.ts}"${attachmentInfo}>` +
+        `<channel source="slack" chat_id="${ev['channel']}" message_id="${ev['ts']}" ` +
+        `user="${userName}"${threadAttr} ts="${ev['ts']}"${attachmentInfo}>` +
         `\n${text}\n</channel>`
 
       // Push into Claude Code session via MCP notification

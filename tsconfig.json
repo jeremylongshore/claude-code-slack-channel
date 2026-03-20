@@ -8,7 +8,9 @@
     "skipLibCheck": true,
     "outDir": "dist",
     "declaration": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
     "types": ["bun-types"]
   },
-  "include": ["server.ts"]
+  "include": ["server.ts", "lib.ts", "server.test.ts"]
 }
