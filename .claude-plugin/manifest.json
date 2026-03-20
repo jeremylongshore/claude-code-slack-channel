@@ -1,9 +1,0 @@
-{
-  "name": "slack",
-  "version": "0.1.0",
-  "description": "Two-way Slack channel for Claude Code — chat from Slack DMs and channels via Socket Mode",
-  "author": {
-    "name": "Anthropic"
-  },
-  "license": "Apache-2.0"
-}
