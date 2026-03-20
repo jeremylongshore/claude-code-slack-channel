@@ -3,7 +3,7 @@
 Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channels, just like you'd chat in the terminal.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 > **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login.
 
@@ -117,4 +117,4 @@ claude --dangerously-load-development-channels server:slack
 
 ## License
 
-Apache-2.0
+MIT

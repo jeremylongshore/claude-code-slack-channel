@@ -45,7 +45,7 @@ my-channel/
 ├── package.json             # Dependencies, start script, metadata
 ├── server.ts                # The MCP server (single file, all logic)
 ├── lib.ts                   # Optional: extracted pure functions for testing
-├── LICENSE                  # Apache-2.0
+├── LICENSE                  # MIT
 └── README.md
 ```
 
@@ -113,7 +113,7 @@ Tells Claude Code how to spawn the MCP server subprocess.
 {
   "name": "claude-channel-slack",
   "version": "0.1.0",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
@@ -139,7 +139,7 @@ Tells Claude Code how to spawn the MCP server subprocess.
 {
   "name": "claude-channel-telegram",
   "version": "0.0.1",
-  "license": "Apache-2.0",
+  "license": "MIT",
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
@@ -485,5 +485,5 @@ jobs:
 - [ ] All JSON files valid
 - [ ] Tests pass
 - [ ] TypeScript strict mode passes
-- [ ] LICENSE correct (Apache-2.0, correct copyright holder)
+- [ ] LICENSE correct (MIT, correct copyright holder)
 - [ ] Structure matches `external_plugins/telegram/` pattern

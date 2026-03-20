@@ -63,4 +63,4 @@ If you discover a security vulnerability, **do not open a public issue**. See [S
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under Apache-2.0.
+By contributing, you agree that your contributions will be licensed under MIT.

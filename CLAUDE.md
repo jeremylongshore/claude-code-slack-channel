@@ -49,7 +49,7 @@ All state lives in `~/.claude/channels/slack/`:
 
 ## Conventions
 
-- Apache-2.0 license
+- MIT license
 - Matches `anthropics/claude-plugins-official` patterns (file structure, naming, skills)
 - Bun primary runtime, Node.js/Docker as alternatives
 - TypeScript strict mode

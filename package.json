@@ -19,7 +19,7 @@
     "@types/bun": "^1.0.0",
     "typescript": "^5.4.0"
   },
-  "license": "Apache-2.0",
+  "license": "MIT",
   "author": {
     "name": "Jeremy Longshore",
     "email": "jeremy@intentsolutions.io"

@@ -5,7 +5,7 @@ Two-way Slack channel for Claude Code — chat from Slack DMs and channels, just
 The first `claude/channel` implementation for Slack. Uses Socket Mode (outbound WebSocket, no public URL) to bridge Slack messages into a running Claude Code session via MCP stdio. Five defense layers prevent prompt injection, token exfiltration, and unauthorized access. Three runtime options: Bun, Node.js, Docker.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
 
 **Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Pages](https://jeremylongshore.github.io/claude-code-slack-channel/)
 
@@ -52,7 +52,7 @@ The architecture mirrors the official Discord channel exactly — same gate/pair
 2. **No public URL** — Socket Mode means outbound-only WebSocket, works behind firewalls and NAT
 3. **Defense-in-depth security** — 5 layers: inbound gate, outbound gate, file exfiltration guard, prompt injection hardening, token lockdown
 4. **Three runtime options** — Bun (fastest), Node.js/npx (universal), Docker (isolated)
-5. **Upstream-ready** — matches `anthropics/claude-plugins-official` patterns exactly (Apache-2.0, same file structure, same conventions as Discord/Telegram)
+5. **Upstream-ready** — matches `anthropics/claude-plugins-official` patterns exactly (MIT, same file structure, same conventions as Discord/Telegram)
 
 ---
 
@@ -150,7 +150,7 @@ claude-code-slack-channel/
 ├── SECURITY.md            # Vulnerability reporting
 ├── CHANGELOG.md           # Keep a Changelog format
 ├── CODE_OF_CONDUCT.md     # Contributor Covenant 2.1
-└── LICENSE                # Apache-2.0
+└── LICENSE                # MIT
 ```
 
 ### Deployment & Operations
@@ -189,6 +189,6 @@ claude-code-slack-channel/
 
 - **Repo:** https://github.com/jeremylongshore/claude-code-slack-channel
 - **CI:** Passing (GitHub Actions — Bun typecheck)
-- **License:** Apache-2.0
+- **License:** MIT
 - **Last Release:** v0.1.0 (2026-03-20)
 - **Test Coverage:** None yet
