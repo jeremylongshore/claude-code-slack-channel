@@ -1,0 +1,3 @@
+title: claude-code-slack-channel
+description: Two-way Slack channel for Claude Code via Socket Mode + MCP
+theme: jekyll-theme-minimal
