@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "description": "Slack channel for Claude Code — two-way chat via Socket Mode",
   "type": "module",
-  "main": "server.ts",
+  "bin": "./server.ts",
   "scripts": {
-    "start": "bun server.ts",
+    "start": "bun install --no-summary && bun server.ts",
     "start:node": "npx tsx server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

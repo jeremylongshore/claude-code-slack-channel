@@ -579,15 +579,26 @@ async function handleMessage(event: unknown): Promise<void> {
         } catch { /* non-critical */ }
       }
 
-      // Build attachment metadata (don't download yet — Claude will if needed)
-      let attachmentInfo = ''
+      // Build meta attributes for the <channel> tag
+      const meta: Record<string, string> = {
+        chat_id: ev['channel'] as string,
+        message_id: ev['ts'] as string,
+        user: userName,
+        ts: ev['ts'] as string,
+      }
+
+      if (ev['thread_ts']) {
+        meta.thread_ts = ev['thread_ts'] as string
+      }
+
       const evFiles = ev['files'] as any[] | undefined
       if (evFiles?.length) {
         const fileDescs = evFiles.map((f: any) => {
           const name = sanitizeFilename(f.name || 'unnamed')
           return `${name} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`
         })
-        attachmentInfo = ` attachment_count="${evFiles.length}" attachments="${fileDescs.join('; ')}"`
+        meta.attachment_count = String(evFiles.length)
+        meta.attachments = fileDescs.join('; ')
       }
 
       // Strip bot mention from text if present
@@ -596,17 +607,10 @@ async function handleMessage(event: unknown): Promise<void> {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
 
-      // Build channel notification content
-      const threadAttr = ev['thread_ts'] ? ` thread_ts="${ev['thread_ts']}"` : ''
-      const content =
-        `<channel source="slack" chat_id="${ev['channel']}" message_id="${ev['ts']}" ` +
-        `user="${userName}"${threadAttr} ts="${ev['ts']}"${attachmentInfo}>` +
-        `\n${text}\n</channel>`
-
       // Push into Claude Code session via MCP notification
       mcp.notification({
         method: 'notifications/claude/channel',
-        params: { content },
+        params: { content: text, meta },
       })
     }
   }
