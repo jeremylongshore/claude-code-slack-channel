@@ -24,8 +24,8 @@ npx tsx server.ts        # Node.js fallback
 ## Key Files
 
 - `server.ts` — entire MCP server: bootstrap, gate, tools, event handling
-- `skills/configure.md` — `/slack:configure` token setup skill
-- `skills/access.md` — `/slack:access` pairing/allowlist management skill
+- `skills/configure/SKILL.md` — `/slack:configure` token setup skill
+- `skills/access/SKILL.md` — `/slack:access` pairing/allowlist management skill
 - `ACCESS.md` — access control schema documentation
 
 ## Security Architecture (critical context)

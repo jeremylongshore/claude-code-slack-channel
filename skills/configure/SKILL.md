@@ -3,7 +3,7 @@ name: configure
 description: Configure Slack channel tokens (bot token + app-level token)
 user-invocable: true
 argument-hint: "<bot-token> <app-token>"
-allowed-tools: Read, Write, Bash(cmd:chmod)
+allowed-tools: [Read, Write, "Bash(cmd:chmod)"]
 ---
 
 # /slack:configure
