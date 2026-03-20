@@ -44,7 +44,7 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
 ### 2. Configure Tokens
 
 ```bash
-/slack:configure xoxb-your-bot-token xapp-your-app-token
+/slack-channel:configure xoxb-your-bot-token xapp-your-app-token
 ```
 
 ### 3. Run
@@ -55,7 +55,10 @@ Pick your runtime:
 
 ```bash
 cd slack && bun install
-claude --channels plugin:slack@claude-plugins-official
+# Current (claude-code-plugins marketplace):
+claude --channels plugin:slack-channel@claude-code-plugins
+# Future (after upstream approval):
+# claude --channels plugin:slack-channel@claude-plugins-official
 ```
 
 #### Option B: Node.js / npx
@@ -63,7 +66,7 @@ claude --channels plugin:slack@claude-plugins-official
 ```bash
 cd slack && npm install
 # In .mcp.json, change command to: "npx", args: ["tsx", "server.ts"]
-claude --channels plugin:slack@claude-plugins-official
+claude --channels plugin:slack-channel@claude-code-plugins
 ```
 
 #### Option C: Docker
@@ -71,13 +74,13 @@ claude --channels plugin:slack@claude-plugins-official
 ```bash
 cd slack && docker build -t claude-slack-channel .
 # In .mcp.json, change command to: "docker", args: ["run", "--rm", "-i", "-v", "~/.claude/channels/slack:/state", "claude-slack-channel"]
-claude --channels plugin:slack@claude-plugins-official
+claude --channels plugin:slack-channel@claude-code-plugins
 ```
 
 ### 4. Pair Your Account
 
 1. DM the bot in Slack — you'll get a 6-character pairing code
-2. In your terminal: `/slack:access pair <code>`
+2. In your terminal: `/slack-channel:access pair <code>`
 3. You're connected. Chat away.
 
 ## Access Control
@@ -85,12 +88,12 @@ claude --channels plugin:slack@claude-plugins-official
 See [ACCESS.md](ACCESS.md) for the full schema.
 
 ```bash
-/slack:access policy allowlist       # Only pre-approved users
-/slack:access add U12345678          # Add a user
-/slack:access remove U12345678       # Remove a user
-/slack:access channel C12345678      # Opt in a channel
-/slack:access channel C12345678 --mention  # Require @mention
-/slack:access status                 # Show current config
+/slack-channel:access policy allowlist       # Only pre-approved users
+/slack-channel:access add U12345678          # Add a user
+/slack-channel:access remove U12345678       # Remove a user
+/slack-channel:access channel C12345678      # Opt in a channel
+/slack-channel:access channel C12345678 --mention  # Require @mention
+/slack-channel:access status                 # Show current config
 ```
 
 ## Security

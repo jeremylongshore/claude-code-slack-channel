@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bot message filtering
 - Link unfurling disabled on all outbound messages
 - Static access mode (`SLACK_ACCESS_MODE=static`)
-- Skills: `/slack:configure`, `/slack:access`
+- Skills: `/slack-channel:configure`, `/slack-channel:access`
 - Three runtime options: Bun, Node.js/npx, Docker
 - Test suite for security-critical functions — gate, assertSendable, assertOutboundAllowed (`server.test.ts`)
 - Extracted shared types and helpers to `lib.ts` for testability

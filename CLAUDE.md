@@ -1,31 +1,41 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## What This Is
 
 Slack channel for Claude Code — two-way chat bridge via Socket Mode + MCP stdio. First `claude/channel` implementation for Slack.
 
 ## Architecture
 
-Single-file MCP server (`server.ts`, ~850 lines). Three dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`. No frameworks.
+Two-file MCP server: `server.ts` (stateful runtime, ~630 lines) and `lib.ts` (pure functions, ~260 lines). Three dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`. No frameworks.
 
 ```
 Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude Code
 ```
+
+**`lib.ts`** contains all pure, testable logic: `gate()`, `assertSendable()`, `assertOutboundAllowed()`, `chunkText()`, `sanitizeFilename()`, types, and constants. Side-effect-free — accepts dependencies as parameters.
+
+**`server.ts`** imports from `lib.ts` and handles stateful concerns: Slack client bootstrap, token loading, MCP server registration, event listeners, file I/O. When adding logic, put pure functions in `lib.ts` and keep `server.ts` for wiring.
 
 ## Commands
 
 ```bash
 bun install              # Install deps
 bun run typecheck        # TypeScript strict check (tsc --noEmit)
+bun test                 # Run test suite (bun:test)
+bun test --watch         # Watch mode
 bun server.ts            # Run server directly
 npx tsx server.ts        # Node.js fallback
 ```
 
 ## Key Files
 
-- `server.ts` — entire MCP server: bootstrap, gate, tools, event handling
-- `skills/configure/SKILL.md` — `/slack:configure` token setup skill
-- `skills/access/SKILL.md` — `/slack:access` pairing/allowlist management skill
+- `server.ts` — MCP server runtime: bootstrap, Slack clients, tools, event handling
+- `lib.ts` — pure functions: gate logic, security guards, text chunking, types
+- `server.test.ts` — test suite covering security-critical functions (uses `bun:test`)
+- `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
+- `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
 - `ACCESS.md` — access control schema documentation
 
 ## Security Architecture (critical context)

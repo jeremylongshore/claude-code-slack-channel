@@ -19,7 +19,7 @@ If you're using Claude Code, you're chained to the terminal. Step away from your
 
 Anthropic shipped channels for Telegram, Discord, and a localhost demo (fakechat), but nothing for Slack — the tool most teams already live in. The existing Slack plugin in the official repo is a tool server: Claude can post to Slack, but Slack can't talk back. It's one-way.
 
-Meanwhile, the channel protocol (`claude/channel`) is new and underdocumented. The community hasn't built a Slack channel either. If you want to DM your Claude session from Slack, nothing exists to do it.
+Meanwhile, the channel protocol (`claude/channel`) is documented in the [Anthropic channels reference](https://docs.anthropic.com/en/docs/claude-code/channels) but no community Slack channel exists yet. If you want to DM your Claude session from Slack, nothing exists to do it.
 
 ### The Solution
 
@@ -137,8 +137,8 @@ claude-code-slack-channel/
 ├── .claude-plugin/
 │   └── manifest.json      # Plugin metadata (name, version, description)
 ├── skills/
-│   ├── configure.md       # /slack:configure — token setup
-│   └── access.md          # /slack:access — pairing, allowlist, channels
+│   ├── configure.md       # /slack-channel:configure — token setup
+│   └── access.md          # /slack-channel:access — pairing, allowlist, channels
 ├── server.ts              # MCP server — all logic (844 lines)
 ├── package.json           # 3 runtime deps, 2 dev deps
 ├── .mcp.json              # MCP server registration (bun server.ts)
@@ -162,10 +162,10 @@ claude-code-slack-channel/
 | Run (Bun) | `bun server.ts` | Primary runtime |
 | Run (Node) | `npx tsx server.ts` | Fallback runtime |
 | Run (Docker) | `docker build -t claude-slack-channel . && docker run --rm -i -v ~/.claude/channels/slack:/state claude-slack-channel` | Isolated runtime |
-| Launch channel | `claude --channels plugin:slack@claude-plugins-official` | Production |
+| Launch channel | `claude --channels plugin:slack-channel@claude-code-plugins` | Current marketplace |
 | Dev mode | `claude --dangerously-load-development-channels server:slack` | Bypasses plugin allowlist |
-| Configure | `/slack:configure xoxb-... xapp-...` | Writes tokens to ~/.claude/channels/slack/.env |
-| Pair user | `/slack:access pair <code>` | Approves pending pairing code |
+| Configure | `/slack-channel:configure xoxb-... xapp-...` | Writes tokens to ~/.claude/channels/slack/.env |
+| Pair user | `/slack-channel:access pair <code>` | Approves pending pairing code |
 
 ### Current State Assessment
 
@@ -179,11 +179,10 @@ claude-code-slack-channel/
 - Three runtime options (Bun, Node.js, Docker)
 - Clean typecheck (`tsc --noEmit` passes)
 
-#### Areas Needing Attention
-- **High** — No test suite. Core security functions (gate, assertSendable, assertOutboundAllowed) need unit tests before upstream PR.
-- ~~**High** — No CI pipeline.~~ GitHub Actions CI configured (Bun typecheck). Passing.
-- **Medium** — Not yet tested against a real Slack workspace. Socket Mode connection, event flow, and file upload need live verification.
-- **Low** — No lint/format config (biome or eslint). Should add before upstream PR.
+#### Roadmap
+- Live Slack workspace integration testing (Socket Mode, event flow, file upload)
+- Lint/format config (biome or eslint) before upstream PR
+- Expanded test coverage for edge cases
 
 ### Quick Reference
 
@@ -191,4 +190,5 @@ claude-code-slack-channel/
 - **CI:** Passing (GitHub Actions — Bun typecheck)
 - **License:** MIT
 - **Last Release:** v0.1.0 (2026-03-20)
-- **Test Coverage:** None yet
+- **Test Coverage:** Unit tests for security-critical functions (gate, assertSendable, assertOutboundAllowed)
+- **Docs:** [Anthropic Channels Reference](https://docs.anthropic.com/en/docs/claude-code/channels) · [Plugin Spec](https://docs.anthropic.com/en/docs/claude-code/plugins)
