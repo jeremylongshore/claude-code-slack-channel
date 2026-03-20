@@ -108,6 +108,10 @@ See [ACCESS.md](ACCESS.md) for the full schema.
 claude --dangerously-load-development-channels server:slack
 ```
 
+## One-Pager & System Analysis
+
+[Full project one-pager and operator-grade system analysis](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53)
+
 ## License
 
 Apache-2.0
