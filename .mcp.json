@@ -2,8 +2,7 @@
   "mcpServers": {
     "slack": {
       "command": "bun",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/server.ts"],
-      "env": {}
+      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]
     }
   }
 }
