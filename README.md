@@ -1,4 +1,4 @@
-# Slack Channel for Claude Code
+# Slack Channel for the Claude Code
 
 Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channels, just like you'd chat in the terminal.
 

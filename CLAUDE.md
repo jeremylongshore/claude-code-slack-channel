@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-Slack channel for Claude Code — two-way chat bridge via Socket Mode + MCP stdio. First `claude/channel` implementation for Slack.
+Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP stdio.
 
 ## Architecture
 

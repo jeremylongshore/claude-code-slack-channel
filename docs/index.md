@@ -1,8 +1,8 @@
 # claude-code-slack-channel v0.1.0
 
-Two-way Slack channel for Claude Code — chat from Slack DMs and channels, just like the terminal.
+Two-way Slack channel for the Claude Code — chat from Slack DMs and channels, just like the terminal.
 
-The first `claude/channel` implementation for Slack. Uses Socket Mode (outbound WebSocket, no public URL) to bridge Slack messages into a running Claude Code session via MCP stdio. Five defense layers prevent prompt injection, token exfiltration, and unauthorized access. Three runtime options: Bun, Node.js, Docker.
+Uses Socket Mode (outbound WebSocket, no public URL) to bridge Slack messages into a running Claude Code session via MCP stdio. Five defense layers prevent prompt injection, token exfiltration, and unauthorized access. Three runtime options: Bun, Node.js, Docker.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
@@ -48,11 +48,10 @@ The architecture mirrors the official Discord channel exactly — same gate/pair
 | Security | Custom gate + allowlist | 5-layer defense: inbound gate, outbound gate, exfiltration guard, prompt hardening, token security |
 
 ### Key Differentiators
-1. **First Slack channel for Claude Code** — nobody else has built this, including Anthropic
-2. **No public URL** — Socket Mode means outbound-only WebSocket, works behind firewalls and NAT
-3. **Defense-in-depth security** — 5 layers: inbound gate, outbound gate, file exfiltration guard, prompt injection hardening, token lockdown
-4. **Three runtime options** — Bun (fastest), Node.js/npx (universal), Docker (isolated)
-5. **Upstream-ready** — matches `anthropics/claude-plugins-official` patterns exactly (MIT, same file structure, same conventions as Discord/Telegram)
+1. **No public URL** — Socket Mode means outbound-only WebSocket, works behind firewalls and NAT
+2. **Defense-in-depth security** — 5 layers: inbound gate, outbound gate, file exfiltration guard, prompt injection hardening, token lockdown
+3. **Three runtime options** — Bun (fastest), Node.js/npx (universal), Docker (isolated)
+4. **Upstream-ready** — matches `anthropics/claude-plugins-official` patterns exactly (MIT, same file structure, same conventions as Discord/Telegram)
 
 ---
 
