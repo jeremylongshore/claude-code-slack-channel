@@ -1,0 +1,21 @@
+name: Notify Marketplace
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '*.md'
+      - '.github/**'
+      - '000-docs/**'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger marketplace sync
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.MARKETPLACE_SYNC_TOKEN }}" \
+            https://api.github.com/repos/jeremylongshore/claude-code-plugins-plus-skills/dispatches \
+            -d '{"event_type":"external-plugin-sync","client_payload":{"source":"slack-channel"}}'
