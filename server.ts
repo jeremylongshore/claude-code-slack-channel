@@ -546,6 +546,28 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Permission relay — forward tool approval prompts to Slack
 // ---------------------------------------------------------------------------
 
+// Track pending permission request details for "See more" button expansion.
+// Each entry includes a timestamp for TTL-based cleanup (5-minute expiry).
+const PERM_TTL_MS = 5 * 60 * 1000
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; createdAt: number }>()
+
+function pruneStalePermissions(): void {
+  const cutoff = Date.now() - PERM_TTL_MS
+  for (const [id, entry] of pendingPermissions) {
+    if (entry.createdAt < cutoff) pendingPermissions.delete(id)
+  }
+}
+
+/** Escape Slack mrkdwn special characters to prevent injection. */
+function escMrkdwn(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+// Type assertion avoids TS2589 (excessively deep type instantiation) caused
+// by zod inference interacting with the MCP SDK's generic signature.
 const PermissionRequestSchema = z.object({
   method: z.literal('notifications/claude/channel/permission_request'),
   params: z.object({
@@ -554,27 +576,224 @@ const PermissionRequestSchema = z.object({
     description: z.string(),
     input_preview: z.string(),
   }),
-})
+}) as any
 
-mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
+// Claude Code generates request_id as exactly 5 lowercase letters from a-z
+// minus 'l'. Validate before using in action_ids (Slack limits to 255 chars).
+const VALID_REQUEST_ID = /^[a-km-z]{5}$/
+
+mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params: { request_id: string; tool_name: string; description: string; input_preview: string } }) => {
+  // Validate request_id format to prevent malformed action_ids
+  if (!VALID_REQUEST_ID.test(params.request_id)) return
+
   // Find where to post — last active channel, or first opted-in channel
   const access = getAccess()
   const targetChannel = lastActiveChannel || Object.keys(access.channels || {})[0]
   if (!targetChannel) return
 
+  // Outbound gate: only post to channels that have been validated
+  try {
+    assertOutboundAllowed(targetChannel)
+  } catch {
+    return
+  }
+
+  pruneStalePermissions()
+  pendingPermissions.set(params.request_id, {
+    tool_name: params.tool_name,
+    description: params.description,
+    input_preview: params.input_preview,
+    createdAt: Date.now(),
+  })
+
+  const safeTool = escMrkdwn(params.tool_name)
+  const safeDesc = escMrkdwn(params.description)
+
+  // Post Block Kit message with interactive buttons
   await web.chat.postMessage({
     channel: targetChannel,
-    text:
-      `🟡 *${params.tool_name}*: ${params.description}\n` +
-      `Reply \`y ${params.request_id}\` or \`n ${params.request_id}\``,
+    // Fallback text for notifications and clients that don't support blocks
+    text: `Claude wants to run ${safeTool}: ${safeDesc} — reply \`y ${params.request_id}\` or \`n ${params.request_id}\``,
     thread_ts: lastActiveThread,
     unfurl_links: false,
     unfurl_media: false,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}`,
+        },
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '✅ Allow' },
+            style: 'primary',
+            action_id: `perm:allow:${params.request_id}`,
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '❌ Deny' },
+            style: 'danger',
+            action_id: `perm:deny:${params.request_id}`,
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: '🔍 Details' },
+            action_id: `perm:more:${params.request_id}`,
+          },
+        ],
+      },
+    ],
   })
 })
 
-// Regex for permission replies: "yes abcde" or "no abcde"
-// ID alphabet is lowercase a-z minus 'l', /i tolerates phone autocorrect
+// Handle Block Kit button interactions (delivered via Socket Mode)
+socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
+  try {
+    await ack()
+    if (body?.type !== 'block_actions' || !body.actions?.length) return
+
+    const action = body.actions[0]
+    const actionId: string = action.action_id || ''
+    const match = actionId.match(/^perm:(allow|deny|more):(.+)$/)
+    if (!match) return
+
+    const [, verb, requestId] = match
+    const userId: string = body.user?.id || ''
+
+    // Only allowlisted users (session owner) can respond to permission prompts
+    const access = getAccess()
+    if (!access.allowFrom.includes(userId)) {
+      // Ephemeral message visible only to the clicking user
+      try {
+        await web.chat.postEphemeral({
+          channel: body.channel?.id || '',
+          user: userId,
+          text: 'Only the session owner can approve or deny tool calls.',
+        })
+      } catch { /* non-critical */ }
+      return
+    }
+
+    const channelId: string = body.channel?.id || ''
+    const messageTs: string = body.message?.ts || ''
+
+    if (verb === 'more') {
+      // Expand details — update the message to include input_preview
+      const details = pendingPermissions.get(requestId)
+      if (!details || !channelId || !messageTs) return
+
+      // Use plain_text to prevent mrkdwn injection from tool input.
+      // Truncate to stay within Slack's 3000-char text object limit.
+      const MAX_PREVIEW = 2900
+      const previewText = details.input_preview
+        ? details.input_preview.length > MAX_PREVIEW
+          ? details.input_preview.slice(0, MAX_PREVIEW) + '…'
+          : details.input_preview
+        : 'No preview available'
+
+      const safeTool = escMrkdwn(details.tool_name)
+      const safeDesc = escMrkdwn(details.description)
+
+      try {
+        await web.chat.update({
+          channel: channelId,
+          ts: messageTs,
+          text: `Claude wants to run ${safeTool}: ${safeDesc}`,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}`,
+              },
+            },
+            {
+              type: 'context',
+              elements: [{ type: 'plain_text', text: previewText }],
+            },
+            {
+              type: 'actions',
+              elements: [
+                {
+                  type: 'button',
+                  text: { type: 'plain_text', text: '✅ Allow' },
+                  style: 'primary',
+                  action_id: `perm:allow:${requestId}`,
+                },
+                {
+                  type: 'button',
+                  text: { type: 'plain_text', text: '❌ Deny' },
+                  style: 'danger',
+                  action_id: `perm:deny:${requestId}`,
+                },
+              ],
+            },
+          ],
+        })
+      } catch { /* non-critical — Slack API rejection won't block the session */ }
+      return
+    }
+
+    // Allow or Deny — send verdict to Claude Code
+    const details = pendingPermissions.get(requestId)
+    if (!details) {
+      // Already resolved (by button or text reply) — update message and bail
+      if (channelId && messageTs) {
+        try {
+          await web.chat.update({
+            channel: channelId,
+            ts: messageTs,
+            text: 'Already resolved',
+            blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '⚪ Already resolved' } }],
+          })
+        } catch { /* non-critical */ }
+      }
+      return
+    }
+
+    const behavior = verb === 'allow' ? 'allow' : 'deny'
+    const verdict = behavior === 'allow' ? 'allowed' : 'denied'
+    const safeTool = escMrkdwn(details.tool_name)
+    pendingPermissions.delete(requestId)
+
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: requestId, behavior },
+    })
+
+    // Update message to show outcome (remove buttons)
+    if (channelId && messageTs) {
+      const emoji = behavior === 'allow' ? '✅' : '❌'
+      try {
+        await web.chat.update({
+          channel: channelId,
+          ts: messageTs,
+          text: `${emoji} ${safeTool} — ${verdict}`,
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: `${emoji} *\`${safeTool}\`* — ${verdict} by <@${userId}>`,
+              },
+            },
+          ],
+        })
+      } catch { /* non-critical */ }
+    }
+  } catch (err) {
+    console.error('[slack] Error handling interactive event:', err)
+  }
+})
+
+// Regex for text-based permission replies: "yes abcde" or "no abcde"
+// Claude Code generates request_id as exactly 5 lowercase letters from a-z
+// minus 'l'. The /i flag tolerates phone autocorrect capitalization.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 // ---------------------------------------------------------------------------
@@ -617,14 +836,30 @@ async function handleMessage(event: unknown): Promise<void> {
       const msgText = ((ev['text'] as string) || '').trim()
       const permMatch = PERMISSION_REPLY_RE.exec(msgText)
       if (permMatch) {
+        const requestId = permMatch[2].toLowerCase()
+
+        // Skip if already resolved (e.g. by a button click)
+        if (!pendingPermissions.has(requestId)) {
+          // Still ack so the user knows the message was seen
+          try {
+            await web.reactions.add({
+              channel: channelId,
+              timestamp: ev['ts'] as string,
+              name: 'heavy_multiplication_x',
+            })
+          } catch { /* non-critical */ }
+          return
+        }
+
+        pendingPermissions.delete(requestId)
         await mcp.notification({
           method: 'notifications/claude/channel/permission',
           params: {
-            request_id: permMatch[2].toLowerCase(),
+            request_id: requestId,
             behavior: permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
           },
         })
-        // Ack with a reaction so Sam knows it was processed
+        // Ack with a reaction so the sender knows it was processed
         try {
           await web.reactions.add({
             channel: channelId,
