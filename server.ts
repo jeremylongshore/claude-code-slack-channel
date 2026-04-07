@@ -14,6 +14,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { z } from 'zod'
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { homedir } from 'os'
@@ -176,6 +177,10 @@ function assertSendable(filePath: string): void {
 // Track channels that passed inbound gate (session-lifetime cache)
 const deliveredChannels = new Set<string>()
 
+// Track last active channel/thread for permission relay
+let lastActiveChannel = ''
+let lastActiveThread: string | undefined
+
 function assertOutboundAllowed(chatId: string): void {
   libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
 }
@@ -223,7 +228,10 @@ const mcp = new Server(
   { name: 'slack', version: '0.1.0' },
   {
     capabilities: {
-      experimental: { 'claude/channel': {} },
+      experimental: {
+        'claude/channel': {},
+        'claude/channel/permission': {},
+      },
       tools: {},
     },
     instructions: [
@@ -535,6 +543,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 })
 
 // ---------------------------------------------------------------------------
+// Permission relay — forward tool approval prompts to Slack
+// ---------------------------------------------------------------------------
+
+const PermissionRequestSchema = z.object({
+  method: z.literal('notifications/claude/channel/permission_request'),
+  params: z.object({
+    request_id: z.string(),
+    tool_name: z.string(),
+    description: z.string(),
+    input_preview: z.string(),
+  }),
+})
+
+mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
+  // Find where to post — last active channel, or first opted-in channel
+  const access = getAccess()
+  const targetChannel = lastActiveChannel || Object.keys(access.channels || {})[0]
+  if (!targetChannel) return
+
+  await web.chat.postMessage({
+    channel: targetChannel,
+    text:
+      `🟡 *${params.tool_name}*: ${params.description}\n` +
+      `Reply \`y ${params.request_id}\` or \`n ${params.request_id}\``,
+    thread_ts: lastActiveThread,
+    unfurl_links: false,
+    unfurl_media: false,
+  })
+})
+
+// Regex for permission replies: "yes abcde" or "no abcde"
+// ID alphabet is lowercase a-z minus 'l', /i tolerates phone autocorrect
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
+// ---------------------------------------------------------------------------
 // Inbound message handler
 // ---------------------------------------------------------------------------
 
@@ -563,7 +606,34 @@ async function handleMessage(event: unknown): Promise<void> {
 
     case 'deliver': {
       // Track this channel as delivered (for outbound gate)
-      deliveredChannels.add(ev['channel'] as string)
+      const channelId = ev['channel'] as string
+      deliveredChannels.add(channelId)
+
+      // Track last active channel for permission relay
+      lastActiveChannel = channelId
+      lastActiveThread = ev['thread_ts'] as string | undefined
+
+      // Check for permission reply before normal delivery
+      const msgText = ((ev['text'] as string) || '').trim()
+      const permMatch = PERMISSION_REPLY_RE.exec(msgText)
+      if (permMatch) {
+        await mcp.notification({
+          method: 'notifications/claude/channel/permission',
+          params: {
+            request_id: permMatch[2].toLowerCase(),
+            behavior: permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
+          },
+        })
+        // Ack with a reaction so Sam knows it was processed
+        try {
+          await web.reactions.add({
+            channel: channelId,
+            timestamp: ev['ts'] as string,
+            name: 'white_check_mark',
+          })
+        } catch { /* non-critical */ }
+        return // Don't forward as chat
+      }
 
       const access = result.access!
       const userName = await resolveUserName(ev['user'] as string)
