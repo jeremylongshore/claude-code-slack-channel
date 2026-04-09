@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-09
+
+### Added
+- Permission relay — approve/deny Claude Code tool calls remotely via Slack (#3)
+- Block Kit interactive buttons for permission prompts (Allow/Deny/Details) (#4)
+- `claude/channel/permission` capability declaration
+- Text-based fallback for permission replies (`y/n + 5-char code`)
+- TTL-based cleanup for pending permission requests (5-minute expiry)
+- mrkdwn escaping to prevent Slack injection via tool names/descriptions
+- `zod` as explicit dependency for schema validation
+
+### Fixed
+- Security: owner-only approval for permission prompts (session owner must be in `allowFrom`)
+- Security: outbound gate enforced on permission relay messages
+- Security: delete-after-send ordering to prevent lost verdicts if notification fails
+- Anthropic spec compliance: skill namespace, install commands (#2)
+- Documentation: added "the" before "Claude Code", removed first MCP claims
+
 ### Changed
 - License changed from Apache-2.0 to MIT
 
