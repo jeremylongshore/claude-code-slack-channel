@@ -37,6 +37,7 @@ import {
   isSlackFileUrl,
   chunkText,
   sanitizeFilename,
+  sanitizeDisplayName,
   gate as libGate,
   type Access,
   type GateResult,
@@ -215,15 +216,19 @@ async function resolveUserName(userId: string): Promise<string> {
   if (userNameCache.has(userId)) return userNameCache.get(userId)!
   try {
     const res = await web.users.info({ user: userId })
-    const name =
+    // All three Slack-provided name fields are attacker-controlled (the
+    // workspace member can set them). Sanitize before caching so every
+    // downstream consumer gets a scrubbed value.
+    const rawName =
       res.user?.profile?.display_name ||
       res.user?.profile?.real_name ||
       res.user?.name ||
       userId
+    const name = sanitizeDisplayName(rawName)
     userNameCache.set(userId, name)
     return name
   } catch {
-    return userId
+    return sanitizeDisplayName(userId)
   }
 }
 
@@ -904,10 +909,19 @@ async function handleMessage(event: unknown): Promise<void> {
         } catch { /* non-critical */ }
       }
 
-      // Build meta attributes for the <channel> tag
+      // Build meta attributes for the <channel> tag.
+      //
+      // user_id is the opaque Slack ID (U...) — trustworthy, set by Slack.
+      // user is the sanitized display name — attacker-controlled content,
+      // safe to render but MUST NOT be used for authorization decisions.
+      // We still run user_id through a strict format check (Slack IDs are
+      // A-Z/0-9 only) so a malformed event payload cannot inject markup.
+      const rawUserId = ev['user'] as string
+      const userIdSafe = /^[A-Z0-9]{1,32}$/.test(rawUserId) ? rawUserId : 'invalid'
       const meta: Record<string, string> = {
         chat_id: ev['channel'] as string,
         message_id: ev['ts'] as string,
+        user_id: userIdSafe,
         user: userName,
         ts: ev['ts'] as string,
       }
