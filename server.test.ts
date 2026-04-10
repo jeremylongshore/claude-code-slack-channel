@@ -1,7 +1,8 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import {
   gate,
   assertSendable,
+  parseSendableRoots,
   assertOutboundAllowed,
   chunkText,
   sanitizeFilename,
@@ -14,6 +15,15 @@ import {
   type Access,
   type GateOptions,
 } from './lib.ts'
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  symlinkSync,
+  rmSync,
+} from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -281,33 +291,154 @@ describe('gate', () => {
 // ---------------------------------------------------------------------------
 // assertSendable()
 // ---------------------------------------------------------------------------
+//
+// The new allowlist-based assertSendable uses realpathSync to follow symlinks,
+// so tests must operate on real files under a temp directory rather than
+// purely-lexical paths.
 
 describe('assertSendable', () => {
-  const stateDir = '/home/user/.claude/channels/slack'
-  const inboxDir = '/home/user/.claude/channels/slack/inbox'
+  let root: string          // tmp root that stands in for HOME
+  let inbox: string         // allowed inbox dir
+  let project: string       // additional allowlisted root
+  let outside: string       // not in allowlist
 
-  test('blocks .env in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/.env`, stateDir, inboxDir)).toThrow('Blocked')
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'slack-sendable-'))
+    inbox = join(root, 'inbox')
+    project = join(root, 'project')
+    outside = join(root, 'outside')
+    mkdirSync(inbox, { recursive: true })
+    mkdirSync(project, { recursive: true })
+    mkdirSync(outside, { recursive: true })
+
+    // Regular files
+    writeFileSync(join(inbox, 'photo.png'), 'png')
+    writeFileSync(join(inbox, 'dangerous.env'), 'nope') // basename matches .env
+    writeFileSync(join(project, 'report.csv'), 'ok')
+    writeFileSync(join(outside, 'secret.txt'), 'leak')
+
+    // Secret files under root — will be used as symlink targets / deny tests
+    writeFileSync(join(root, '.env'), 'SECRET=1')
+    writeFileSync(join(root, 'plain.txt'), 'home file no ext')
+
+    // .aws/credentials
+    mkdirSync(join(root, '.aws'), { recursive: true })
+    writeFileSync(join(root, '.aws', 'credentials'), 'aws creds')
+
+    // .ssh/id_rsa
+    mkdirSync(join(root, '.ssh'), { recursive: true })
+    writeFileSync(join(root, '.ssh', 'id_rsa'), 'ssh key')
+
+    // Symlink inside inbox that points at the .env outside
+    try {
+      symlinkSync(join(root, '.env'), join(inbox, 'innocent-looking.txt'))
+    } catch { /* some FSes don't support symlinks; test will skip */ }
   })
 
-  test('blocks access.json in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/access.json`, stateDir, inboxDir)).toThrow('Blocked')
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
   })
 
-  test('blocks nested files in state dir', () => {
-    expect(() => assertSendable(`${stateDir}/subdir/secret`, stateDir, inboxDir)).toThrow('Blocked')
+  test('allows a real file inside INBOX', () => {
+    expect(() => assertSendable(join(inbox, 'photo.png'), inbox, [])).not.toThrow()
   })
 
-  test('allows files in inbox/', () => {
-    expect(() => assertSendable(`${inboxDir}/photo.png`, stateDir, inboxDir)).not.toThrow()
+  test('allows a real file under an explicit allowlist root', () => {
+    expect(() => assertSendable(join(project, 'report.csv'), inbox, [project])).not.toThrow()
   })
 
-  test('allows files outside state dir entirely', () => {
-    expect(() => assertSendable('/tmp/output.txt', stateDir, inboxDir)).not.toThrow()
+  test('denies a plain-text file under HOME with no allowlist entry', () => {
+    expect(() => assertSendable(join(root, 'plain.txt'), inbox, [])).toThrow('Blocked')
   })
 
-  test('allows home directory files', () => {
-    expect(() => assertSendable('/home/user/project/file.ts', stateDir, inboxDir)).not.toThrow()
+  test('denies HOME/.env by basename even if HOME were allowlisted', () => {
+    expect(() => assertSendable(join(root, '.env'), inbox, [root])).toThrow('Blocked')
+  })
+
+  test('denies ~/.aws/credentials via parent-component deny', () => {
+    expect(() => assertSendable(join(root, '.aws', 'credentials'), inbox, [root])).toThrow('Blocked')
+  })
+
+  test('denies ~/.ssh/id_rsa via parent-component deny', () => {
+    expect(() => assertSendable(join(root, '.ssh', 'id_rsa'), inbox, [root])).toThrow('Blocked')
+  })
+
+  test('denies a symlink under INBOX that points at ~/.env (realpath follow)', () => {
+    // Symlink may not have been created on exotic FSes; tolerate that.
+    try {
+      // Sanity: ensure the symlink exists
+      require('fs').lstatSync(join(inbox, 'innocent-looking.txt'))
+    } catch {
+      return
+    }
+    expect(() =>
+      assertSendable(join(inbox, 'innocent-looking.txt'), inbox, []),
+    ).toThrow('Blocked')
+  })
+
+  test('denies a path containing a ".." component (raw string)', () => {
+    // join() collapses ".." at build time, so pass a raw string to exercise
+    // the pre-resolve check.
+    expect(() =>
+      assertSendable(inbox + '/../.env', inbox, [root]),
+    ).toThrow('..')
+  })
+
+  test('denies a file whose basename matches the .env regex', () => {
+    // Matches ^\.env(\..*)?$
+    writeFileSync(join(inbox, '.env.local'), 'leak')
+    expect(() => assertSendable(join(inbox, '.env.local'), inbox, [])).toThrow('Blocked')
+  })
+
+  test('denies nonexistent files', () => {
+    expect(() =>
+      assertSendable(join(inbox, 'does-not-exist.png'), inbox, []),
+    ).toThrow('Blocked')
+  })
+
+  test('error messages do not echo the attempted path', () => {
+    try {
+      assertSendable(join(root, 'plain.txt'), inbox, [])
+    } catch (e) {
+      const msg = (e as Error).message
+      expect(msg).not.toContain('plain.txt')
+      expect(msg).not.toContain(root)
+      return
+    }
+    throw new Error('expected assertSendable to throw')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// parseSendableRoots()
+// ---------------------------------------------------------------------------
+
+describe('parseSendableRoots', () => {
+  test('returns empty array for undefined', () => {
+    expect(parseSendableRoots(undefined)).toEqual([])
+  })
+
+  test('returns empty array for empty string', () => {
+    expect(parseSendableRoots('')).toEqual([])
+  })
+
+  test('parses single absolute path', () => {
+    expect(parseSendableRoots('/tmp/foo')).toEqual(['/tmp/foo'])
+  })
+
+  test('parses multiple colon-separated absolute paths', () => {
+    expect(parseSendableRoots('/tmp/foo:/var/bar')).toEqual(['/tmp/foo', '/var/bar'])
+  })
+
+  test('silently drops relative paths', () => {
+    expect(parseSendableRoots('/tmp/foo:relative/path:/var/bar')).toEqual([
+      '/tmp/foo',
+      '/var/bar',
+    ])
+  })
+
+  test('silently drops empty entries', () => {
+    expect(parseSendableRoots('/tmp/foo::/var/bar')).toEqual(['/tmp/foo', '/var/bar'])
   })
 })
 

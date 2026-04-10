@@ -71,3 +71,38 @@ How to split long messages: `"newline"` (paragraph-aware, default) or `"length"`
 - Writes are atomic (write `.tmp`, then rename)
 - Corrupt files are moved aside and replaced with defaults
 - In static mode (`SLACK_ACCESS_MODE=static`), the file is read once at boot and never mutated
+
+## File attachments — sendable roots
+
+The `reply` tool can attach files to Slack messages, but only files whose
+real path (symlinks resolved) sits under an **explicit allowlist of roots**.
+
+### Default allowlist
+
+- `~/.claude/channels/slack/inbox/` — always allowed; re-shares previously
+  downloaded attachments.
+
+### Adding additional roots
+
+Set `SLACK_SENDABLE_ROOTS` in `~/.claude/channels/slack/.env` to a
+colon-separated list of absolute paths:
+
+```env
+SLACK_SENDABLE_ROOTS=/Users/you/projects/report-outputs:/tmp/claude-artifacts
+```
+
+- Paths must be absolute; relative entries are silently dropped.
+- Symlinks are followed via `realpath` before the allowlist check, so
+  symlinking a secret file into an allowed root will not bypass the guard.
+- The guard also applies a **basename denylist** that rejects common secret
+  filenames even inside allowlisted roots:
+  `.env`, `.env.*`, `.netrc`, `.npmrc`, `.pypirc`, `*.pem`, `*.key`,
+  `id_rsa` / `id_ecdsa` / `id_ed25519` / `id_dsa` (and `.pub`),
+  `credentials`, `credentials.*`, `.git-credentials`.
+- Any path descending through `.ssh`, `.aws`, `.gnupg`, `.config/gcloud`,
+  `.config/gh`, or `.git` is rejected.
+- Paths containing a `..` component are rejected.
+
+If the reply tool tries to attach a path outside the allowlist (or on the
+denylist), the upload is blocked with a generic error that names WHICH
+check failed but does not echo the attempted path.

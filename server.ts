@@ -32,6 +32,7 @@ import {
   pruneExpired,
   generateCode as _generateCode,
   assertSendable as libAssertSendable,
+  parseSendableRoots,
   assertOutboundAllowed as libAssertOutboundAllowed,
   chunkText,
   sanitizeFilename,
@@ -52,6 +53,11 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const DEFAULT_CHUNK_LIMIT = 4000
+
+// File-exfil allowlist: additional roots beyond INBOX_DIR from which the
+// reply tool may attach files. Colon-separated absolute paths. Default empty
+// (only INBOX_DIR is sendable). See ACCESS.md for details.
+const SENDABLE_ROOTS = parseSendableRoots(process.env['SLACK_SENDABLE_ROOTS'])
 
 // ---------------------------------------------------------------------------
 // Bootstrap — tokens & state directory
@@ -167,7 +173,7 @@ function getAccess(): Access {
 // ---------------------------------------------------------------------------
 
 function assertSendable(filePath: string): void {
-  libAssertSendable(filePath, resolve(STATE_DIR), resolve(INBOX_DIR))
+  libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS)
 }
 
 // ---------------------------------------------------------------------------
