@@ -36,9 +36,27 @@ Controls how DMs from unknown users are handled.
 
 | Value | Behavior |
 |-------|----------|
-| `pairing` | Unknown senders get a 6-character code to approve via `/slack-channel:access pair` (default) |
-| `allowlist` | Only users in `allowFrom` can DM; others are silently dropped |
+| `allowlist` | Only users in `allowFrom` can DM; others are silently dropped (default in this hardened fork) |
+| `pairing` | Unknown senders get a 6-character code to approve via `/slack-channel:access pair` (upstream default; opt-in only) |
 | `disabled` | All DMs dropped |
+
+> **Note — default is `allowlist`:** this fork defaults to `allowlist` instead
+> of the upstream `pairing` default. The pairing flow lets any workspace
+> member DM the bot, receive a pairing code, and then socially-engineer the
+> operator into pasting `/slack-channel:access pair <code>`. To avoid that
+> foothold, the operator must explicitly add their own Slack user ID to
+> `allowFrom` before DMs will reach the bot:
+>
+> ```
+> /slack-channel:access add U01234567
+> ```
+>
+> Replace `U01234567` with your Slack user ID (visible from your Slack
+> profile → More → Copy member ID). There is no longer a self-service
+> pairing-code emission by default. To temporarily re-enable the pairing
+> flow — for example, to onboard an additional trusted user — edit
+> `~/.claude/channels/slack/access.json` and set `dmPolicy` to `pairing`,
+> then switch it back to `allowlist` afterwards.
 
 ### `allowFrom`
 Array of Slack user IDs (e.g., `U12345678`) allowed to send DMs. Managed via `/slack-channel:access add/remove`.

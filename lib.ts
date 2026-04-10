@@ -63,7 +63,13 @@ export interface GateResult {
 
 export function defaultAccess(): Access {
   return {
-    dmPolicy: 'pairing',
+    // Hardened default: only users explicitly added to allowFrom can DM the
+    // bot. The upstream default of 'pairing' would respond to any workspace
+    // member with a pairing code, opening a social-engineering path where
+    // an attacker DMs, then asks the operator to run /slack-channel:access
+    // pair <code>. Operators must now explicitly add their own U... via
+    // /slack-channel:access add U01234567 before any DM reaches the bot.
+    dmPolicy: 'allowlist',
     allowFrom: [],
     channels: {},
     pending: {},
