@@ -6,6 +6,7 @@
   "bin": "./server.ts",
   "scripts": {
     "start": "bun install --frozen-lockfile --no-summary && bun server.ts",
+    "start:node": "npx tsx server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
