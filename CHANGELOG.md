@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-11
+
+### Added
+- File allowlist documentation in MCP instructions — Claude now knows which paths are blocked (#5)
+
+### Fixed
+- **Security**: `assertSendable` rewritten with defense-in-depth — allowlist roots + basename denylist + parent-dir denylist + symlink resolution (#5)
+- **Security**: Outbound gate enforced on `react`, `edit_message`, `fetch_messages`, `download_attachment` tools (#5)
+- **Security**: Display name sanitization prevents prompt injection via Slack usernames (#5)
+- **Security**: `access.json` atomic write with mode 0o600 passed directly to `writeFileSync` (#5)
+- **Security**: `isSlackFileUrl()` validation prevents token exfiltration via crafted file URLs (#5)
+- **Security**: Dependencies pinned to exact versions with `--frozen-lockfile` on install (#5)
+- Restored `start:node` script for Node.js users (#5)
+
+### Changed
+- **BREAKING**: Default `dmPolicy` changed from `pairing` to `allowlist` — new installs must add user ID before DMs work (#6)
+- **BREAKING**: `assertSendable` policy changed from permissive (allow all except state dir) to restrictive (deny all except inbox + configured `SLACK_SENDABLE_ROOTS`) (#5)
+
+### Security
+- 7 vulnerabilities closed from pre-deployment security review by @maui-99
+- 34 new tests covering all security-critical functions (52 → 86 total)
+
 ## [0.2.0] - 2026-04-09
 
 ### Added
