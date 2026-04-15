@@ -985,6 +985,47 @@ socket.on('app_mention', async ({ event, ack }) => {
 })
 
 // ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+//
+// Without this, the process turns into a zombie when Claude Code disconnects.
+// The MCP SDK's StdioServerTransport only listens for stdin `data`/`error` —
+// not `end`/`close` — so EOF on the pipe is silently ignored. Meanwhile the
+// Socket Mode WebSocket keeps pinger/reconnect timers alive, holding the
+// event loop open indefinitely. We hook stdin directly, plus SIGINT/SIGTERM,
+// and tear down both the socket and the MCP server on any of those signals.
+
+let shuttingDown = false
+
+async function shutdown(reason: string, code = 0): Promise<void> {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.error(`[slack] Shutting down: ${reason}`)
+
+  // Force-exit safety net: if socket/mcp close hangs, don't linger.
+  const forceExit = setTimeout(() => {
+    console.error('[slack] Shutdown timed out, forcing exit')
+    process.exit(code)
+  }, 3000)
+  forceExit.unref()
+
+  try {
+    await socket.disconnect()
+  } catch (err) {
+    console.error('[slack] socket.disconnect() failed:', err)
+  }
+  try {
+    await mcp.close()
+  } catch { /* ignore */ }
+
+  clearTimeout(forceExit)
+  process.exit(code)
+}
+
+process.on('SIGINT', () => void shutdown('SIGINT'))
+process.on('SIGTERM', () => void shutdown('SIGTERM'))
+
+// ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 
@@ -1003,8 +1044,15 @@ async function main(): Promise<void> {
 
   // Connect MCP stdio (server ↔ Claude Code)
   const transport = new StdioServerTransport()
+  transport.onclose = () => void shutdown('stdio transport closed')
   await mcp.connect(transport)
   console.error('[slack] MCP server running on stdio')
+
+  // Belt-and-suspenders: the SDK's StdioServerTransport doesn't listen for
+  // stdin end/close, so transport.onclose never fires on its own. Hook stdin
+  // directly so a parent hangup (Claude Code session ends) triggers shutdown.
+  process.stdin.on('end', () => void shutdown('stdin EOF'))
+  process.stdin.on('close', () => void shutdown('stdin closed'))
 }
 
 main().catch((err) => {
