@@ -1,44 +1,19 @@
 # Dependabot configuration.
 #
-# Two ecosystems: npm (runtime + dev deps) and github-actions (workflow pins).
-# Grouping keeps @slack/* and @modelcontextprotocol/* updates as single PRs so
-# related-package bumps are reviewed together rather than as N isolated PRs.
+# Only github-actions is managed by Dependabot.
+#
+# npm is intentionally OMITTED: this repo uses Bun with bun.lockb, which
+# Dependabot cannot regenerate. Every npm-ecosystem Dependabot PR would
+# fail `bun install --frozen-lockfile` in CI because package.json and
+# bun.lockb drift apart. npm dependency bumps are handled manually via
+# a local `bun install` + commit. Revisit if/when Dependabot gains
+# native Bun support, or swap to Renovate which does support Bun.
 #
 # Reference: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
 
 version: 2
 
 updates:
-  - package-ecosystem: npm
-    directory: /
-    schedule:
-      interval: weekly
-      day: monday
-      time: "06:00"
-      timezone: America/Chicago
-    open-pull-requests-limit: 5
-    labels:
-      - dependencies
-    assignees:
-      - jeremylongshore
-    commit-message:
-      prefix: chore(deps)
-      prefix-development: chore(deps-dev)
-      include: scope
-    groups:
-      slack:
-        patterns:
-          - "@slack/*"
-      mcp:
-        patterns:
-          - "@modelcontextprotocol/*"
-      # Non-major dev-tooling bumps (typescript, @types/*) go in one PR.
-      dev-minor:
-        dependency-type: development
-        update-types:
-          - minor
-          - patch
-
   - package-ecosystem: github-actions
     directory: /
     schedule:
