@@ -1,0 +1,62 @@
+# Dependabot configuration.
+#
+# Two ecosystems: npm (runtime + dev deps) and github-actions (workflow pins).
+# Grouping keeps @slack/* and @modelcontextprotocol/* updates as single PRs so
+# related-package bumps are reviewed together rather than as N isolated PRs.
+#
+# Reference: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    assignees:
+      - jeremylongshore
+    commit-message:
+      prefix: chore(deps)
+      prefix-development: chore(deps-dev)
+      include: scope
+    groups:
+      slack:
+        patterns:
+          - "@slack/*"
+      mcp:
+        patterns:
+          - "@modelcontextprotocol/*"
+      # Non-major dev-tooling bumps (typescript, @types/*) go in one PR.
+      dev-minor:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    assignees:
+      - jeremylongshore
+    commit-message:
+      prefix: chore(ci)
+      include: scope
+    groups:
+      actions-minor:
+        update-types:
+          - minor
+          - patch

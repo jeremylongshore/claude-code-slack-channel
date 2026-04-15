@@ -1,0 +1,92 @@
+name: Bug report
+description: Something broke, crashed, or behaved weirdly. Not a security issue.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug.
+
+        **If this is a security issue — a way to bypass the inbound gate, leak
+        tokens, reach Claude from an un-paired sender, or anything along those
+        lines — please close this form and use the private report link on the
+        previous page instead.** Public issues for security bugs help attackers,
+        not defenders.
+
+  - type: checkboxes
+    id: not-security
+    attributes:
+      label: Confirm this is not a security report
+      options:
+        - label: This bug is **not** a gate bypass, token leak, or other vulnerability. I understand security issues go through private reporting.
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Short description of the actual behavior.
+      placeholder: "Slack DM from an allowlisted user didn't reach Claude — no error, just silence."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal recipe. Ideally something the maintainer can run without your Slack workspace.
+      placeholder: |
+        1. Start the server with `bun server.ts`
+        2. Send `...` from an allowlisted user
+        3. Observe `...`
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: "Output of `git rev-parse --short HEAD` or the release tag you're on."
+      placeholder: "v0.3.0 or abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      options:
+        - Bun
+        - Node.js (tsx)
+        - Docker
+        - Other (note in Extra context)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "macOS 14.5, Ubuntu 22.04, etc."
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste relevant server output. **Redact tokens, channel IDs, and user IDs.** If it's long, attach a file.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Extra context
+      description: Anything else — screenshots, suspected cause, related issues, workarounds.

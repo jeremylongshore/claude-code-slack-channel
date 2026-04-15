@@ -1,0 +1,20 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private report)
+    url: https://github.com/jeremylongshore/claude-code-slack-channel/security/advisories/new
+    about: |
+      Gate bypasses, token leaks, prompt-injection escapes, outbound-gate
+      bypasses, or anything that could reach Claude from an un-paired sender.
+      Goes straight to the maintainer via GitHub's private advisory flow — do
+      not file a public issue.
+
+  - name: Security policy and threat model
+    url: https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/SECURITY.md
+    about: Scope, defense layers, and what counts as in-scope before you report.
+
+  - name: Question or idea
+    url: https://github.com/jeremylongshore/claude-code-slack-channel/discussions
+    about: |
+      Not sure it's a bug? Want to propose a new MCP tool or a different
+      access-control model? Open a discussion first so we can hash it out
+      before anyone writes code.

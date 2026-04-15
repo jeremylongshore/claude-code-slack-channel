@@ -1,0 +1,66 @@
+name: CodeQL
+
+# Static analysis for the MCP server. This is a prompt-injection vector and
+# the gate/outbound/exfil guards in lib.ts are security-critical — CodeQL's
+# security-extended pack catches the JS/TS taint-flow and dangerous-sink
+# classes that could regress those guards.
+#
+# Source template: https://github.com/actions/starter-workflows/blob/main/code-scanning/codeql.yml
+# Action reference: https://github.com/github/codeql-action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly scan catches newly-published queries against unchanged code.
+    - cron: '27 6 * * 1'
+
+# A push to main cancels an in-flight PR run for the same ref; PR runs from
+# different branches don't collide.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: read-all
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    permissions:
+      # Required to upload SARIF results to the Security tab.
+      security-events: write
+      # Required to fetch internal action metadata on private repos; harmless on public.
+      actions: read
+      # Minimum needed for checkout.
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended = default security queries + additional high-signal
+          # rules (taint flow, unsafe deserialization, regex DoS). Packed ruleset
+          # shipped by GitHub; no custom config file required.
+          queries: security-extended
+
+      # No build step: javascript-typescript uses the none build mode by default
+      # (CodeQL extracts source directly). Keeping autobuild would still work,
+      # but the explicit analyze call is faster and matches the starter-workflow.
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+        with:
+          category: /language:${{ matrix.language }}

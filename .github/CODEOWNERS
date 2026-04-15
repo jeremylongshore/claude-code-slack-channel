@@ -1,0 +1,35 @@
+# CODEOWNERS for claude-code-slack-channel
+#
+# GitHub assigns review requests to the owners listed here whenever a matching
+# path changes. The *last* matching rule wins — more specific paths near the
+# bottom override the catch-all at the top.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-security/customizing-your-repository/about-code-owners
+
+# Default: everything is owned by the sole maintainer.
+* @jeremylongshore
+
+# Security-critical runtime — the gate, the guards, the transport.
+# Any edit here needs a human read-through, not just a rubber-stamp.
+/lib.ts                         @jeremylongshore
+/server.ts                      @jeremylongshore
+/server.test.ts                 @jeremylongshore
+
+# Access control surface (allowlist, pairing codes, on-disk schema).
+/ACCESS.md                      @jeremylongshore
+/skills/access/                 @jeremylongshore
+/skills/configure/              @jeremylongshore
+
+# Security policy + threat model — changes must be intentional.
+/SECURITY.md                    @jeremylongshore
+/CLAUDE.md                      @jeremylongshore
+
+# CI + release automation. Workflow edits can bypass the whole test gate,
+# so they get reviewed as carefully as the runtime.
+/.github/                       @jeremylongshore
+/.github/workflows/             @jeremylongshore
+
+# Dependency manifests — a single bad upgrade is a supply-chain incident.
+/package.json                   @jeremylongshore
+/bun.lockb                      @jeremylongshore
+/package-lock.json              @jeremylongshore
