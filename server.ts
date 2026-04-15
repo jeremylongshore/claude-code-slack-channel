@@ -39,6 +39,8 @@ import {
   sanitizeFilename,
   sanitizeDisplayName,
   gate as libGate,
+  isDuplicateEvent,
+  EVENT_DEDUP_TTL_MS,
   type Access,
   type GateResult,
 } from './lib.ts'
@@ -188,6 +190,10 @@ function assertSendable(filePath: string): void {
 
 // Track channels that passed inbound gate (session-lifetime cache)
 const deliveredChannels = new Set<string>()
+
+// Dedupe events across `message` and `app_mention` subscriptions. Keyed on
+// (channel, ts). See isDuplicateEvent in lib.ts for rationale.
+const seenEvents = new Map<string, number>()
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -829,9 +835,13 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 // ---------------------------------------------------------------------------
 
 async function handleMessage(event: unknown): Promise<void> {
-  const result = await gate(event)
-
   const ev = event as Record<string, unknown>
+
+  // Skip duplicates (message + app_mention fire for the same @-mentioned
+  // channel message; Slack also occasionally redelivers on slow acks).
+  if (isDuplicateEvent(ev, seenEvents, Date.now(), EVENT_DEDUP_TTL_MS)) return
+
+  const result = await gate(event)
 
   switch (result.action) {
     case 'drop':

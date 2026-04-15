@@ -11,6 +11,8 @@ import {
   defaultAccess,
   pruneExpired,
   generateCode,
+  isDuplicateEvent,
+  EVENT_DEDUP_TTL_MS,
   MAX_PENDING,
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
@@ -796,5 +798,88 @@ describe('defaultAccess', () => {
 
   test('returns empty pending', () => {
     expect(defaultAccess().pending).toEqual({})
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isDuplicateEvent()
+// ---------------------------------------------------------------------------
+
+describe('isDuplicateEvent', () => {
+  test('returns false and records the event on first seen', () => {
+    const seen = new Map<string, number>()
+    const result = isDuplicateEvent(
+      { channel: 'C1', ts: '1700000000.000100' },
+      seen,
+      1000,
+      EVENT_DEDUP_TTL_MS,
+    )
+    expect(result).toBe(false)
+    expect(seen.size).toBe(1)
+  })
+
+  test('returns true for repeat within TTL window', () => {
+    const seen = new Map<string, number>()
+    isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 1000, 60000)
+    const second = isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 2000, 60000)
+    expect(second).toBe(true)
+  })
+
+  test('returns false for same event after TTL expires', () => {
+    const seen = new Map<string, number>()
+    isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 1000, 60000)
+    const later = isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 62000, 60000)
+    expect(later).toBe(false)
+  })
+
+  test('distinguishes same ts across different channels', () => {
+    const seen = new Map<string, number>()
+    isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 1000, 60000)
+    const other = isDuplicateEvent({ channel: 'C2', ts: '1.0' }, seen, 1000, 60000)
+    expect(other).toBe(false)
+  })
+
+  test('distinguishes different ts within the same channel', () => {
+    const seen = new Map<string, number>()
+    isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 1000, 60000)
+    const other = isDuplicateEvent({ channel: 'C1', ts: '2.0' }, seen, 1000, 60000)
+    expect(other).toBe(false)
+  })
+
+  test('treats missing channel as undedupable (returns false, no record)', () => {
+    const seen = new Map<string, number>()
+    const result = isDuplicateEvent({ ts: '1.0' }, seen, 1000, 60000)
+    expect(result).toBe(false)
+    expect(seen.size).toBe(0)
+  })
+
+  test('treats missing ts as undedupable (returns false, no record)', () => {
+    const seen = new Map<string, number>()
+    const result = isDuplicateEvent({ channel: 'C1' }, seen, 1000, 60000)
+    expect(result).toBe(false)
+    expect(seen.size).toBe(0)
+  })
+
+  test('prunes expired entries when checking new events', () => {
+    const seen = new Map<string, number>()
+    isDuplicateEvent({ channel: 'C1', ts: '1.0' }, seen, 1000, 60000)
+    isDuplicateEvent({ channel: 'C1', ts: '2.0' }, seen, 62000, 60000)
+    expect(seen.size).toBe(1)
+    expect(seen.has('C1:1.0')).toBe(false)
+    expect(seen.has('C1:2.0')).toBe(true)
+  })
+
+  test('covers the intended scenario: message + app_mention duplicate delivery', () => {
+    const seen = new Map<string, number>()
+    const event = {
+      channel: 'C_INCIDENTS',
+      ts: '1700000000.000100',
+      user: 'U_SENDER',
+      text: 'hey <@U_BOT> please look',
+    }
+    // `message` subscription fires first
+    expect(isDuplicateEvent(event, seen, 1000, 60000)).toBe(false)
+    // `app_mention` subscription fires shortly after with the same event
+    expect(isDuplicateEvent(event, seen, 1050, 60000)).toBe(true)
   })
 })

@@ -454,3 +454,51 @@ function isMentioned(event: Record<string, unknown>, botUserId: string): boolean
   const text = (event['text'] as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
 }
+
+// ---------------------------------------------------------------------------
+// Event deduplication
+// ---------------------------------------------------------------------------
+
+/** How long a seen (channel, ts) pair stays in the dedup cache. */
+export const EVENT_DEDUP_TTL_MS = 60_000
+
+/**
+ * Detect and record a duplicate Slack event.
+ *
+ * Slack subscribes bots to both `message` and `app_mention` events. A channel
+ * message that @-mentions the bot arrives via BOTH subscriptions, so the
+ * server's handler runs twice for the same Slack message. This also protects
+ * against Slack's own event redelivery when an ack is slow or missed.
+ *
+ * Dedup key is (channel, ts) — Slack's own unique identifier for a message.
+ *
+ * Mutates `seen` in place: prunes expired entries on every call, then
+ * records this event with expiry at `now + ttlMs`. Returns true when the
+ * event was already recorded within the window (caller should skip).
+ * Events without both channel and ts can't be deduped and are treated as
+ * first-time (returns false).
+ */
+export function isDuplicateEvent(
+  event: Record<string, unknown>,
+  seen: Map<string, number>,
+  now: number,
+  ttlMs: number,
+): boolean {
+  // Prune expired on every check. Cheap in practice — TTL is short and
+  // the Map only holds a few minutes of event history.
+  for (const [key, expiresAt] of seen) {
+    if (expiresAt <= now) seen.delete(key)
+  }
+
+  const channel = event['channel']
+  const ts = event['ts']
+  if (typeof channel !== 'string' || typeof ts !== 'string') {
+    return false
+  }
+
+  const key = `${channel}:${ts}`
+  if (seen.has(key)) return true
+
+  seen.set(key, now + ttlMs)
+  return false
+}
