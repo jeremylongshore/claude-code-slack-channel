@@ -1,0 +1,54 @@
+# Gemini AI Code Review
+#
+# Template for all wild-* repos.
+# Requires these GitHub repo variables (set via scripts/gcp-setup.sh):
+#   WIF_PROVIDER, WIF_SERVICE_ACCOUNT, GCP_PROJECT_ID,
+#   GOOGLE_CLOUD_LOCATION, GOOGLE_GENAI_USE_VERTEXAI
+#
+# Copy this file to .github/workflows/gemini-review.yml in each wild-* repo.
+
+name: Gemini Code Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write   # Required for WIF
+
+jobs:
+  gemini-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gcp_workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          gcp_service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+          gcp_location: ${{ vars.GOOGLE_CLOUD_LOCATION }}
+          use_vertex_ai: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
+          gemini_model: gemini-2.5-pro
+          settings: |
+            {
+              "tools": {
+                "includeTools": [
+                  "add_comment_to_pending_review",
+                  "pull_request_read",
+                  "pull_request_review_write"
+                ],
+                "core": [
+                  "run_shell_command(cat)",
+                  "run_shell_command(echo)",
+                  "run_shell_command(grep)",
+                  "run_shell_command(head)",
+                  "run_shell_command(tail)"
+                ]
+              }
+            }
