@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.27.1",
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@slack/socket-mode": "2.0.6",
     "@slack/web-api": "7.15.0",
     "zod": "3.25.76"
