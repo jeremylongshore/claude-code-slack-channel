@@ -13,7 +13,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.27.1",
     "@slack/socket-mode": "2.0.6",
-    "@slack/web-api": "7.15.0",
+    "@slack/web-api": "7.15.1",
     "zod": "3.25.76"
   },
   "devDependencies": {
