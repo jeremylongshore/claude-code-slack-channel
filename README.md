@@ -1,9 +1,12 @@
-# Slack Channel for the Claude Code
+# claude-code-slack-channel v0.3.1
 
 Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channels, just like you'd chat in the terminal.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
+
+**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.3.1)
 
 > **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login.
 
@@ -54,7 +57,7 @@ Pick your runtime:
 #### Option A: Bun (recommended)
 
 ```bash
-cd slack && bun install
+bun install
 # Current (claude-code-plugins marketplace):
 claude --channels plugin:slack-channel@claude-code-plugins
 # Future (after upstream approval):
@@ -64,7 +67,7 @@ claude --channels plugin:slack-channel@claude-code-plugins
 #### Option B: Node.js / npx
 
 ```bash
-cd slack && npm install
+npm install
 # In .mcp.json, change command to: "npx", args: ["tsx", "server.ts"]
 claude --channels plugin:slack-channel@claude-code-plugins
 ```
@@ -72,7 +75,7 @@ claude --channels plugin:slack-channel@claude-code-plugins
 #### Option C: Docker
 
 ```bash
-cd slack && docker build -t claude-slack-channel .
+docker build -t claude-slack-channel .
 # In .mcp.json, change command to: "docker", args: ["run", "--rm", "-i", "-v", "~/.claude/channels/slack:/state", "claude-slack-channel"]
 claude --channels plugin:slack-channel@claude-code-plugins
 ```
@@ -120,8 +123,10 @@ claude --dangerously-load-development-channels server:slack
 
 ## Contributors
 
-- [@jeremylongshore](https://github.com/jeremylongshore) — author
-- [@maui-99](https://github.com/maui-99) — security hardening (v0.3.0)
+- [@jeremylongshore](https://github.com/jeremylongshore) — author, maintainer
+- [@maui-99](https://github.com/maui-99) — security hardening review (v0.3.0)
+- [@jinsung-kang](https://github.com/jinsung-kang) — clean shutdown on client disconnect (v0.3.1)
+- [@CaseyMargell](https://github.com/CaseyMargell) — event deduplication fix (v0.3.1)
 
 ## License
 
