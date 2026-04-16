@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.1] - 2026-04-15
 
 ### Fixed
-- MCP server now terminates cleanly on client disconnect (#7) — @maui-99
-- Deduplicated event delivery from `message` + `app_mention` dual-fire (#8) — @maui-99
+- MCP server now terminates cleanly on client disconnect (#7) — @jinsung-kang
+- Deduplicated event delivery from `message` + `app_mention` dual-fire (#8) — @CaseyMargell
 
 ### Changed
 - **Governance**: Added CODEOWNERS, PR template, SECURITY.md, CONTRIBUTING.md, CODE_OF_CONDUCT.md (#10)
