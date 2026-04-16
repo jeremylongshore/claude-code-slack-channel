@@ -8,7 +8,7 @@ Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP 
 
 ## Architecture
 
-Two-file MCP server: `server.ts` (stateful runtime, ~630 lines) and `lib.ts` (pure functions, ~260 lines). Three dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`. No frameworks.
+Two-file MCP server: `server.ts` (stateful runtime, ~1000 lines) and `lib.ts` (pure functions, ~460 lines). Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
 
 ```
 Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude Code
@@ -71,4 +71,4 @@ All state lives in `~/.claude/channels/slack/`:
 - Matches `anthropics/claude-plugins-official` patterns (file structure, naming, skills)
 - Bun primary runtime, Node.js/Docker as alternatives
 - TypeScript strict mode
-- No external frameworks beyond the three declared dependencies
+- No external frameworks beyond the four declared runtime dependencies
