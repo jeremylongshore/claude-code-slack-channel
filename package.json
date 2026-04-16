@@ -1,6 +1,6 @@
 {
   "name": "claude-channel-slack",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Slack channel for Claude Code — two-way chat via Socket Mode",
   "type": "module",
   "bin": "./server.ts",
