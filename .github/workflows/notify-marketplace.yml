@@ -8,9 +8,12 @@ on:
       - '.github/**'
       - '000-docs/**'
 
+permissions: {}
+
 jobs:
   notify:
     runs-on: ubuntu-latest
+    permissions: {}
     steps:
       - name: Trigger marketplace sync
         run: |
