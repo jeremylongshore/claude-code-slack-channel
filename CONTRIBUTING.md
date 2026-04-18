@@ -35,7 +35,7 @@ We welcome contributions to the Slack channel for Claude Code.
 ## Code Style
 
 - TypeScript strict mode
-- No external frameworks beyond the three declared dependencies
+- No external frameworks beyond the four declared runtime dependencies (`@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`)
 - Run `bun run typecheck` before submitting
 
 ## Testing
