@@ -13,6 +13,7 @@ import {
   generateCode,
   isDuplicateEvent,
   EVENT_DEDUP_TTL_MS,
+  PERMISSION_REPLY_RE,
   MAX_PENDING,
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
@@ -43,6 +44,8 @@ function makeOpts(overrides: Partial<GateOptions> = {}): GateOptions {
     staticMode: false,
     saveAccess: () => {},
     botUserId: 'U_BOT',
+    selfBotId: 'B_BOT',
+    selfAppId: 'A_BOT',
     ...overrides,
   }
 }
@@ -289,6 +292,135 @@ describe('gate', () => {
       makeOpts({ access }),
     )
     expect(result.action).toBe('deliver')
+  })
+
+  // -- allowBotIds (cross-bot coordination) --
+
+  test('drops bot message when channel has no allowBotIds (default-safe)', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: [] } },
+    })
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hello' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('drops bot message when bot user_id not in allowBotIds', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_OTHER_BOT'] } },
+    })
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hello' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('delivers bot message when user_id in allowBotIds and channel allowFrom includes it', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: ['U_PEER'], allowBotIds: ['U_PEER'] } },
+    })
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hello from peer' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('drops self-echo via bot_id match even when allowBotIds includes our botUserId', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: ['U_BOT'], allowBotIds: ['U_BOT'] } },
+    })
+    const result = await gate(
+      { bot_id: 'B_BOT', user: 'U_BOT', channel: 'C1', channel_type: 'channel', text: 'my own echo' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('drops self-echo when ev.user is missing but bot_profile.app_id matches', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_UNKNOWN'] } },
+    })
+    const result = await gate(
+      { bot_id: 'B_UNKNOWN', bot_profile: { app_id: 'A_BOT' }, channel: 'C1', channel_type: 'channel', text: 'no user field' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('drops bot message in DM channel even with allowBotIds set on a different channel', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER'] } },
+    })
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel_type: 'im', channel: 'D_DM', text: 'hello via DM' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('drops peer-bot message matching PERMISSION_REPLY_RE', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: ['U_PEER'], allowBotIds: ['U_PEER'] } },
+    })
+    // "y abcde" matches the permission reply pattern
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'y abcde' },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+
+    // Verify the regex matches what we expect
+    expect(PERMISSION_REPLY_RE.test('y abcde')).toBe(true)
+    expect(PERMISSION_REPLY_RE.test('no xyzwq')).toBe(true)
+    expect(PERMISSION_REPLY_RE.test('hello from peer bot')).toBe(false)
+  })
+
+  test('requireMention still applies to peer-bot messages', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: true, allowFrom: [], allowBotIds: ['U_PEER'] } },
+    })
+    const noMention = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'no mention here' },
+      makeOpts({ access }),
+    )
+    expect(noMention.action).toBe('drop')
+
+    const withMention = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hey <@U_BOT> please look' },
+      makeOpts({ access }),
+    )
+    expect(withMention.action).toBe('deliver')
+  })
+
+  test('peer bot not in global allowFrom cannot trigger permission relay via text', async () => {
+    // Peer bot is in allowBotIds but NOT in global access.allowFrom
+    const access = makeAccess({
+      allowFrom: ['U_HUMAN_ONLY'],
+      channels: { C1: { requireMention: false, allowFrom: ['U_PEER'], allowBotIds: ['U_PEER'] } },
+    })
+
+    // A non-permission message delivers normally
+    const normalMsg = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'incident detected' },
+      makeOpts({ access }),
+    )
+    expect(normalMsg.action).toBe('deliver')
+
+    // A permission-reply-shaped message is dropped by the gate
+    const permMsg = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'y abcde' },
+      makeOpts({ access }),
+    )
+    expect(permMsg.action).toBe('drop')
+
+    // Even if the message somehow reached handleMessage's permission branch,
+    // the global access.allowFrom check at server.ts:704/876 would block it
+    // because U_PEER is not in access.allowFrom. This test verifies the
+    // belt-and-suspenders gate-level check catches it first.
   })
 })
 
