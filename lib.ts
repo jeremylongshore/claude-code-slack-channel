@@ -650,6 +650,23 @@ export function deliveredThreadKey(
 }
 
 /**
+ * Composite key for the pending-permissions map (ccsc-xa3.7). Pairs a
+ * thread_ts with a request_id so an approval posted in thread A
+ * cannot satisfy a permission request issued from thread B. Uses
+ * `\0` as the separator — illegal in both Slack thread_ts (which is
+ * `"<unix>.<frac>"`) and in request_ids (Claude Code's 5 lowercase
+ * letters), so no collision with legitimate input is possible.
+ * `undefined` thread collapses to empty-string — distinct from any
+ * threaded slot per the same rule the outbound gate uses.
+ */
+export function permissionPairingKey(
+  threadTs: string | undefined,
+  requestId: string,
+): string {
+  return `${threadTs ?? ''}\0${requestId}`
+}
+
+/**
  * Throws if `(chatId, threadTs)` names a (channel, thread) pair that
  * has not previously delivered inbound AND `chatId` is not an
  * opted-in channel.

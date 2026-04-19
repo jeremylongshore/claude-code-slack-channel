@@ -36,6 +36,7 @@ import {
   validateSendableRoots,
   assertOutboundAllowed as libAssertOutboundAllowed,
   deliveredThreadKey as libDeliveredThreadKey,
+  permissionPairingKey as permKey,
   isSlackFileUrl,
   chunkText,
   sanitizeFilename,
@@ -624,6 +625,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Track pending permission request details for "See more" button expansion.
 // Each entry includes a timestamp for TTL-based cleanup (5-minute expiry).
+//
+// Keyed by `permKey(threadTs, requestId)` — the composite form (ccsc-
+// xa3.7) so an approval posted in thread A cannot satisfy a permission
+// prompt that was issued from thread B. requestId alone would collide
+// across threads when Claude Code happened to reuse the 5-letter space
+// (it's a 6.4M-id alphabet — collisions are rare but not impossible)
+// AND, more importantly, the pair blocks a crafted cross-thread reply
+// from authorizing a different thread's tool call even when the
+// requestIds genuinely differ. The composite key closes that gap.
 const PERM_TTL_MS = 5 * 60 * 1000
 const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; createdAt: number }>()
 
@@ -674,7 +684,12 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   assertOutboundAllowed(targetChannel, lastActiveThread)
 
   pruneStalePermissions()
-  pendingPermissions.set(params.request_id, {
+  // Pin the request to the thread it was issued from. The button /
+  // text-reply resolvers must present the SAME thread_ts to look the
+  // entry up — see ccsc-xa3.7 for the cross-thread authorization gap
+  // this closes. The thread itself is encoded in the key; no need
+  // to store it on the value.
+  pendingPermissions.set(permKey(lastActiveThread, params.request_id), {
     tool_name: params.tool_name,
     description: params.description,
     input_preview: params.input_preview,
@@ -758,10 +773,19 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 
     const channelId: string = body.channel?.id || ''
     const messageTs: string = body.message?.ts || ''
+    // Slack includes `thread_ts` on interactive payloads only when the
+    // message lives inside a thread. Top-level messages have no
+    // thread_ts on the message body. Normalize to undefined so the
+    // lookup key matches the request-time key exactly.
+    const interactionThreadTs: string | undefined =
+      (body.message?.thread_ts as string | undefined) || undefined
 
     if (verb === 'more') {
-      // Expand details — update the message to include input_preview
-      const details = pendingPermissions.get(requestId)
+      // Expand details — update the message to include input_preview.
+      // Scoped to the thread this button lives in; a request issued
+      // in a different thread with the same requestId (vanishingly
+      // rare collision) won't leak its preview here.
+      const details = pendingPermissions.get(permKey(interactionThreadTs, requestId))
       if (!details || !channelId || !messageTs) return
 
       // Use plain_text to prevent mrkdwn injection from tool input.
@@ -816,8 +840,12 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
       return
     }
 
-    // Allow or Deny — send verdict to Claude Code
-    const details = pendingPermissions.get(requestId)
+    // Allow or Deny — send verdict to Claude Code. Lookup is scoped
+    // to (interaction thread, requestId) so a click in thread X
+    // cannot satisfy a request issued from thread Y even when the
+    // requestIds match (ccsc-xa3.7).
+    const key = permKey(interactionThreadTs, requestId)
+    const details = pendingPermissions.get(key)
     if (!details) {
       // Already resolved (by button or text reply) — update message and bail
       if (channelId && messageTs) {
@@ -841,7 +869,7 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
       method: 'notifications/claude/channel/permission',
       params: { request_id: requestId, behavior },
     })
-    pendingPermissions.delete(requestId)
+    pendingPermissions.delete(key)
 
     // Update message to show outcome (remove buttons)
     if (channelId && messageTs) {
@@ -932,8 +960,17 @@ async function handleMessage(event: unknown): Promise<void> {
 
         pruneStalePermissions()
 
-        // Skip if already resolved (e.g. by a button click)
-        if (!pendingPermissions.has(requestId)) {
+        // Scope the lookup to the thread the reply arrived from. A
+        // reply posted in thread X cannot satisfy a request issued
+        // from thread Y (ccsc-xa3.7). If the requestId exists but in
+        // a different thread we still reject — an honest SO who
+        // replies in the wrong thread gets an unambiguous rejection
+        // emoji rather than a silent cross-thread resolution.
+        const replyKey = permKey(incomingThreadTs, requestId)
+
+        // Skip if already resolved (e.g. by a button click) OR if the
+        // requestId is not pending in THIS thread.
+        if (!pendingPermissions.has(replyKey)) {
           try {
             await web.reactions.add({
               channel: channelId,
@@ -951,7 +988,7 @@ async function handleMessage(event: unknown): Promise<void> {
             behavior: permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
           },
         })
-        pendingPermissions.delete(requestId)
+        pendingPermissions.delete(replyKey)
         // Ack with a reaction so the user knows it was processed
         try {
           await web.reactions.add({
