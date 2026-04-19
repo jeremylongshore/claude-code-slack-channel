@@ -3110,10 +3110,11 @@ describe('createSessionSupervisor.activate', () => {
     await expect(sup.shutdown()).rejects.toThrow(/xa3\.14/)
   })
 
-  test('handle.update is a staged stub that rejects with a bead pointer', async () => {
+  test('handle.update on an active handle resolves (ccsc-9d9 implemented)', async () => {
     const sup = makeSupervisor()
     const handle = await sup.activate(key, 'U_OWNER')
-    await expect(handle.update((s) => s)).rejects.toThrow(/not yet implemented/)
+    // update() is now wired (ccsc-9d9); an identity fn must resolve cleanly.
+    await expect(handle.update((s) => s)).resolves.toBeUndefined()
   })
 })
 
@@ -5584,6 +5585,172 @@ describe('SessionSupervisor quarantine (S6)', () => {
     // Both should complete without throwing.
     await expect(sup.reapIdle()).resolves.toBeUndefined()
     await expect(aggressiveSup.reapIdle()).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SessionHandle.update() — mutex-serialised state mutation (ccsc-9d9)
+//
+// Verifies the six acceptance criteria from the bead:
+//   1. Basic update mutates in-memory session and persists to disk.
+//   2. Concurrent updates serialize — increments apply in call order.
+//   3. Concurrent update + deactivate serialize without half-written state.
+//   4. update() after quiesce() rejects with /quiescing/i.
+//   5. update() on a quarantined handle rejects with /quarantined/i.
+//   6. save failure during update() quarantines the handle and chains cause.
+// ---------------------------------------------------------------------------
+
+describe('SessionHandle.update (ccsc-9d9)', () => {
+  const KEY: SessionKey = { channel: 'C_UPD', thread: '1700000000.000001' }
+  const OWNER = 'U_UPD'
+
+  let rawRoot: string
+  let stateRoot: string
+  let channelDir: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'sup-update-'))
+    stateRoot = realpathSync.native(rawRoot)
+    channelDir = join(stateRoot, 'sessions', KEY.channel)
+    mkdirSync(channelDir, { recursive: true, mode: 0o700 })
+  })
+
+  afterEach(() => {
+    try {
+      const { chmodSync } = require('fs')
+      chmodSync(channelDir, 0o700)
+    } catch { /* best-effort */ }
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    return createSessionSupervisor({
+      stateRoot,
+      log: () => { /* silent */ },
+      clock: () => 1_700_000_000_000,
+    })
+  }
+
+  // 1. Basic update mutates in-memory session and persists to disk.
+  test('update mutates in-memory session and persists to disk', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(KEY, OWNER)
+
+    await handle.update((s) => ({ ...s, data: { turns: 1 } }))
+
+    // In-memory reference reflects the patch.
+    expect(handle.session.data).toEqual({ turns: 1 })
+
+    // On-disk file reflects the same patch.
+    const p = sessionPath(stateRoot, KEY)
+    const fromDisk = await loadSession(stateRoot, p)
+    expect(fromDisk.data).toEqual({ turns: 1 })
+  })
+
+  // 2. Concurrent updates serialize in call order — counter increments
+  //    must total the number of calls with no lost writes.
+  test('concurrent updates serialize in call order', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(KEY, OWNER)
+
+    // Seed a counter.
+    await handle.update((s) => ({ ...s, data: { count: 0 } }))
+
+    // Fire three concurrent increments without awaiting individually.
+    const p1 = handle.update((s) => ({ ...s, data: { count: (s.data['count'] as number) + 1 } }))
+    const p2 = handle.update((s) => ({ ...s, data: { count: (s.data['count'] as number) + 1 } }))
+    const p3 = handle.update((s) => ({ ...s, data: { count: (s.data['count'] as number) + 1 } }))
+    await Promise.all([p1, p2, p3])
+
+    expect((handle.session.data['count'] as number)).toBe(3)
+
+    // Disk must also reflect the final value.
+    const path = sessionPath(stateRoot, KEY)
+    const fromDisk = await loadSession(stateRoot, path)
+    expect(fromDisk.data['count']).toBe(3)
+  })
+
+  // 3. Concurrent update + deactivate serialize — final state must be
+  //    consistent: no half-written file and no lost update.
+  test('concurrent update + deactivate serialize without corrupting state', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(KEY, OWNER)
+
+    // Fire update first (not awaited), then quiesce + deactivate.
+    const updateP = handle.update((s) => ({ ...s, data: { sentinel: 'written' } }))
+    const quiesceP = sup.quiesce(KEY)
+
+    // Both must settle without throwing.
+    await Promise.allSettled([updateP, quiesceP])
+    await sup.deactivate(KEY)
+
+    // Disk must be parseable (not corrupt). The sentinel may or may not
+    // be present depending on race ordering, but the file must be valid.
+    const path = sessionPath(stateRoot, KEY)
+    const fromDisk = await loadSession(stateRoot, path)
+    expect(fromDisk.key).toEqual(KEY)
+  })
+
+  // 4. update() after quiesce() rejects with /quiescing/i.
+  test('update after quiesce rejects with quiescing error', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(KEY, OWNER)
+    await sup.quiesce(KEY)
+
+    await expect(handle.update((s) => s)).rejects.toThrow(/quiescing/i)
+  })
+
+  // 5. update() on a quarantined handle rejects with /quarantined/i.
+  test('update on quarantined handle rejects with quarantined error', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(KEY, OWNER)
+
+    // Force quarantine via the package-private transition (same pattern
+    // as the deactivate quarantine tests in S6).
+    const h = handle as unknown as { markQuarantined(): void }
+    h.markQuarantined()
+
+    await expect(handle.update((s) => s)).rejects.toThrow(/quarantined/i)
+  })
+
+  // 6. save failure during update() quarantines the handle + chains cause.
+  test('save failure during update quarantines the handle and chains cause', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(KEY, OWNER)
+
+    // Make the channel dir unwritable so saveSession()'s tmp-write fails
+    // with EACCES — same chmod trick used in S6.
+    const { chmodSync } = require('fs')
+    chmodSync(channelDir, 0o000)
+
+    let caught: unknown
+    try {
+      await handle.update((s) => ({ ...s, data: { injected: true } }))
+    } catch (err) {
+      caught = err
+    } finally {
+      chmodSync(channelDir, 0o700)
+    }
+
+    // The promise must have rejected.
+    expect(caught).toBeInstanceOf(Error)
+    const err = caught as Error
+
+    // Error must mention quarantined.
+    expect(err.message).toMatch(/quarantined/i)
+
+    // Error.cause must carry the underlying filesystem error.
+    expect(err.cause).toBeInstanceOf(Error)
+    const cause = err.cause as Error
+    expect(cause.message).toMatch(/EACCES|permission denied|EPERM/i)
+
+    // Handle must now be in quarantined state.
+    expect(handle.state).toBe('quarantined')
+
+    // Subsequent update() must also reject with quarantined.
+    await expect(handle.update((s) => s)).rejects.toThrow(/quarantined/i)
   })
 })
 

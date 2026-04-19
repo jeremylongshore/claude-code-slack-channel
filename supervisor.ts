@@ -418,8 +418,23 @@ export function createSessionSupervisor(
     }
 
     const handle = new ConcreteHandle(key, session, path)
+    // Wire the quarantine callback so update()'s failure arm can record
+    // the error in the supervisor's quarantined map AND remove the handle
+    // from live. Without this the supervisor's two maps would be out of
+    // sync: live still carrying a quarantined handle that activate()
+    // would return instead of rejecting.
+    const id = keyId(key)
+    handle.onQuarantine = (err: Error) => {
+      quarantined.set(id, err)
+      live.delete(id)
+      log('session.update_error', {
+        channel: key.channel,
+        thread: key.thread,
+        error: errorMessage(err),
+      })
+    }
     handle.markActive()
-    live.set(keyId(key), handle)
+    live.set(id, handle)
 
     log('session.activate', {
       channel: key.channel,
@@ -674,6 +689,14 @@ class ConcreteHandle implements SessionHandle {
    *  `sessionPath()` (which would re-mkdir the parent). */
   readonly path: string
 
+  /** Mutex tail for serialised `update()` calls. Each call chains its
+   *  work onto this promise so concurrent updates run in strict call
+   *  order without interleaving. Initialized to a resolved promise so
+   *  the first update starts immediately. The chain carries
+   *  `Promise<void>` throughout; individual links catch their own errors
+   *  to prevent a rejected link from collapsing the whole chain. */
+  private writeQueue: Promise<void> = Promise.resolve()
+
   /** In-flight drain promise allocated by `beginQuiesce()`. Null when
    *  the handle is Active (nothing to drain). Callers of quiesce share
    *  this promise so concurrent quiesce() requests do not allocate
@@ -684,6 +707,15 @@ class ConcreteHandle implements SessionHandle {
    *  last in-flight entry drains, or directly by `beginQuiesce()` when
    *  the map is already empty at quiesce time. */
   private resolveQuiesce: (() => void) | null = null
+
+  /** Callback invoked when `update()` transitions the handle to
+   *  `quarantined`. The supervisor injects this so its `quarantined` map
+   *  stays consistent: a quarantine triggered inside the write queue
+   *  must be recorded in the same map that `activate()` checks, or a
+   *  subsequent activate() would silently reload a potentially-corrupt
+   *  file instead of rejecting. Set once by the supervisor after
+   *  construction; never null after `markActive()`. */
+  onQuarantine: ((err: Error) => void) | null = null
 
   constructor(key: SessionKey, session: Session, path: string) {
     this.key = key
@@ -815,15 +847,88 @@ class ConcreteHandle implements SessionHandle {
     }
   }
 
-  update(_fn: (prev: Session) => Session): Promise<void> {
-    // Staged for a later bead. update() is documented in the interface
-    // so later code can rely on the shape, but the mutex + atomic-write
-    // plumbing lands with the first real consumer (29-B or a follow-up
-    // 32-B bead). The interface's "rejects when state !== 'active'"
-    // clause lands with the real impl — for now we reject uniformly.
-    return Promise.reject(
-      new Error('SessionHandle.update: not yet implemented (later 32-B bead)'),
-    )
+  /** Serialise a state mutation through the per-session write mutex,
+   *  persist it atomically, and refresh `this.session` on success.
+   *
+   *  The write queue is a promise chain: each call appends a new link
+   *  and returns a promise that resolves only after the previous link
+   *  settles. Links catch their own errors so a failed update does not
+   *  prevent subsequent calls from running — the handle quarantines
+   *  itself and further calls will immediately reject at the state check.
+   *
+   *  Implementation mirrors the `deactivate()` save path: both use
+   *  `saveSession()` (tmp + chmod + rename from lib.ts) and both
+   *  transition to `quarantined` on save failure. */
+  update(fn: (prev: Session) => Session): Promise<void> {
+    // Capture state at enqueue time for the early-exit checks below.
+    // We re-check after acquiring the mutex because state can change
+    // while waiting in the queue (a concurrent quiesce, for example).
+    const enqueueTimeState = this._state
+
+    if (enqueueTimeState === 'quarantined') {
+      return Promise.reject(
+        new Error(`SessionHandle.update: handle is quarantined`),
+      )
+    }
+    if (enqueueTimeState !== 'active') {
+      // Covers 'quiescing', 'deactivating', and 'activating'.
+      return Promise.reject(
+        new Error(`SessionHandle.update: handle quiescing`),
+      )
+    }
+
+    // Expose a stable Promise<void> to the caller that resolves/rejects
+    // based solely on this link's outcome.
+    let resolve!: () => void
+    let reject!: (err: unknown) => void
+    const callerPromise = new Promise<void>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+
+    // Chain the work unit onto the write queue. The link must catch all
+    // errors to avoid collapsing the chain — the original rejection is
+    // forwarded to the caller via `callerPromise`.
+    this.writeQueue = this.writeQueue.then(async () => {
+      // Re-check state now that we hold the mutex. A concurrent quiesce
+      // or a previous update's quarantine may have changed things.
+      if (this._state === 'quarantined') {
+        reject(new Error(`SessionHandle.update: handle is quarantined`))
+        return
+      }
+      if (this._state !== 'active') {
+        reject(new Error(`SessionHandle.update: handle quiescing`))
+        return
+      }
+
+      const prev = this.session
+      const next = fn(prev)
+
+      try {
+        await saveSession(this.path, next)
+        this.session = next
+        resolve()
+      } catch (err) {
+        // Save failure: quarantine the handle so future update() and
+        // activate() calls fail fast. In-memory session reverts to
+        // `prev` (it was never reassigned). This mirrors the deactivate()
+        // failure arm exactly (session-state-machine.md §132-137).
+        this._state = 'quarantined'
+        const errObj = err instanceof Error ? err : new Error(String(err))
+        // Notify the supervisor so its quarantined map and live map stay
+        // in sync. Without this, a subsequent activate() would return the
+        // cached live handle (which is now quarantined) instead of
+        // rejecting — violating the sticky-quarantine invariant.
+        this.onQuarantine?.(errObj)
+        reject(
+          new Error(`SessionHandle.update: save failed; handle quarantined`, {
+            cause: errObj,
+          }),
+        )
+      }
+    })
+
+    return callerPromise
   }
 }
 
