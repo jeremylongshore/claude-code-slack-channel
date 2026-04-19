@@ -1,16 +1,20 @@
 # Gemini AI Code Review
 #
-# Template for all wild-* repos.
 # Requires these GitHub repo variables (set via scripts/gcp-setup.sh):
 #   WIF_PROVIDER, WIF_SERVICE_ACCOUNT, GCP_PROJECT_ID,
 #   GOOGLE_CLOUD_LOCATION, GOOGLE_GENAI_USE_VERTEXAI
 #
-# Copy this file to .github/workflows/gemini-review.yml in each wild-* repo.
+# Uses pull_request_target so WIF auth works on fork PRs. This workflow
+# is read-only by design: it checks out the PR head SHA but never executes
+# any code from it (no install, no build, no test). The run-gemini-cli
+# action reads the diff via the GitHub API and is restricted to read-only
+# shell tools (cat, echo, grep, head, tail). A malicious fork cannot
+# compromise the runner credentials through code Gemini only reads.
 
 name: Gemini Code Review
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [opened, synchronize, reopened]
 
@@ -27,6 +31,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          # Check out the PR head SHA explicitly (pull_request_target
+          # defaults to base branch). Using the SHA (not ref) prevents
+          # TOCTOU if the PR is force-pushed mid-run.
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - uses: google-github-actions/run-gemini-cli@9dbec29a20fab3f35017a40ad0eb798a257d4d51 # v0
         with:
