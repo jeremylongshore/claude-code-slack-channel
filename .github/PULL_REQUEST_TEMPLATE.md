@@ -100,3 +100,4 @@ convincing, you'll be asked for more, or the PR will be declined.
 - [ ] I did not add runtime dependencies beyond what's needed (the "four deps" rule)
 - [ ] Commit messages describe *why*, not just *what*
 - [ ] If this is a breaking change, `CHANGELOG.md` says so loudly
+- [ ] I re-read the full PR diff (not just the latest commit) before clicking merge
