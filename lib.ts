@@ -10,7 +10,7 @@
 
 import { resolve, sep, basename, join } from 'path'
 import { realpathSync, mkdirSync } from 'fs'
-import { writeFile, chmod, rename, unlink } from 'fs/promises'
+import { writeFile, chmod, rename, unlink, readFile } from 'fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -257,6 +257,46 @@ export async function saveSession(path: string, session: Session): Promise<void>
     }
     throw err
   }
+}
+
+/** Read and parse a session file, fail-closed on any containment breach.
+ *
+ *  Contract (000-docs/session-state-machine.md §47-68, §232-239):
+ *
+ *  - `path` is assumed to be the output of `sessionPath()` from a prior
+ *    turn. Between save and load, an adversary with local access could
+ *    replace the file with a symlink pointing outside the state root.
+ *    `loadSession` catches that by realpath-ing both the root and the
+ *    path and verifying root-prefix containment.
+ *  - Both `root` and `path` are realpath-resolved up front. Any
+ *    resolution failure (ENOENT on a missing file, loop, permission)
+ *    propagates to the caller — the supervisor treats that as a
+ *    `Quarantined` transition per the state machine.
+ *  - JSON.parse errors propagate unchanged. No silent recovery;
+ *    malformed session files are loud failures.
+ *
+ *  This function does NOT schema-validate the parsed object against the
+ *  `Session` shape. The writer (saveSession) is trusted to produce valid
+ *  content; runtime schema validation is a separate concern (a Zod
+ *  schema for Session would live with the type).
+ *
+ *  **Fail-closed posture.** Any throw here should drop the event (the
+ *  supervisor Quarantines the key); it must never degrade to a partial
+ *  load or a synthesized empty session.
+ */
+export async function loadSession(root: string, path: string): Promise<Session> {
+  const resolvedRoot = realpathSync.native(resolve(root))
+  // realpath on the file itself — throws ENOENT if missing, which is
+  // the caller's signal to create a fresh session. Also collapses any
+  // symlinks at `path` to their true target.
+  const resolvedFile = realpathSync.native(path)
+  if (!isUnderRoot(resolvedFile, resolvedRoot)) {
+    throw new Error(
+      `loadSession: resolved path escapes state root: ${JSON.stringify(path)}`,
+    )
+  }
+  const raw = await readFile(resolvedFile, 'utf8')
+  return JSON.parse(raw) as Session
 }
 
 // ---------------------------------------------------------------------------

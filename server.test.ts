@@ -14,6 +14,7 @@ import {
   isDuplicateEvent,
   sessionPath,
   saveSession,
+  loadSession,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   MAX_PENDING,
@@ -1285,5 +1286,120 @@ describe('saveSession', () => {
     const loaded = JSON.parse(readFileSync(p, 'utf8')) as Session
     expect(loaded.key.channel).toBe('C_ID')
     expect(loaded.key.thread).toBe('1700000000.000100')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// loadSession — realpath-guarded reader
+//
+// Entry point to on-disk state after a supervisor restart. Trusts nothing:
+// realpaths both root and target, verifies containment, fail-closed on any
+// resolution error. See 000-docs/session-state-machine.md §232-239 for the
+// restart-recovery contract this reader serves.
+// ---------------------------------------------------------------------------
+
+describe('loadSession', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  const makeSession = (channel: string, thread: string): Session => ({
+    v: 1,
+    key: { channel, thread },
+    createdAt: 1_700_000_000_000,
+    lastActiveAt: 1_700_000_001_000,
+    ownerId: 'U_OWNER',
+    data: { turns: ['hello', 'world'] },
+  })
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'loadSession-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('round-trips with saveSession — load returns the saved object', async () => {
+    const key = { channel: 'C_RT', thread: '1700000000.000100' }
+    const p = sessionPath(tmpRoot, key)
+    const s = makeSession(key.channel, key.thread)
+
+    await saveSession(p, s)
+    const loaded = await loadSession(tmpRoot, p)
+
+    expect(loaded).toEqual(s)
+  })
+
+  test('throws ENOENT when file is missing', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_MISS', thread: 'T1.0' })
+    // sessionPath created the per-channel dir but no file yet.
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('rejects symlink at session file pointing outside the state root', async () => {
+    // Simulate an attacker who swaps the session file for a symlink
+    // to an arbitrary path after save. loadSession realpaths and
+    // checks the resolved target is still under the state root.
+    const outside = mkdtempSync(join(tmpdir(), 'loadSession-escape-'))
+    const victimFile = join(outside, 'victim.json')
+    writeFileSync(victimFile, JSON.stringify(makeSession('C_EVIL', 'T1.0')))
+
+    try {
+      const p = sessionPath(tmpRoot, { channel: 'C_EVIL', thread: 'T1.0' })
+      // Place a symlink at the session-file path pointing outside root.
+      symlinkSync(victimFile, p)
+
+      await expect(loadSession(tmpRoot, p)).rejects.toThrow(/escapes state root/)
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  test('throws on malformed JSON — no silent recovery', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_BAD', thread: 'T1.0' })
+    writeFileSync(p, '{not valid json', { mode: 0o600 })
+
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('round-trip preserves nested data field contents', async () => {
+    const key = { channel: 'C_NEST', thread: 'T1.0' }
+    const p = sessionPath(tmpRoot, key)
+    const s = makeSession(key.channel, key.thread)
+    s.data = {
+      turns: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi back' },
+      ],
+      counters: { messages: 2, replies: 1 },
+    }
+
+    await saveSession(p, s)
+    const loaded = await loadSession(tmpRoot, p)
+
+    expect(loaded.data).toEqual(s.data)
+  })
+
+  test('two threads in one channel round-trip independently', async () => {
+    // Locks the core session-isolation invariant end-to-end: save thread A,
+    // save thread B, load both, neither sees the other's state.
+    const pA = sessionPath(tmpRoot, { channel: 'C_ISO', thread: 'TA.0' })
+    const pB = sessionPath(tmpRoot, { channel: 'C_ISO', thread: 'TB.0' })
+
+    const sA = makeSession('C_ISO', 'TA.0')
+    sA.ownerId = 'U_A'
+    const sB = makeSession('C_ISO', 'TB.0')
+    sB.ownerId = 'U_B'
+
+    await saveSession(pA, sA)
+    await saveSession(pB, sB)
+
+    const loadedA = await loadSession(tmpRoot, pA)
+    const loadedB = await loadSession(tmpRoot, pB)
+
+    expect(loadedA.ownerId).toBe('U_A')
+    expect(loadedB.ownerId).toBe('U_B')
+    expect(loadedA.key.thread).toBe('TA.0')
+    expect(loadedB.key.thread).toBe('TB.0')
   })
 })
