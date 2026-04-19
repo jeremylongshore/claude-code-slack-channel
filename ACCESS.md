@@ -115,6 +115,53 @@ How to split long messages: `"newline"` (paragraph-aware, default) or `"length"`
 - Corrupt files are moved aside and replaced with defaults
 - In static mode (`SLACK_ACCESS_MODE=static`), the file is read once at boot and never mutated
 
+## State directory layout
+
+All plugin state lives under `~/.claude/channels/slack/`. Files are mode `0o600`, directories `0o700` — owner-only access. The plugin is single-writer per state directory; running two plugin instances against the same directory is undefined behavior.
+
+```
+~/.claude/channels/slack/
+├── .env                        # tokens (xoxb / xapp), SLACK_SENDABLE_ROOTS, SLACK_ACCESS_MODE   (0o600)
+├── access.json                 # this file — allowlist, pairing codes, per-channel policy        (0o600)
+├── inbox/                      # downloaded attachments, auto-allowed for re-share via `reply`   (0o700)
+└── sessions/                   # per-thread conversation state (v0.5.0+)                          (0o700)
+    ├── .migrated               # sentinel: migrator has run; future boots skip the scan          (0o600)
+    ├── C0123456789/            # one directory per Slack channel ID
+    │   ├── default.json        #   migrated flat pre-0.5.0 session, if the channel had one       (0o600)
+    │   ├── 1700000000.000100.json   # one file per thread_ts                                     (0o600)
+    │   └── 1700000500.000200.json   #                                                            (0o600)
+    └── D0987654321/            # DMs use the same per-channel layout (channel ID starts with D)
+        └── 1700000100.000300.json
+```
+
+### How thread-scoping works
+
+A **session** is the unit of conversation state. One session corresponds to one Slack thread — **not** one channel. Two parallel threads in the same channel get two independent sessions and never observe each other's state.
+
+- `channel` — Slack channel ID, e.g. `C0123456789` (channel) or `D0123456789` (DM).
+- `thread` — `thread_ts` from the Slack event. For top-level (non-threaded) messages, the plugin synthesises `thread = ts` of the root message, so the first reply anchors the thread naturally.
+
+Session files are **self-describing**: each JSON file duplicates the `(channel, thread)` key inside the file body. A moved or copied session file stays traceable under forensic inspection.
+
+### Migration from v0.4.x
+
+Pre-0.5.0, the plugin kept one file per channel at `sessions/<channel>.json`. The migrator runs once at boot:
+
+- Finds each `sessions/*.json` that is a regular file.
+- Creates `sessions/<channel>/` at mode `0o700`.
+- Moves the legacy file to `sessions/<channel>/default.json` (atomic rename; mode preserved).
+- Drops `sessions/.migrated` so subsequent boots no-op.
+
+Existing conversations that predate thread-scoping surface as the `default` thread and continue without context loss. If the migrator encounters a partial prior migration (per-channel dir already exists), it leaves the legacy file in place and surfaces the conflict rather than clobber.
+
+### Safety invariants
+
+- **Realpath-guarded joins.** Every path is validated against `/^[A-Za-z0-9._-]+$/` and additionally rejected if the component is exactly `.` or `..` (both match the regex but would escape the `sessions/` layer via `path.join`). After the per-channel directory is created, `realpath` resolves it and the plugin verifies the state root is still a prefix — catches symlink-based smuggling (CWE-22).
+- **Atomic writes.** Every session save is `writeFile(<path>.tmp.<pid>, {flag: 'wx', mode: 0o600})` → `chmod 0o600` → `rename`. Readers never observe a partial file; the `wx` flag makes a stale `.tmp.*` from a crashed prior writer a loud failure rather than a silent overwrite.
+- **Fail-closed loader.** `loadSession` realpaths the file before reading; any containment breach or malformed JSON throws and the supervisor Quarantines the session. No silent degradation to an empty session.
+
+Full design reference: [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md).
+
 ## File attachments — sendable roots
 
 The `reply` tool can attach files to Slack messages, but only files whose
