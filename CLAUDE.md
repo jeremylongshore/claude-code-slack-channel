@@ -106,10 +106,11 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
+   bd backup export-git   # pushes a snapshot to origin/beads-backup for cross-machine recovery
    git push
    git status  # MUST show "up to date with origin"
    ```
+   (`bd dolt push` is only for projects with a Dolt remote configured via `bd dolt remote add`; this repo uses the git-branch backup path instead.)
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
