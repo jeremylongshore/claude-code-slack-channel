@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-04-19
+
+### Added
+- **SessionHandle.update() mutex-serialized state mutation** (#92) — closes the "not yet implemented" stub from v0.5.0. `update(fn)` now uses a per-handle write queue so concurrent tool calls serialize their state transitions. `saveSession` uses `await writeFile` instead of `writeFileSync` and propagates file-write failures via `Error.cause`.
+- **SessionSupervisor wired into server.ts** (#93) — the supervisor from v0.5.0 is now live: `createSessionSupervisor(STATE_DIR)` at boot, `supervisor.activate()` on every inbound message (human and peer-bot), idle reaper on 60s interval via `SLACK_SESSION_IDLE_MS`, `supervisor.shutdown()` on SIGTERM/SIGINT/stdin-EOF. Quarantine tracking persists across deactivate/activate cycles.
+- **Journal event emission at gate/session/pairing paths** (#94) — 10 of the 19 `EventKind` values now fire in production: `system.boot`, `system.shutdown`, `gate.inbound.deliver`, `gate.inbound.drop`, `gate.outbound.allow`, `gate.outbound.deny`, `exfil.block`, `session.activate`, `session.quiesce`, `session.deactivate`. Remaining `pairing.*` and `policy.*` events land when their trigger points exist (pairing.accepted lives in the CLI skill, not the server). Journal path: `~/.claude/channels/slack/audit.log`.
+- **430 tests** — up from 370 in v0.5.0 (+60 covering the security fixes and wiring).
+
+### Fixed
+- **`assertSendable` state-root denylist (S1)** (#86) — `assertSendable` now accepts an explicit `stateRoot` parameter and rejects any path under it (via `isUnderRoot` + realpath resolution). Closes the doc-vs-code gap where CLAUDE.md claimed `.env`/`access.json`/`audit.log`/`sessions/` were blocked, but only `allowlistRoots` + basename denylists were enforced. Operators who misconfigure `SLACK_SENDABLE_ROOTS=~/.claude` no longer leak `access.json`.
+- **Journal broken-flag + schema-parse ordering (S2, S3)** (#89) — `_doWrite` now checks `if (this.broken) throw this.broken` at entry, ensuring in-flight queue entries reject correctly. ZodError during `JournalEvent.parse()` no longer sets `this.broken` (schema errors are retriable); parse now runs before hash computation so a bad event never mutates state.
+- **`loadSession` Zod schema validation (S4)** (#87) — `loadSession` now validates against a strict `SessionSchema` Zod schema. Corrupt/attacker-modified session files (e.g., `ownerId: 123`) throw at load time instead of passing through to the supervisor. Added `owner` alias for `ownerId` during migration.
+- **Per-tool Zod input schemas for MCP handlers (S5)** (#91) — All 9 MCP tools (`reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`, `upload_file`, `list_channels`, `get_thread_replies`, `list_sessions`) now validate args via `safeParse` at switch entry. Malformed calls return structured error objects with `code: "invalid_params"` instead of runtime exceptions.
+- **Supervisor quarantine state survives deactivate (S6)** (#90) — `SessionSupervisor` now tracks quarantined keys in a `Map<string, Error>`. `deactivate()` on a quarantined handle moves it to the quarantine map (not silent deletion). `activate()` on a quarantined key rejects with the original error until explicit `clearQuarantine(key)`.
+
+### Changed
+- **Known caveats section removed** — the `SessionHandle.update()` stub blocker no longer applies; supervisor is fully wired.
+
 ## [0.5.0] - 2026-04-19
 
 ### Added

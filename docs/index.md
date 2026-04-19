@@ -1,4 +1,4 @@
-# claude-code-slack-channel v0.5.0
+# claude-code-slack-channel v0.5.1
 
 Two-way Slack channel for Claude Code — chat from Slack DMs and channels, approve tool calls from your phone.
 
@@ -8,7 +8,7 @@ A `claude/channel` implementation for Slack. Socket Mode (outbound WebSocket, no
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
-**Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.5.0)
+**Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.5.1)
 
 ---
 
@@ -65,7 +65,9 @@ Security is defense-in-depth: inbound gate drops ungated messages before MCP, ou
 
 claude-code-slack-channel is a production-oriented MCP server that bridges Slack workspaces to Claude Code sessions. The implementation is split across `server.ts` (~1100 lines of stateful runtime wiring) and `lib.ts` (~915 lines of pure, testable functions), with `policy.ts`, `journal.ts`, and `supervisor.ts` providing the policy engine, audit log, and session state machine. Four runtime dependencies (`@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`) — no frameworks, no middleware, no build step for Bun.
 
-**v0.5.0** lands the big-picture redesign: per-thread session isolation (`sessions/<channel>/<thread>.json`), hash-chained tamper-evident audit journal (`journal.ts`), policy engine with monotonicity invariant + shadow-rule linter (`policy.ts`), thread-scoped outbound gate, thread-scoped pairing key, and the `slack/list_sessions` MCP tool. Supervisor and reaper live in `supervisor.ts` as an instantiated library ready for wiring in v0.5.1. ~370 tests.
+**v0.5.1** wires the supervisor and journal into production: `SessionSupervisor` boots at startup, `activate()` fires on every inbound message, idle reaper runs on 60s interval, and 10 of 19 journal EventKinds now emit (`gate.*`, `session.*`, `exfil.block`, `system.*`). Six security fixes from the pre-release audit: state-root denylist for `assertSendable`, journal broken-flag + parse ordering, Zod schema validation in `loadSession`, per-tool Zod input schemas for MCP handlers, and quarantine tracking in the supervisor. ~430 tests.
+
+**v0.5.0** landed the big-picture redesign: per-thread session isolation (`sessions/<channel>/<thread>.json`), hash-chained tamper-evident audit journal (`journal.ts`), policy engine with monotonicity invariant + shadow-rule linter (`policy.ts`), thread-scoped outbound gate, thread-scoped pairing key, and the `slack/list_sessions` MCP tool.
 
 **v0.4.0** added per-channel cross-bot message delivery via `allowBotIds` (#33 — @CaseyMargell). Multi-agent coordination: channels can opt in to receiving messages from specific peer bots (e.g., ops-monitor and engineering bots in `#incidents`). Default-safe — absent or empty `allowBotIds` preserves the "all bot messages dropped" behavior. Self-echo detection uses a triple-check (`bot_id`, `bot_profile.app_id`, `user`) to cover Slack payload variants.
 
@@ -113,7 +115,7 @@ Every security-relevant event (gate drops, policy decisions, session transitions
 
 | Metric | Value |
 |--------|-------|
-| Test Coverage | ~370 tests, security-critical functions |
+| Test Coverage | ~430 tests, security-critical functions |
 | TypeScript | Strict mode, zero errors |
 | Dependencies | 4 production deps |
 | Lines of Code | ~2000 total (`server.ts` ~1100 + `lib.ts` ~915, plus `policy.ts` / `journal.ts` / `supervisor.ts`) |
@@ -135,9 +137,9 @@ Every security-relevant event (gate drops, policy decisions, session transitions
 - Three runtime options (Bun, Node.js, Docker)
 - Governance: CODEOWNERS, SECURITY.md, PR template, branch protection, Dependabot
 
-**Roadmap (v0.5.1)**
-- Wire supervisor + journal event emission into the server hot path (currently library-only)
-- `SessionHandle.update()` mutex-serialized state mutation
+**Roadmap (v0.6.0)**
+- Remaining journal events: `pairing.accepted`, `pairing.expired`, `policy.*`
+- `evaluate()` policy enforcement in MCP tool-call path
 - Upstream PR to `anthropics/claude-plugins-official`
 
 ### Quick Reference
@@ -145,8 +147,8 @@ Every security-relevant event (gate drops, policy decisions, session transitions
 - **Repo:** [github.com/jeremylongshore/claude-code-slack-channel](https://github.com/jeremylongshore/claude-code-slack-channel)
 - **CI:** Passing (GitHub Actions — typecheck, test, CodeQL, Gemini review, Scorecard)
 - **License:** MIT
-- **Latest Release:** [v0.5.0](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.5.0)
-- **Test Coverage:** ~370 tests covering security-critical functions
+- **Latest Release:** [v0.5.1](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.5.1)
+- **Test Coverage:** ~430 tests covering security-critical functions
 - **Docs:** [Anthropic Channels Reference](https://docs.anthropic.com/en/docs/claude-code/channels) · [Plugin Spec](https://docs.anthropic.com/en/docs/claude-code/plugins)
 
 ### Contributors
