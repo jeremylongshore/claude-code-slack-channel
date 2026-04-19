@@ -162,6 +162,65 @@ Existing conversations that predate thread-scoping surface as the `default` thre
 
 Full design reference: [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md).
 
+## Policy schema (v0.5.0+)
+
+A **policy** decides whether an MCP tool call proceeds, is denied, or requires a human approver. Policies are authored as JSON and validated at load with a Zod schema. The evaluator (`evaluate()` in `policy.ts`) is pure and uses first-applicable combining — the first rule whose `match` applies wins. See [`000-docs/policy-evaluation-flow.md`](000-docs/policy-evaluation-flow.md) for the full decision procedure and worked examples.
+
+### PolicyRule
+
+```ts
+type PolicyRule =
+  | { id: string; effect: 'auto_approve';     match: MatchSpec; priority?: number }
+  | { id: string; effect: 'deny';             match: MatchSpec; priority?: number; reason: string }
+  | { id: string; effect: 'require_approval'; match: MatchSpec; priority?: number; ttlMs?: number }
+```
+
+- **`id`** — stable, human-readable. Shows up in the audit journal and any error surfaced to Claude. Duplicate ids are a load-time error.
+- **`effect`** — one of three: `auto_approve` (allow without prompting), `deny` (refuse with a non-sensitive reason string), `require_approval` (hold until a human approver responds on Slack within `ttlMs`).
+- **`priority`** — default `100`. Position in the policy array is the *primary* sort key (first-applicable). `priority` is a tie-breaker *within effect* when two rules would otherwise be equivalent — not a global sort.
+- **`reason`** (deny only) — 1–200 chars, surfaced to Claude so the model knows why the call was rejected. Keep non-sensitive.
+- **`ttlMs`** (require_approval only) — approval freshness window. Default 5 minutes, hard ceiling 24 hours. Once granted, an approval auto-approves subsequent matching calls in the same `(rule, sessionKey)` until expiry.
+
+### MatchSpec
+
+```ts
+type MatchSpec = {
+  tool?:       string              // exact MCP tool name, e.g. "upload_file"
+  pathPrefix?: string              // canonicalized via realpath before compare (CWE-22 safe)
+  channel?:    string              // Slack channel ID, ^[CD][A-Z0-9]+$
+  actor?:      'session_owner' | 'claude_process'
+  argEquals?:  Record<string, unknown>   // subset-equality on validated MCP input args
+}
+```
+
+**At least one field must be constrained.** A match that restricts zero fields (either literally `{}` or `{ argEquals: {} }`) is a load-time error — a rule that matches every call is almost always a bug.
+
+- **`tool`** — exact match only; no globbing.
+- **`pathPrefix`** — compared after `realpath` resolves both sides; `/etc/passwd` does **not** match prefix `/etc/pass` (there's a `+ sep` guard). A rule pointing at a nonexistent path is a load-time error.
+- **`channel`** — Slack IDs starting with `C` (channel) or `D` (DM). Validated against `^[CD][A-Z0-9]+$`.
+- **`actor`** — who is calling the tool. `session_owner` is the human at the terminal; `claude_process` is the Claude Code session. Human approvers arrive as a later turn (permission reply) and are never the `actor` on the original call.
+- **`argEquals`** — subset equality on the MCP input object. Every listed key must match the call's input. Comparison is structural (JSON round-trip) — suitable for plain-JSON values only.
+
+### Default-branch behavior
+
+When no rule matches:
+
+- **Deny** — if the tool is in the `requireAuthoredPolicy` set (`['upload_file']` by default; grows as dangerous tools are added). Decision: `{ kind: 'deny', rule: 'default', reason: 'no policy authored for …' }`.
+- **Allow** — otherwise. Decision: `{ kind: 'allow' }` (no `rule` field, since no rule matched).
+
+The evaluator is a **veto layer**, not the sole gate. Even an allowed decision still flows through `assertOutboundAllowed` and `assertSendable` downstream — the policy engine is additional authorization, never sole authorization.
+
+### Safety checks the loader runs
+
+- **Schema validation** — Zod rejects malformed rules with structured errors naming the field and id.
+- **Duplicate-id rejection** — two rules sharing an `id` fail load.
+- **Shadow-detection linter** — warns (doesn't block) when a later rule is unreachable because an earlier rule's match is less-specific-or-equal on every field. Warnings go to stderr + audit log; operator sees them at boot and in CI.
+- **Monotonicity invariant** — on hot reload, refuses to adopt a policy set that contains a new `auto_approve` rule whose match is covered by an existing `deny`. Fail-closed because an accidental weakening reload is the exact shape of an attack via operator coercion.
+
+### Where policies live
+
+Currently: policies are consumed as a `PolicyRule[]` by `evaluate()` — the loader and on-disk format land with the server integration in **Epic 29-B**. This section will be updated when the file format is frozen; until then, treat the schema above as the stable contract.
+
 ## File attachments — sendable roots
 
 The `reply` tool can attach files to Slack messages, but only files whose

@@ -339,6 +339,142 @@ Every 29-A PR is checked against these.
 
 ---
 
+## Worked examples
+
+Concrete policy sets that exercise the combining algorithm. Every
+example is a legal input to `parsePolicyRules` and produces the
+decisions shown. Operators can paste these into a test harness to
+verify local changes behave as expected.
+
+### Example 1 — Allow replies, gate every upload
+
+The smallest policy set that changes default behavior. `reply` is not
+in `requireAuthoredPolicy`, so the authored rule is a no-op for it
+(default already allows); it's listed here to make the policy
+self-documenting for future readers.
+
+```json
+[
+  { "id": "allow-replies",   "effect": "auto_approve",     "match": { "tool": "reply" } },
+  { "id": "gate-uploads",    "effect": "require_approval", "match": { "tool": "upload_file" }, "ttlMs": 300000 }
+]
+```
+
+| Call                                      | Decision                                                                |
+|-------------------------------------------|-------------------------------------------------------------------------|
+| `tool: reply`                             | `{ kind: 'allow', rule: 'allow-replies' }`                              |
+| `tool: upload_file`, no prior approval    | `{ kind: 'require', rule: 'gate-uploads', approver: 'human_approver' }` |
+| `tool: upload_file`, approval in flight   | `{ kind: 'allow', rule: 'gate-uploads' }`                               |
+| `tool: edit_message`                      | `{ kind: 'allow' }` (default branch)                                    |
+
+### Example 2 — Path-scoped upload: auto-approve inside `/safe/`, deny `/etc/`
+
+Demonstrates first-applicable ordering + CWE-22 mitigation. A traversal
+`/safe/../etc/passwd` realpath-resolves to `/etc/passwd` and falls
+through to the deny rule — the "looks safe" path doesn't bypass the
+guard.
+
+```json
+[
+  { "id": "deny-etc",        "effect": "deny",
+    "match": { "tool": "upload_file", "pathPrefix": "/etc" },
+    "reason": "uploads from /etc are never permitted" },
+
+  { "id": "allow-safe-dir",  "effect": "auto_approve",
+    "match": { "tool": "upload_file", "pathPrefix": "/safe" } }
+]
+```
+
+| Call                                                | Decision                                                            |
+|-----------------------------------------------------|---------------------------------------------------------------------|
+| `upload_file` path=`/safe/report.pdf`               | `{ kind: 'allow', rule: 'allow-safe-dir' }`                         |
+| `upload_file` path=`/etc/passwd`                    | `{ kind: 'deny',  rule: 'deny-etc', reason: '…' }`                  |
+| `upload_file` path=`/safe/../etc/passwd` (traversal)| `{ kind: 'deny',  rule: 'deny-etc', reason: '…' }` — realpath wins  |
+| `upload_file` path=`/other/x.pdf`                   | `{ kind: 'deny',  rule: 'default', reason: 'no policy authored…' }` |
+
+### Example 3 — Channel + actor scoping for incident response
+
+Incident channel wants hands-off auto-approval for the on-call Claude
+process; other channels fall through to default. Shows how `channel`
+and `actor` narrow the match.
+
+```json
+[
+  { "id": "incidents-autoreply",
+    "effect": "auto_approve",
+    "match": { "tool": "reply", "channel": "C_INCIDENTS", "actor": "claude_process" } }
+]
+```
+
+| Call                                                         | Decision                                      |
+|--------------------------------------------------------------|-----------------------------------------------|
+| `reply` in `C_INCIDENTS`, actor=`claude_process`             | `{ kind: 'allow', rule: 'incidents-autoreply' }` |
+| `reply` in `C_INCIDENTS`, actor=`session_owner`              | `{ kind: 'allow' }` (default — actor mismatch) |
+| `reply` in `C_OTHER_CHANNEL`                                 | `{ kind: 'allow' }` (default — channel mismatch) |
+| `upload_file` in `C_INCIDENTS`                               | `{ kind: 'deny', rule: 'default' }` (tool mismatch → default deny) |
+
+### Example 4 — Shadow warning (operator-visible at load)
+
+This policy set produces a warning but still boots. The linter's job
+is to point out the dead rule so the operator can reorder or narrow.
+
+```json
+[
+  { "id": "auto-approve-all-uploads", "effect": "auto_approve", "match": { "tool": "upload_file" } },
+  { "id": "deny-env-upload",          "effect": "deny",
+    "match": { "tool": "upload_file", "pathPrefix": "/etc" },
+    "reason": "blocks env files" }
+]
+```
+
+At load, `detectShadowing()` returns:
+
+```
+[
+  { later: 'deny-env-upload',
+    earlier: 'auto-approve-all-uploads',
+    message: "rule 'deny-env-upload' is shadowed by earlier rule 'auto-approve-all-uploads' …" }
+]
+```
+
+Every call to `upload_file` matches the earlier `auto_approve` first,
+so `deny-env-upload` never fires. The fix is to reorder — put the deny
+before the allow — or to narrow the allow to a specific pathPrefix.
+
+### Example 5 — Monotonicity violation (load refused)
+
+Operator edits the policy file and adds an auto-approve that would
+weaken an existing deny. Reload refuses; `prev` stays active.
+
+```json
+// prev (currently loaded)
+[{ "id": "deny-uploads", "effect": "deny", "match": { "tool": "upload_file" }, "reason": "default-off" }]
+
+// next (attempted reload)
+[
+  { "id": "deny-uploads", "effect": "deny", "match": { "tool": "upload_file" }, "reason": "default-off" },
+  { "id": "allow-pdfs",   "effect": "auto_approve",
+    "match": { "tool": "upload_file", "argEquals": { "mimeType": "application/pdf" } } }
+]
+```
+
+`checkMonotonicity(prev, next)` returns:
+
+```
+[
+  { newRule: 'allow-pdfs',
+    existingDeny: 'deny-uploads',
+    message: "new auto_approve rule 'allow-pdfs' weakens existing deny 'deny-uploads' — reload refused" }
+]
+```
+
+The operator has two clean paths forward:
+
+1. **Remove the old deny first.** A reload that *removes* a deny is allowed — the operator has signed off by deleting the rule. Then reload the new auto-approve separately.
+2. **Make the new auto-approve orthogonal.** If the intent was to allow a narrower case *and* keep the deny as a catch-all, the rules need to be authored so the allow is strictly narrower and placed earlier (first-applicable will match the allow first). The monotonicity check flags the current pair because the new rule's match is a subset of the deny's match — they are *not* orthogonal.
+
+---
+
 ## References
 
 - OASIS (2013). *eXtensible Access Control Markup Language (XACML)
