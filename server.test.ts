@@ -12,6 +12,7 @@ import {
   pruneExpired,
   generateCode,
   isDuplicateEvent,
+  sessionPath,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   MAX_PENDING,
@@ -19,6 +20,7 @@ import {
   PAIRING_EXPIRY_MS,
   type Access,
   type GateOptions,
+  type SessionKey,
 } from './lib.ts'
 import {
   mkdtempSync,
@@ -1013,5 +1015,58 @@ describe('isDuplicateEvent', () => {
     expect(isDuplicateEvent(event, seen, 1000, 60000)).toBe(false)
     // `app_mention` subscription fires shortly after with the same event
     expect(isDuplicateEvent(event, seen, 1050, 60000)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// sessionPath — ccsc-z78.3 failing test (spec-first)
+//
+// Locks the thread-scoped layout from 000-docs/session-state-machine.md §47-68
+// before any implementation lands. Skipped tests below are the red side of
+// the TDD cycle; ccsc-z78.4 un-skips and implements sessionPath() to go
+// green. Do not delete these assertions without updating the design doc.
+// ---------------------------------------------------------------------------
+
+describe('sessionPath', () => {
+  const key = (channel: string, thread: string): SessionKey => ({ channel, thread })
+
+  test('stub throws until ccsc-z78.4 lands — locks the export contract', () => {
+    // Active gate so ccsc-z78.4 cannot quietly rename, remove, or change
+    // the signature of this symbol without a visible test failure.
+    expect(() => sessionPath('/tmp/state', key('C0000000001', '1700000000.000100'))).toThrow(
+      /not implemented/,
+    )
+  })
+
+  test.skip('two threads in one channel produce two distinct file paths', () => {
+    // ccsc-z78.4 un-skips. The bug this epic fixes: a flat
+    // <root>/sessions/<channel>.json layout cannot represent two
+    // parallel threads in one channel. The path must encode `thread`.
+    const root = '/tmp/state-root'
+    const p1 = sessionPath(root, key('C_CHAN', 'T1700000000.000100'))
+    const p2 = sessionPath(root, key('C_CHAN', 'T1700000000.000200'))
+
+    expect(p1).not.toBe(p2)
+    expect(p1.endsWith('/T1700000000.000100.json')).toBe(true)
+    expect(p2.endsWith('/T1700000000.000200.json')).toBe(true)
+
+    // Both live under the same per-channel directory.
+    const dir1 = p1.slice(0, p1.lastIndexOf('/'))
+    const dir2 = p2.slice(0, p2.lastIndexOf('/'))
+    expect(dir1).toBe(dir2)
+    expect(dir1.endsWith('/sessions/C_CHAN')).toBe(true)
+  })
+
+  test.skip('different channels produce paths under different per-channel dirs', () => {
+    // ccsc-z78.4 un-skips. Sibling threads may collide in filename
+    // (same thread_ts across channels is improbable but legal); the
+    // per-channel parent directory keeps them isolated.
+    const root = '/tmp/state-root'
+    const p1 = sessionPath(root, key('C_AAA', '1700000000.000100'))
+    const p2 = sessionPath(root, key('C_BBB', '1700000000.000100'))
+
+    expect(p1).not.toBe(p2)
+    expect(p1.includes('/sessions/C_AAA/')).toBe(true)
+    expect(p2.includes('/sessions/C_BBB/')).toBe(true)
   })
 })

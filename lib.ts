@@ -123,6 +123,24 @@ export interface Session {
   data: Record<string, unknown>
 }
 
+/** Construct the on-disk path for a session file.
+ *
+ *  Contract per 000-docs/session-state-machine.md §47-68:
+ *    <root>/sessions/<channel>/<thread>.json
+ *
+ *  Implementation lands in ccsc-z78.4 with three safety rules:
+ *    1. Validate every component against /^[A-Za-z0-9._-]+$/.
+ *    2. Resolve parent via fs.realpathSync.native and verify the state
+ *       root is still a prefix (CWE-22 symlink smuggling).
+ *    3. Create sessions/<channel>/ with mode 0o700 on first use.
+ *
+ *  Stub until then so the boundary type is exported and ccsc-z78.3's
+ *  failing spec test has a symbol to reference.
+ */
+export function sessionPath(_root: string, _key: SessionKey): string {
+  throw new Error('sessionPath not implemented (ccsc-z78.4)')
+}
+
 // ---------------------------------------------------------------------------
 // Access helpers
 // ---------------------------------------------------------------------------
