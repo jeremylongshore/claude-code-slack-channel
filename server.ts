@@ -251,6 +251,24 @@ function assertOutboundAllowed(
 }
 
 // ---------------------------------------------------------------------------
+// Audit journal — fire-and-forget helper
+// ---------------------------------------------------------------------------
+
+/** Fire-and-forget journal write. Must never throw — a broken audit log
+ *  MUST NOT interrupt message delivery or tool execution. Errors are
+ *  forwarded to stderr so operators can detect a broken journal without
+ *  losing the hot path. Per audit-journal-architecture.md invariant. */
+function journalWrite(input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0]): void {
+  if (journal === null) return
+  journal.writeEvent(input).catch((err: unknown) => {
+    console.error('[slack] journal.writeEvent failed', {
+      kind: input.kind,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Gate function (wires up getAccess/saveAccess/botUserId for production use)
 // ---------------------------------------------------------------------------
 
@@ -543,7 +561,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const threadTs: string | undefined = args.thread_ts
       const files: string[] | undefined = args.files
 
-      assertOutboundAllowed(chatId, threadTs)
+      try {
+        assertOutboundAllowed(chatId, threadTs)
+      } catch (outboundErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'reply',
+          sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
+          input: { channel: chatId, thread_ts: threadTs },
+          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+        })
+        throw outboundErr
+      }
+      journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'reply',
+        sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
+        input: { channel: chatId, thread_ts: threadTs },
+      })
 
       const access = getAccess()
       const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
@@ -565,7 +602,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Upload files if provided
       if (files && files.length > 0) {
         for (const filePath of files) {
-          assertSendable(filePath)
+          try {
+            assertSendable(filePath)
+          } catch (exfilErr) {
+            journalWrite({
+              kind: 'exfil.block',
+              outcome: 'deny',
+              toolName: 'reply',
+              reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
+            })
+            throw exfilErr
+          }
           const resolved = resolve(filePath)
           const uploadArgs: Record<string, any> = {
             channel_id: chatId,
@@ -595,7 +642,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Callers that know the parent thread pass `thread_ts`; when
       // omitted, fall back to channel-level opt-in or top-level
       // delivery by passing undefined.
-      assertOutboundAllowed(args.chat_id, args.thread_ts)
+      try {
+        assertOutboundAllowed(args.chat_id, args.thread_ts)
+      } catch (outboundErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'react',
+          sessionKey: args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
+          input: { channel: args.chat_id, thread_ts: args.thread_ts },
+          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+        })
+        throw outboundErr
+      }
+      journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'react',
+        sessionKey: args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
+        input: { channel: args.chat_id, thread_ts: args.thread_ts },
+      })
       await web.reactions.add({
         channel: args.chat_id,
         timestamp: args.message_id,
@@ -613,7 +679,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Editing a message engages with the thread that message lives
       // in. Callers that know the thread pass `thread_ts`; otherwise
       // the gate falls back to channel-level opt-in or top-level.
-      assertOutboundAllowed(args.chat_id, args.thread_ts)
+      try {
+        assertOutboundAllowed(args.chat_id, args.thread_ts)
+      } catch (outboundErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'edit_message',
+          sessionKey: args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
+          input: { channel: args.chat_id, thread_ts: args.thread_ts },
+          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+        })
+        throw outboundErr
+      }
+      journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'edit_message',
+        sessionKey: args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
+        input: { channel: args.chat_id, thread_ts: args.thread_ts },
+      })
       await web.chat.update({
         channel: args.chat_id,
         ts: args.message_id,
@@ -631,7 +716,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const channel: string = args.channel
       const threadTs: string | undefined = args.thread_ts
       const limit = Math.min(args.limit || 20, 100)
-      assertOutboundAllowed(channel, threadTs)
+      try {
+        assertOutboundAllowed(channel, threadTs)
+      } catch (outboundErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'fetch_messages',
+          sessionKey: threadTs !== undefined ? { channel, thread: threadTs } : undefined,
+          input: { channel, thread_ts: threadTs },
+          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+        })
+        throw outboundErr
+      }
+      journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'fetch_messages',
+        sessionKey: threadTs !== undefined ? { channel, thread: threadTs } : undefined,
+        input: { channel, thread_ts: threadTs },
+      })
 
       let messages: any[]
       if (threadTs) {
@@ -682,7 +786,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Download engages with the thread the target message lives
       // in. Callers that know the thread pass `thread_ts`; the gate
       // falls back to channel-level opt-in or top-level otherwise.
-      assertOutboundAllowed(channel, args.thread_ts)
+      try {
+        assertOutboundAllowed(channel, args.thread_ts)
+      } catch (outboundErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'download_attachment',
+          sessionKey: args.thread_ts !== undefined ? { channel, thread: args.thread_ts } : undefined,
+          input: { channel, thread_ts: args.thread_ts },
+          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+        })
+        throw outboundErr
+      }
+      journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'download_attachment',
+        sessionKey: args.thread_ts !== undefined ? { channel, thread: args.thread_ts } : undefined,
+        input: { channel, thread_ts: args.thread_ts },
+      })
 
       // Fetch the specific message to get file info
       const res = await web.conversations.replies({
@@ -835,7 +958,24 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   // so approvals surface in the same thread the tool call originated
   // from. Falls back to top-level only when we're using an opted-in
   // channel with no active thread (lastActiveThread === undefined).
-  assertOutboundAllowed(targetChannel, lastActiveThread)
+  try {
+    assertOutboundAllowed(targetChannel, lastActiveThread)
+  } catch (outboundErr) {
+    journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      sessionKey: lastActiveThread !== undefined ? { channel: targetChannel, thread: lastActiveThread } : undefined,
+      input: { channel: targetChannel, thread_ts: lastActiveThread },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    return
+  }
+  journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    sessionKey: lastActiveThread !== undefined ? { channel: targetChannel, thread: lastActiveThread } : undefined,
+    input: { channel: targetChannel, thread_ts: lastActiveThread },
+  })
 
   pruneStalePermissions()
   // Pin the request to the thread it was issued from. The button /
@@ -1118,10 +1258,31 @@ async function handleMessage(event: unknown): Promise<void> {
 
   const result = await gate(event)
   switch (result.action) {
-    case 'drop':
+    case 'drop': {
+      journalWrite({
+        kind: 'gate.inbound.drop',
+        outcome: 'drop',
+        actor: ev['bot_id'] ? 'peer_agent' : 'session_owner',
+        input: {
+          channel: ev['channel'] as string,
+          user: ev['user'] as string | undefined,
+        },
+      })
       return
+    }
 
     case 'pair': {
+      // Emit pairing.issued for new codes only — resends don't create new
+      // entries in pending, so they are not a new issuance event.
+      if (!result.isResend) {
+        journalWrite({
+          kind: 'pairing.issued',
+          outcome: 'n/a',
+          actor: 'system',
+          input: { channel: ev['channel'] as string },
+        })
+      }
+
       const msg = result.isResend
         ? `Your pairing code is still: *${result.code}*\nAsk the Claude Code user to run: \`/slack-channel:access pair ${result.code}\``
         : `Hi! I need to verify you before connecting.\nYour pairing code: *${result.code}*\nAsk the Claude Code user to run: \`/slack-channel:access pair ${result.code}\``
@@ -1152,6 +1313,18 @@ async function handleMessage(event: unknown): Promise<void> {
       const channelId = ev['channel'] as string
       const incomingThreadTs = ev['thread_ts'] as string | undefined
       deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
+
+      journalWrite({
+        kind: 'gate.inbound.deliver',
+        outcome: 'allow',
+        actor: ev['bot_id'] ? 'peer_agent' : 'session_owner',
+        sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev['ts'] as string) },
+        input: {
+          channel: channelId,
+          user: ev['bot_id'] ? (ev['bot_id'] as string) : (ev['user'] as string | undefined),
+          thread_ts: incomingThreadTs,
+        },
+      })
 
       // Activate session and record inbound activity via the supervisor.
       // The thread key follows session-state-machine.md §39: top-level
@@ -1469,6 +1642,7 @@ async function main(): Promise<void> {
   supervisor = createSessionSupervisor({
     stateRoot: STATE_DIR,
     idleMs: resolveIdleMs(process.env),
+    journal: journal ?? undefined,
   })
 
   // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is

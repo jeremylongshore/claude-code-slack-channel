@@ -38,6 +38,7 @@
 
 import { loadSession, saveSession, sessionPath } from './lib'
 import type { Session, SessionKey } from './lib'
+import type { JournalWriter } from './journal'
 
 // ---------------------------------------------------------------------------
 // Lifecycle state
@@ -281,6 +282,13 @@ export interface SupervisorOptions {
    *  `SLACK_SESSION_IDLE_MS` env var documented in
    *  session-state-machine.md §119. */
   idleMs?: number
+  /** Optional audit journal writer. When provided, the supervisor emits
+   *  `session.activate`, `session.quiesce`, and `session.deactivate` events
+   *  at the corresponding state transitions. Journal write failures are
+   *  logged and swallowed — they must never interrupt message delivery or
+   *  session lifecycle (audit-journal-architecture.md invariant: broken
+   *  journal MUST NOT take down the hot path). */
+  journal?: JournalWriter
 }
 
 /** Default idle threshold: 4 hours in ms. Documented in
@@ -338,7 +346,24 @@ export function createSessionSupervisor(
   const log = opts.log ?? defaultLog
   const clock = opts.clock ?? Date.now
   const idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
-  const { stateRoot } = opts
+  const { stateRoot, journal } = opts
+
+  /** Awaitable journal write for session lifecycle transitions. Never throws —
+   *  a broken journal MUST NOT take down the session lifecycle path. Errors are
+   *  forwarded to `log`. Returns a promise so callers in non-hot paths (quiesce,
+   *  deactivate) can await completion before they return — this ensures that
+   *  the journal file is durable before the supervisor's own state changes. */
+  async function journalWrite(input: Parameters<JournalWriter['writeEvent']>[0]): Promise<void> {
+    if (journal === undefined) return
+    try {
+      await journal.writeEvent(input)
+    } catch (err: unknown) {
+      log('journal.write_error', {
+        kind: input.kind,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+  }
 
   // Live handles, keyed by the stringified SessionKey. Use a composite
   // string because `Map<object, ...>` keys by reference and two equal-
@@ -441,6 +466,12 @@ export function createSessionSupervisor(
       thread: key.thread,
       ownerId: session.ownerId,
     })
+    await journalWrite({
+      kind: 'session.activate',
+      outcome: 'n/a',
+      actor: 'system',
+      sessionKey: key,
+    })
 
     return handle
   }
@@ -491,7 +522,7 @@ export function createSessionSupervisor(
       return promise
     },
 
-    quiesce(key: SessionKey): Promise<void> {
+    async quiesce(key: SessionKey): Promise<void> {
       const id = keyId(key)
       const handle = live.get(id)
       if (handle === undefined) {
@@ -500,7 +531,7 @@ export function createSessionSupervisor(
         // handle to transition and no work to flush. Do not emit a
         // log line for the empty case; it adds no information and
         // would confuse the journal sink's per-session correlation.
-        return Promise.resolve()
+        return
       }
 
       log('session.quiesce', {
@@ -509,7 +540,19 @@ export function createSessionSupervisor(
         inflight: handle.inFlight.size,
       })
 
-      return handle.beginQuiesce()
+      // beginQuiesce() transitions the state active → quiescing synchronously.
+      // The journal write follows so the state is already visible to concurrent
+      // callers when the event is persisted. Journal errors never abort the
+      // quiesce path — beginQuiesce already began.
+      const drainPromise = handle.beginQuiesce()
+      await journalWrite({
+        kind: 'session.quiesce',
+        outcome: 'n/a',
+        actor: 'system',
+        sessionKey: key,
+      })
+
+      return drainPromise
     },
 
     async deactivate(key: SessionKey): Promise<void> {
@@ -584,6 +627,12 @@ export function createSessionSupervisor(
       log('session.deactivate', {
         channel: key.channel,
         thread: key.thread,
+      })
+      await journalWrite({
+        kind: 'session.deactivate',
+        outcome: 'n/a',
+        actor: 'system',
+        sessionKey: key,
       })
     },
 
