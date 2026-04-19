@@ -3527,12 +3527,8 @@ describe('truncate', () => {
   test('truncates long strings with an inline [... truncated N chars] marker', async () => {
     const { truncate } = await import('./journal.ts')
     const long = 'a'.repeat(3000)
-    const out = truncate(long, 100) as string
-    expect(out.startsWith('a'.repeat(100))).toBe(true)
-    expect(out.endsWith('[... truncated 2900 chars]')).toBe(true)
-    // The truncated output is itself bounded — the marker adds a
-    // fixed-size suffix so the record stays usefully small.
-    expect(out.length).toBeLessThan(200)
+    const expected = 'a'.repeat(100) + '[... truncated 2900 chars]'
+    expect(truncate(long, 100)).toBe(expected)
   })
 
   test('recurses into arrays and truncates oversize elements', async () => {

@@ -570,11 +570,10 @@ export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
     return '[' + value.map(canonicalJson).join(',') + ']'
   }
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>
-    const keys = Object.keys(obj).sort()
+  if (isRecord(value)) {
+    const keys = Object.keys(value).sort()
     const pairs = keys.map(
-      (k) => JSON.stringify(k) + ':' + canonicalJson(obj[k]),
+      (k) => JSON.stringify(k) + ':' + canonicalJson(value[k]),
     )
     return '{' + pairs.join(',') + '}'
   }
@@ -591,6 +590,16 @@ export function canonicalJson(value: unknown): string {
  *  in this module share one implementation. */
 export function sha256Hex(input: string | Uint8Array): string {
   return createHash('sha256').update(input).digest('hex')
+}
+
+/** Narrow `value` to a plain object shape. Rejects arrays, null, and
+ *  primitives. Used by `canonicalJson`, `redact`, and `truncate` so
+ *  the `value as Record<string, unknown>` casts that previously
+ *  followed `typeof value === 'object' && value !== null` become
+ *  compiler-checked narrowings instead of trust-me-bro assertions.
+ *  Not exported — these helpers are the only callers. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -658,15 +667,14 @@ export function redact(value: unknown): unknown {
     }
     return changed ? out : value
   }
-  if (typeof value === 'object' && value !== null) {
+  if (isRecord(value)) {
     // Plain object fast-path. We do not try to detect class instances
     // here because the journal event shape is JSON — class instances
     // round-tripping through JSON.stringify would have lost their
     // prototype anyway.
-    const obj = value as Record<string, unknown>
     let changed = false
     const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(obj)) {
+    for (const [k, v] of Object.entries(value)) {
       const next = redact(v)
       if (next !== v) changed = true
       out[k] = next
@@ -765,9 +773,8 @@ export function truncate(
     }
     return changed ? out : value
   }
-  if (typeof value === 'object' && value !== null) {
-    const obj = value as Record<string, unknown>
-    const entries = Object.entries(obj)
+  if (isRecord(value)) {
+    const entries = Object.entries(value)
     let changed = false
     const out: Record<string, unknown> = {}
     for (const [k, v] of entries) {
