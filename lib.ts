@@ -84,6 +84,45 @@ export interface SessionKey {
   thread: string
 }
 
+/** Schema version for a persisted Session file. Bumped on incompatible
+ *  changes; older files are either migrated or rejected with a
+ *  Quarantined transition (see 000-docs/session-state-machine.md). */
+export type SessionSchemaVersion = 1
+
+/** The persistent state blob for one thread-scoped session.
+ *
+ *  Written atomically (tmp + chmod 0o600 + rename) by the atomic writer
+ *  in 32-A.5; loaded via the realpath-guarded loader in 32-A.6. Contents
+ *  beyond `key` + metadata are kept in a versioned envelope so the
+ *  session-state-machine supervisor can migrate shapes without rewriting
+ *  every field.
+ *
+ *  This type is the *file* shape; the in-memory SessionHandle (32-A.5)
+ *  wraps it with mutex and lifecycle metadata.
+ */
+export interface Session {
+  /** Schema version of this session file. */
+  v: SessionSchemaVersion
+  /** Identity of this session. Duplicated from the filename so a moved
+   *  file is self-describing under forensic inspection. */
+  key: SessionKey
+  /** Epoch ms when this session file was first created. Never changes
+   *  across the session's lifetime. */
+  createdAt: number
+  /** Epoch ms of the most recent state update. Used by the idle-TTL
+   *  check in the supervisor. */
+  lastActiveAt: number
+  /** Slack user ID of the principal who opened the session — the first
+   *  delivered message's sender. Recorded so the audit journal can
+   *  attribute turns without re-reading message history. */
+  ownerId: string
+  /** Opaque per-session state carried by higher-level code. Left open so
+   *  32-A can ship the boundary before downstream consumers (reply
+   *  history, policy approvals, conversation scratchpad) are wired in.
+   *  32-A tests treat this field as an arbitrary object. */
+  data: Record<string, unknown>
+}
+
 // ---------------------------------------------------------------------------
 // Access helpers
 // ---------------------------------------------------------------------------
