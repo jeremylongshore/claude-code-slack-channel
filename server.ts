@@ -40,11 +40,13 @@ import {
   sanitizeDisplayName,
   gate as libGate,
   isDuplicateEvent,
+  resolveJournalPath,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   type Access,
   type GateResult,
 } from './lib.ts'
+import { JournalWriter } from './journal.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -1033,6 +1035,12 @@ socket.on('app_mention', async ({ event, ack }) => {
 
 let shuttingDown = false
 
+// Audit journal handle (ccsc-5pi.6). Null when --audit-log-file /
+// SLACK_AUDIT_LOG is unset — journal writes become no-ops in that
+// case. Opened in main() once the state dir is ready; closed in
+// shutdown() after a final `system.shutdown` event.
+let journal: JournalWriter | null = null
+
 async function shutdown(reason: string, code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
@@ -1054,6 +1062,22 @@ async function shutdown(reason: string, code = 0): Promise<void> {
     await mcp.close()
   } catch { /* ignore */ }
 
+  // Write a final `system.shutdown` event before closing the journal
+  // so the chain terminates cleanly with operator-visible intent.
+  // Failures here are non-fatal — better to exit with an imperfect
+  // journal than to hang shutdown.
+  if (journal !== null) {
+    try {
+      await journal.writeEvent({ kind: 'system.shutdown', reason })
+    } catch (err) {
+      console.error('[slack] journal.writeEvent(system.shutdown) failed:', err)
+    }
+    try {
+      await journal.close()
+    } catch { /* ignore */ }
+    journal = null
+  }
+
   clearTimeout(forceExit)
   process.exit(code)
 }
@@ -1066,6 +1090,42 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Open audit journal if --audit-log-file or SLACK_AUDIT_LOG is set.
+  // Opt-in per ccsc-5pi.6: absent configuration disables journaling
+  // entirely and every hook that would write an event becomes a
+  // no-op. Present but unwritable fails loud at boot so the operator
+  // sees the misconfig immediately rather than on the first tool
+  // call. CLI flag wins over env var — see resolveJournalPath() in
+  // lib.ts for the resolution contract.
+  const auditResolution = resolveJournalPath(
+    process.argv.slice(2),
+    process.env,
+  )
+  if (auditResolution.path !== null) {
+    const absPath = resolve(auditResolution.path)
+    try {
+      journal = await JournalWriter.open({ path: absPath })
+      console.error(
+        `[slack] audit journal enabled at ${absPath} (source: ${auditResolution.source})`,
+      )
+      // First event after open is the boot marker — gives the
+      // verifier a clean starting landmark and records the
+      // operational start of this process.
+      await journal.writeEvent({
+        kind: 'system.boot',
+        actor: 'system',
+        reason: `started from ${auditResolution.source} configuration`,
+      })
+    } catch (err) {
+      console.error(
+        `[slack] audit journal open failed at ${absPath}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+      process.exit(1)
+    }
+  }
+
   // Resolve bot identity (user ID, bot ID, app ID) for mention detection
   // and self-echo filtering across payload variants and multi-workspace setups
   try {

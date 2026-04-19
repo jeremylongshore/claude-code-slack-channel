@@ -13,6 +13,7 @@ import {
   pruneExpired,
   generateCode,
   isDuplicateEvent,
+  resolveJournalPath,
   sessionPath,
   saveSession,
   loadSession,
@@ -3745,5 +3746,81 @@ describe('JournalWriter truncation integration', () => {
     } finally {
       await w.close()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolveJournalPath — ccsc-5pi.6
+// ---------------------------------------------------------------------------
+
+describe('resolveJournalPath', () => {
+  test('returns null when neither flag nor env is set', () => {
+    expect(resolveJournalPath([], {})).toEqual({ path: null, source: null })
+  })
+
+  test('picks up SLACK_AUDIT_LOG env var when no flag present', () => {
+    expect(
+      resolveJournalPath([], { SLACK_AUDIT_LOG: '/var/log/slack-audit.log' }),
+    ).toEqual({ path: '/var/log/slack-audit.log', source: 'env' })
+  })
+
+  test('picks up --audit-log-file space-separated form', () => {
+    expect(
+      resolveJournalPath(['--audit-log-file', '/tmp/a.log'], {}),
+    ).toEqual({ path: '/tmp/a.log', source: 'flag' })
+  })
+
+  test('picks up --audit-log-file=PATH equals form', () => {
+    expect(
+      resolveJournalPath(['--audit-log-file=/tmp/b.log'], {}),
+    ).toEqual({ path: '/tmp/b.log', source: 'flag' })
+  })
+
+  test('flag wins over env var when both are set', () => {
+    expect(
+      resolveJournalPath(
+        ['--audit-log-file', '/from/flag'],
+        { SLACK_AUDIT_LOG: '/from/env' },
+      ),
+    ).toEqual({ path: '/from/flag', source: 'flag' })
+  })
+
+  test('empty flag value falls through to env (shell mistake protection)', () => {
+    // `--audit-log-file` with no successor or `--audit-log-file=` both
+    // represent a launcher bug; don't silently enable journaling at
+    // an unexpected path. Fall through to env.
+    expect(
+      resolveJournalPath(['--audit-log-file'], { SLACK_AUDIT_LOG: '/from/env' }),
+    ).toEqual({ path: '/from/env', source: 'env' })
+    expect(
+      resolveJournalPath(['--audit-log-file='], { SLACK_AUDIT_LOG: '/from/env' }),
+    ).toEqual({ path: '/from/env', source: 'env' })
+  })
+
+  test('empty env var is treated as unset', () => {
+    expect(resolveJournalPath([], { SLACK_AUDIT_LOG: '' })).toEqual({
+      path: null,
+      source: null,
+    })
+  })
+
+  test('flag works mid-argv with unrelated args around it', () => {
+    expect(
+      resolveJournalPath(
+        ['--some-other', 'value', '--audit-log-file', '/a.log', '--debug'],
+        {},
+      ),
+    ).toEqual({ path: '/a.log', source: 'flag' })
+  })
+
+  test('first --audit-log-file wins when multiple are provided', () => {
+    // Operator presumably intended the first; later ones are stale
+    // from a launcher script concatenation.
+    expect(
+      resolveJournalPath(
+        ['--audit-log-file', '/first', '--audit-log-file', '/second'],
+        {},
+      ),
+    ).toEqual({ path: '/first', source: 'flag' })
   })
 })
