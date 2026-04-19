@@ -35,16 +35,51 @@ Dev mode (bypasses plugin allowlist):
 claude --dangerously-load-development-channels server:slack
 ```
 
-CI runs typecheck + tests on every push to main and every PR (`.github/workflows/ci.yml`).
+CI workflows (`.github/workflows/`):
+- `ci.yml` — Typecheck (required by branch protection) + test suite on push/PR to main.
+- `codeql.yml` — CodeQL security scan.
+- `gemini-review.yml` — automated PR review.
+- `scorecard.yml` — OpenSSF Scorecard.
+- `notify-marketplace.yml` — marketplace notification on release.
+
+## Merging PRs
+
+Main is branch-protected: `Typecheck` is a required status check and `strict: true` (each PR must be up-to-date with main before merging). You have admin rights:
+
+```bash
+gh pr merge <N> --squash --admin --delete-branch
+```
+
+When merging multiple PRs in sequence, `strict: true` will re-demand Typecheck against the new main for every later PR in the queue. Temporarily drop strict, merge, restore:
+
+```bash
+echo '{"strict":false,"contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremylongshore/claude-code-slack-channel/branches/main/protection/required_status_checks --input -
+# merge your PRs
+echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremylongshore/claude-code-slack-channel/branches/main/protection/required_status_checks --input -
+```
 
 ## Key Files
 
 - `server.ts` — MCP server runtime: bootstrap, Slack clients, tools, event handling
-- `lib.ts` — pure functions: gate logic, security guards, text chunking, types
+- `lib.ts` — pure functions: gate logic, security guards, text chunking, session types
+- `policy.ts` — Zod schema for PolicyRule (29-A.1 landed; evaluator lands in follow-up beads)
 - `server.test.ts` — test suite covering security-critical functions (uses `bun:test`)
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
 - `ACCESS.md` — access control schema documentation
+
+## Design Docs (load-bearing contracts)
+
+The design-in-public commitment: the doc ships before the code, and the doc is the source of truth for security-boundary decisions. Read the matching doc before touching its subsystem — a PR that contradicts a frozen doc is a revert, not a merge.
+
+- `ARCHITECTURE.md` — top-level component diagram, four-principal model.
+- `000-docs/THREAT-MODEL.md` — trust boundaries, attack surface per primitive, T1–T10 threats, invariants.
+- `000-docs/session-state-machine.md` — `SessionKey`, supervisor contract, lifecycle (Epic 32-A/B).
+- `000-docs/policy-evaluation-flow.md` — `evaluate()` decision procedure, shadow linter, monotonicity (Epic 29-A/B).
+- `000-docs/audit-journal-architecture.md` — hash-chain, redaction, verify command (Epic 30-A/B).
+- `000-docs/bot-manifest-protocol.md` — manifest schema, "advertisements are not grants" invariant (Epic 31-A/B).
+
+When a design doc and code disagree, the code is wrong.
 
 ## Security Architecture (critical context)
 
@@ -72,6 +107,8 @@ All state lives in `~/.claude/channels/slack/`:
 - Bun primary runtime, Node.js/Docker as alternatives
 - TypeScript strict mode
 - No external frameworks beyond the four declared runtime dependencies
+- Epic / sub-epic titles read like English sentences, not code. Leaf bead titles can stay technical. `ccsc-v1b: Build the policy engine's core logic` ✓, not `29-A.Eval: evaluate() + load-time safety` ✗.
+- Issues → 2–5 themed epics (A/B split + sub-epics when >5 children). Don't ship one flat epic with 10 children.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
