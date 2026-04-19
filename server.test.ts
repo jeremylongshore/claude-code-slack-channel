@@ -3265,3 +3265,251 @@ describe('JournalWriter', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Redaction — ccsc-5pi.4
+// ---------------------------------------------------------------------------
+
+describe('redact', () => {
+  test('passes non-string primitives through unchanged', async () => {
+    const { redact } = await import('./journal.ts')
+    expect(redact(null)).toBeNull()
+    expect(redact(42)).toBe(42)
+    expect(redact(true)).toBe(true)
+    expect(redact(false)).toBe(false)
+  })
+
+  test('leaves plain strings untouched', async () => {
+    const { redact } = await import('./journal.ts')
+    expect(redact('hello world')).toBe('hello world')
+    expect(redact('/home/jeremy/.claude/channels/slack/audit.log')).toBe(
+      '/home/jeremy/.claude/channels/slack/audit.log',
+    )
+  })
+
+  test('redacts Anthropic keys (sk-*)', async () => {
+    const { redact } = await import('./journal.ts')
+    const secret = 'sk-ant-api03-' + 'a'.repeat(30)
+    expect(redact(`key is ${secret}`)).toBe('key is [REDACTED:anthropic]')
+  })
+
+  test('redacts Slack bot tokens (xoxb-*)', async () => {
+    const { redact } = await import('./journal.ts')
+    // Constructed at runtime so the source literal does not pattern-
+    // match GitHub's push-protection secret scanner. The detector
+    // catches literal xoxb- tokens in committed files; we need the
+    // shape live for the test, not on disk in source form.
+    const fake = 'xoxb' + '-' + '123456789012' + '-' + '123456789012' + '-' + 'abcdefghijklmnop'
+    expect(redact(fake)).toBe('[REDACTED:slack_bot]')
+  })
+
+  test('redacts Slack app tokens (xapp-*)', async () => {
+    const { redact } = await import('./journal.ts')
+    const fake = 'xapp' + '-' + '1' + '-' + 'A0ABC123DEF' + '-' + '1234567890123' + '-' + 'a'.repeat(32)
+    expect(redact(fake)).toBe('[REDACTED:slack_app]')
+  })
+
+  test('redacts GitHub PATs (ghp_*)', async () => {
+    const { redact } = await import('./journal.ts')
+    expect(redact('token=ghp_' + 'A'.repeat(36))).toBe(
+      'token=[REDACTED:github]',
+    )
+  })
+
+  test('redacts AWS access keys (AKIA*)', async () => {
+    const { redact } = await import('./journal.ts')
+    expect(redact('export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE')).toBe(
+      'export AWS_ACCESS_KEY_ID=[REDACTED:aws_access]',
+    )
+  })
+
+  test('redacts JWTs (eyJ...eyJ...)', async () => {
+    const { redact } = await import('./journal.ts')
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123-_def'
+    expect(redact(`Bearer ${jwt}`)).toBe('Bearer [REDACTED:jwt]')
+  })
+
+  test('redacts multiple occurrences in one string', async () => {
+    const { redact } = await import('./journal.ts')
+    const s = `first sk-${'a'.repeat(30)} and another sk-${'b'.repeat(30)}`
+    expect(redact(s)).toBe('first [REDACTED:anthropic] and another [REDACTED:anthropic]')
+  })
+
+  test('recurses into arrays', async () => {
+    const { redact } = await import('./journal.ts')
+    const result = redact(['safe', `bad=${'ghp_' + 'A'.repeat(36)}`, 42])
+    expect(result).toEqual(['safe', 'bad=[REDACTED:github]', 42])
+  })
+
+  test('recurses into plain objects', async () => {
+    const { redact } = await import('./journal.ts')
+    const input = {
+      env: {
+        ANTHROPIC_API_KEY: 'sk-ant-' + 'x'.repeat(30),
+        SAFE_VAR: 'ok',
+      },
+      argv: ['--key=AKIAIOSFODNN7EXAMPLE'],
+    }
+    expect(redact(input)).toEqual({
+      env: {
+        ANTHROPIC_API_KEY: '[REDACTED:anthropic]',
+        SAFE_VAR: 'ok',
+      },
+      argv: ['--key=[REDACTED:aws_access]'],
+    })
+  })
+
+  test('pure: does not mutate its argument', async () => {
+    const { redact } = await import('./journal.ts')
+    const input = { k: 'sk-ant-' + 'a'.repeat(30) }
+    const snapshot = JSON.stringify(input)
+    redact(input)
+    expect(JSON.stringify(input)).toBe(snapshot)
+  })
+
+  test('returns same reference when nothing changed (allocation optimization)', async () => {
+    const { redact } = await import('./journal.ts')
+    const clean = { a: 1, b: 'safe', c: [1, 2, 'also safe'] }
+    expect(redact(clean)).toBe(clean)
+  })
+
+  test('tokenPatterns() surfaces the six frozen patterns for the verifier', async () => {
+    const { tokenPatterns } = await import('./journal.ts')
+    const kinds = tokenPatterns().map((p) => p.kind).sort()
+    expect(kinds).toEqual([
+      'anthropic',
+      'aws_access',
+      'github',
+      'jwt',
+      'slack_app',
+      'slack_bot',
+    ])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// JournalWriter ↔ redaction integration
+// ---------------------------------------------------------------------------
+
+describe('JournalWriter redaction integration', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logPath: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'journal-redact-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logPath = join(tmpRoot, 'audit.log')
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  const stableAnchor = 'a'.repeat(64)
+
+  test('redacts input.input before hashing and writing', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      const secret = 'sk-ant-' + 'z'.repeat(30)
+      const ev = await w.writeEvent({
+        kind: 'policy.deny',
+        input: { env: { ANTHROPIC_API_KEY: secret } },
+      })
+      // Returned event reflects redaction — callers observe the
+      // scrubbed form, not the original.
+      expect(
+        (ev.input as { env: { ANTHROPIC_API_KEY: string } }).env
+          .ANTHROPIC_API_KEY,
+      ).toBe('[REDACTED:anthropic]')
+      // And the persisted line contains no trace of the secret.
+      const disk = readFileSync(logPath, 'utf8')
+      expect(disk).not.toContain(secret)
+      expect(disk).toContain('[REDACTED:anthropic]')
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('redacts reason before hashing and writing', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      const secret = 'ghp_' + 'A'.repeat(36)
+      const ev = await w.writeEvent({
+        kind: 'gate.inbound.drop',
+        reason: `peer bot tried to post key ${secret}`,
+      })
+      expect(ev.reason).toBe(
+        'peer bot tried to post key [REDACTED:github]',
+      )
+      const disk = readFileSync(logPath, 'utf8')
+      expect(disk).not.toContain(secret)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('leaves non-redaction fields (toolName, ruleId, correlationId) untouched', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      // Even if a caller stuffs a token-shaped string into ruleId, the
+      // writer deliberately does NOT redact it — operators want that
+      // loud signal, per audit-journal-architecture.md §183-184.
+      const tokenShaped = 'ghp_' + 'A'.repeat(36)
+      const ev = await w.writeEvent({
+        kind: 'policy.deny',
+        toolName: 'reply',
+        ruleId: tokenShaped,
+        correlationId: 'req-42',
+      })
+      expect(ev.ruleId).toBe(tokenShaped)
+      expect(ev.toolName).toBe('reply')
+      expect(ev.correlationId).toBe('req-42')
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('hash is computed over the redacted form', async () => {
+    const { JournalWriter, canonicalJson, sha256Hex, redact } =
+      await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => new Date('2026-04-19T12:34:56.789Z'),
+    })
+    try {
+      const secret = 'AKIAIOSFODNN7EXAMPLE'
+      const ev = await w.writeEvent({
+        kind: 'policy.deny',
+        input: { leaked: secret },
+      })
+      // Recompute the expected hash using the REDACTED form — it must
+      // match the on-disk hash. A verifier computing from the on-disk
+      // file (which contains only the redacted form) can successfully
+      // re-derive the chain.
+      const { hash: _h, ...rest } = ev
+      void _h
+      const expectedRedactedInput = redact({ leaked: secret }) as Record<
+        string,
+        unknown
+      >
+      expect(rest.input).toEqual(expectedRedactedInput)
+      expect(sha256Hex(stableAnchor + canonicalJson(rest))).toBe(ev.hash)
+    } finally {
+      await w.close()
+    }
+  })
+})

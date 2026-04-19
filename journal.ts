@@ -453,12 +453,21 @@ export class JournalWriter {
     if (this.fh === null) {
       throw new Error('JournalWriter._doWrite: writer closed mid-queue')
     }
+    // Redact token-shaped values BEFORE hashing so the on-disk bytes,
+    // the hash chain, and the journal the operator inspects all agree.
+    // Surgical per audit-journal-architecture.md §183-184: only `input`
+    // and `reason` are redacted; other top-level fields are
+    // `ruleId`/`correlationId`/`toolName`-style identifiers that never
+    // carry secrets by contract. An operator who mistakenly stuffs a
+    // token into one of those is a caller bug, not a redactor gap.
+    const redactedInput = redactEventFields(input)
+
     const partial: PartialJournalEvent = {
       v: 1,
       ts: this.now().toISOString(),
       seq: this.nextSeq,
       prevHash: this.lastHash,
-      ...input,
+      ...redactedInput,
     }
     const hash = sha256Hex(this.lastHash + canonicalJson(partial))
     const event: JournalEvent = { ...partial, hash }
@@ -575,4 +584,115 @@ export function canonicalJson(value: unknown): string {
  *  in this module share one implementation. */
 export function sha256Hex(input: string | Uint8Array): string {
   return createHash('sha256').update(input).digest('hex')
+}
+
+// ---------------------------------------------------------------------------
+// Redaction — token-shaped secret scrubbing (ccsc-5pi.4)
+// ---------------------------------------------------------------------------
+
+/** Known secret patterns. Each entry's `re` is a global regex; `kind`
+ *  becomes the `[REDACTED:<kind>]` placeholder. Patterns taken directly
+ *  from 000-docs/audit-journal-architecture.md §168-181 — changes to
+ *  this list require a design-doc update, not a code-side tweak.
+ *
+ *  Defense-in-depth, not compliance: the redactor catches the
+ *  well-known token shapes that leak most often through error messages
+ *  and logs. Bespoke secrets (project-internal tokens, operator-chosen
+ *  passwords pasted as message text) still require operator-side
+ *  hygiene. The journal is `0o600` for a reason. */
+const TOKEN_PATTERNS: ReadonlyArray<{ kind: string; re: RegExp }> = [
+  { kind: 'anthropic', re: /sk-[a-zA-Z0-9-]{20,}/g },
+  { kind: 'slack_bot', re: /xoxb-[0-9]+-[0-9]+-[a-zA-Z0-9]+/g },
+  { kind: 'slack_app', re: /xapp-[0-9]+-[A-Z0-9]+-[0-9]+-[a-f0-9]+/g },
+  { kind: 'github', re: /\bghp_[A-Za-z0-9]{36}\b/g },
+  { kind: 'aws_access', re: /\bAKIA[0-9A-Z]{16}\b/g },
+  { kind: 'jwt', re: /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g },
+]
+
+/** Return the pattern list for tests and the verifier. Read-only; the
+ *  patterns are frozen to match the design doc. */
+export function tokenPatterns(): ReadonlyArray<{ kind: string; re: RegExp }> {
+  return TOKEN_PATTERNS
+}
+
+/** Replace every occurrence of a known secret pattern in `s` with
+ *  `[REDACTED:<kind>]`. Pure over the input string. */
+function redactString(s: string): string {
+  let out = s
+  for (const { kind, re } of TOKEN_PATTERNS) {
+    out = out.replace(re, `[REDACTED:${kind}]`)
+  }
+  return out
+}
+
+/** Deep-walk `value`, redacting every string encountered and
+ *  recursively walking arrays and plain objects. Non-string primitives
+ *  (numbers, booleans, null) pass through unchanged; unsupported
+ *  container types (Maps, Sets, class instances) pass through by
+ *  reference — callers that need to redact those must pre-flatten them
+ *  into plain JSON shapes.
+ *
+ *  Pure: never mutates its argument. Always returns a new object /
+ *  array when the container has any redactable content. Returns the
+ *  same reference when nothing changed (microoptimisation — saves
+ *  allocations in the common case where events carry no tokens). */
+export function redact(value: unknown): unknown {
+  if (typeof value === 'string') {
+    const out = redactString(value)
+    return out === value ? value : out
+  }
+  if (Array.isArray(value)) {
+    let changed = false
+    const out: unknown[] = new Array(value.length)
+    for (let i = 0; i < value.length; i++) {
+      const next = redact(value[i])
+      if (next !== value[i]) changed = true
+      out[i] = next
+    }
+    return changed ? out : value
+  }
+  if (typeof value === 'object' && value !== null) {
+    // Plain object fast-path. We do not try to detect class instances
+    // here because the journal event shape is JSON — class instances
+    // round-tripping through JSON.stringify would have lost their
+    // prototype anyway.
+    const obj = value as Record<string, unknown>
+    let changed = false
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(obj)) {
+      const next = redact(v)
+      if (next !== v) changed = true
+      out[k] = next
+    }
+    return changed ? out : value
+  }
+  return value
+}
+
+/** Writer-integration helper. Redacts only the two fields the design
+ *  doc lists (`input`, `reason`) and leaves everything else untouched.
+ *  Returns a new object when redaction changed anything; same
+ *  reference otherwise. Exported for the writer's own use; not part of
+ *  the public caller API.
+ *
+ *  Why restrict the scope? `toolName`, `ruleId`, `correlationId` and
+ *  friends are short identifiers that the caller authored. Redacting
+ *  them would mask real operator mistakes behind `[REDACTED:...]` and
+ *  make forensic review harder. If a caller does stuff a token into
+ *  one of those fields the journal will surface it loud — exactly the
+ *  forensic signal an operator wants. */
+export function redactEventFields(input: WriteInput): WriteInput {
+  const hasReason = typeof input.reason === 'string'
+  const hasInput = input.input !== undefined
+
+  if (!hasReason && !hasInput) return input
+
+  const out: WriteInput = { ...input }
+  if (hasReason) {
+    out.reason = redactString(input.reason as string)
+  }
+  if (hasInput) {
+    out.input = redact(input.input) as Record<string, unknown>
+  }
+  return out
 }
