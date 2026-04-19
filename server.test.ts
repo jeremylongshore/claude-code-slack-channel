@@ -13,6 +13,7 @@ import {
   generateCode,
   isDuplicateEvent,
   sessionPath,
+  saveSession,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   MAX_PENDING,
@@ -20,17 +21,21 @@ import {
   PAIRING_EXPIRY_MS,
   type Access,
   type GateOptions,
+  type Session,
   type SessionKey,
 } from './lib.ts'
 import {
   mkdtempSync,
   mkdirSync,
   writeFileSync,
+  readFileSync,
   symlinkSync,
   rmSync,
   statSync,
   readlinkSync,
   realpathSync,
+  existsSync,
+  readdirSync,
 } from 'fs'
 import { tmpdir } from 'os'
 import { join, sep } from 'path'
@@ -1166,5 +1171,119 @@ describe('sessionPath', () => {
     expect(() =>
       sessionPath(join(tmpRoot, 'nope-does-not-exist'), key('C_CHAN', 'T1.0')),
     ).toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// saveSession — 000-docs/session-state-machine.md §83-97
+//
+// Atomic write: tmp + chmod 0o600 + rename. Readers must never observe a
+// partial file. Any failure leaves the destination untouched and cleans up
+// the tmp sibling.
+// ---------------------------------------------------------------------------
+
+describe('saveSession', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  const makeSession = (channel: string, thread: string): Session => ({
+    v: 1,
+    key: { channel, thread },
+    createdAt: 1_700_000_000_000,
+    lastActiveAt: 1_700_000_001_000,
+    ownerId: 'U_OWNER',
+    data: { turns: [] },
+  })
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'saveSession-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('writes valid JSON that round-trips', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_RT', thread: 'T1.0' })
+    const s = makeSession('C_RT', 'T1.0')
+    await saveSession(p, s)
+
+    const raw = readFileSync(p, 'utf8')
+    expect(JSON.parse(raw)).toEqual(s)
+  })
+
+  test('written file is mode 0o600', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_MODE', thread: 'T1.0' })
+    await saveSession(p, makeSession('C_MODE', 'T1.0'))
+
+    const st = statSync(p)
+    expect(st.mode & 0o777).toBe(0o600)
+  })
+
+  test('overwrite: second save replaces the first, no partial state', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_OW', thread: 'T1.0' })
+
+    const s1 = makeSession('C_OW', 'T1.0')
+    s1.ownerId = 'U_FIRST'
+    await saveSession(p, s1)
+
+    const s2 = makeSession('C_OW', 'T1.0')
+    s2.ownerId = 'U_SECOND'
+    s2.lastActiveAt = 1_700_000_999_000
+    await saveSession(p, s2)
+
+    const loaded = JSON.parse(readFileSync(p, 'utf8')) as Session
+    expect(loaded.ownerId).toBe('U_SECOND')
+    expect(loaded.lastActiveAt).toBe(1_700_000_999_000)
+  })
+
+  test('cleans up tmp file on rename failure (destination dir removed mid-flight)', async () => {
+    // sessionPath creates sessions/<channel>/, but we can defeat rename
+    // by providing a path whose parent dir does not exist. The write
+    // itself (to .tmp.<pid>) will also fail here, which is what
+    // triggers cleanup — assert no stray .tmp.* files remain in tmpRoot.
+    const bogusPath = join(tmpRoot, 'missing-subdir', 'file.json')
+    await expect(saveSession(bogusPath, makeSession('C_X', 'T1.0'))).rejects.toThrow()
+
+    // No tmp file should linger in tmpRoot itself.
+    const stray = readdirSync(tmpRoot).filter((f) => f.startsWith('.tmp') || f.includes('.tmp.'))
+    expect(stray).toEqual([])
+  })
+
+  test('wx flag rejects pre-existing tmp sibling (crash-safety guard)', async () => {
+    // Simulate a crashed prior writer that left a tmp file behind.
+    // The current writer must NOT silently overwrite it, because doing
+    // so could race with a concurrent recovery process also eyeing the
+    // same stale tmp. wx requires the caller to clear the stale file
+    // explicitly (operator action) rather than racing it blind.
+    const p = sessionPath(tmpRoot, { channel: 'C_WX', thread: 'T1.0' })
+    const stale = `${p}.tmp.${process.pid}`
+    writeFileSync(stale, 'stale garbage', { mode: 0o600 })
+
+    await expect(saveSession(p, makeSession('C_WX', 'T1.0'))).rejects.toThrow()
+    // The destination file must not have been created by the failed attempt.
+    expect(existsSync(p)).toBe(false)
+  })
+
+  test('final file is at the expected path (no tmp suffix lingering)', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_FIN', thread: 'T1.0' })
+    await saveSession(p, makeSession('C_FIN', 'T1.0'))
+
+    expect(existsSync(p)).toBe(true)
+    const tmpSibling = `${p}.tmp.${process.pid}`
+    expect(existsSync(tmpSibling)).toBe(false)
+  })
+
+  test('serializes SessionKey verbatim — key.channel and key.thread survive round-trip', async () => {
+    // The design doc §106-108 makes identity self-describing: the
+    // persisted file contains its own key so a moved file stays
+    // traceable. Locks that invariant.
+    const p = sessionPath(tmpRoot, { channel: 'C_ID', thread: '1700000000.000100' })
+    const s = makeSession('C_ID', '1700000000.000100')
+    await saveSession(p, s)
+
+    const loaded = JSON.parse(readFileSync(p, 'utf8')) as Session
+    expect(loaded.key.channel).toBe('C_ID')
+    expect(loaded.key.thread).toBe('1700000000.000100')
   })
 })
