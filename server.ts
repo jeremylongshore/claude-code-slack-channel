@@ -363,6 +363,8 @@ const DownloadAttachmentInput = z
 
 const ListSessionsInput = z.object({}).strict()
 
+// NOTE: These schemas are duplicated for isolated testing in `server.test.ts`.
+// If you update a schema here, please update the corresponding copy there.
 export const toolSchemas = {
   reply: ReplyInput,
   react: ReactInput,
