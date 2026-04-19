@@ -272,11 +272,7 @@ the external-anchor mitigation.
 ### One-liner
 
 ```bash
-bun -e 'const { verifyJournal } = await import("./journal.ts"); \
-  const r = await verifyJournal(process.argv[1]); \
-  if (r.ok) { console.log(`ok: ${r.eventsVerified} events, chain intact`); process.exit(0) } \
-  else { const b = r.break; console.error(`tamper at line=${b.lineNumber} seq=${b.seq} ts=${b.ts}\n  reason: ${b.reason}` + (b.expected ? `\n  expected: ${b.expected}\n  actual:   ${b.actual}` : "")); process.exit(1) }' \
-  ~/.claude/channels/slack/audit.log
+bun -e 'const { verifyJournal } = await import("./journal.ts"); const r = await verifyJournal(process.argv[1]); if (r.ok) { console.log(`ok: ${r.eventsVerified} events, chain intact`); process.exit(0); } else { const b = r.break; console.error(`tamper at line=${b.lineNumber} seq=${b.seq} ts=${b.ts}\n  reason: ${b.reason}` + (b.expected ? `\n  expected: ${b.expected}\n  actual:   ${b.actual}` : "")); process.exit(1); }' ~/.claude/channels/slack/audit.log
 ```
 
 Exit codes:
