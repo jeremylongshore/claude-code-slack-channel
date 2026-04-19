@@ -913,3 +913,80 @@ export function isDuplicateEvent(
   seen.set(key, now + ttlMs)
   return false
 }
+
+// ---------------------------------------------------------------------------
+// Audit journal path resolution (ccsc-5pi.6)
+// ---------------------------------------------------------------------------
+
+/** Result of resolving the audit-log destination from CLI + env. `path`
+ *  is null when no journal is configured — in that case server.ts
+ *  never opens a writer and callers get a no-op journal surface.
+ *  `source` tracks where the path came from for diagnostic logging so
+ *  an operator can tell whether a surprise path came from a stale env
+ *  var or an invocation flag. */
+export interface JournalPathResolution {
+  path: string | null
+  source: 'flag' | 'env' | null
+}
+
+/** Resolve the audit-log path from argv + env. Pure. CLI flag wins
+ *  over env var; env var wins over unset. Both an empty `--audit-log-file`
+ *  and an empty `SLACK_AUDIT_LOG` are treated as "not set" (a leading
+ *  `=` with no value is almost always a shell mistake, not an intent
+ *  to journal to the current directory's root).
+ *
+ *  Forms accepted:
+ *    - `--audit-log-file PATH`       (space-separated)
+ *    - `--audit-log-file=PATH`       (equals form)
+ *
+ *  The returned path is NOT resolved against the filesystem — that
+ *  happens when `JournalWriter.open()` runs during bootstrap. Keeping
+ *  this helper pure lets tests assert the resolution order without
+ *  touching disk.
+ */
+export function resolveJournalPath(
+  argv: ReadonlyArray<string>,
+  env: Readonly<Record<string, string | undefined>>,
+): JournalPathResolution {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === '--audit-log-file') {
+      const next = argv[i + 1]
+      // Reject values that look like another flag (start with `-`).
+      // Scenarios:
+      //   - `--audit-log-file --debug` — operator forgot the path;
+      //     don't silently journal to a file literally named
+      //     `--debug`.
+      //   - `--audit-log-file -` — stdin convention; never a sensible
+      //     audit destination.
+      // A filename that genuinely starts with `-` is an
+      // operator-side edge case resolved by passing `./-name` through
+      // the shell or by using the `--audit-log-file=-name` equals
+      // form (which keeps the literal).
+      if (
+        typeof next === 'string' &&
+        next.length > 0 &&
+        !next.startsWith('-')
+      ) {
+        return { path: next, source: 'flag' }
+      }
+      // Missing / empty / flag-shaped value: fall through. Don't
+      // silently enable journaling at an unexpected path.
+      continue
+    }
+    if (arg.startsWith('--audit-log-file=')) {
+      const val = arg.slice('--audit-log-file='.length)
+      if (val.length > 0) {
+        return { path: val, source: 'flag' }
+      }
+      continue
+    }
+  }
+
+  const envPath = env['SLACK_AUDIT_LOG']
+  if (typeof envPath === 'string' && envPath.length > 0) {
+    return { path: envPath, source: 'env' }
+  }
+
+  return { path: null, source: null }
+}
