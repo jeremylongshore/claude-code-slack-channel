@@ -2936,10 +2936,20 @@ describe('JournalEvent', () => {
     expect(() =>
       JournalEvent.parse(minimal({ sessionKey: { thread: 'T01' } })),
     ).toThrow()
-    // Extra fields on sessionKey also rejected (strict nested shape)
-    // — Zod objects default to strip, but the critical invariant is at
-    // the top level; nested loose is acceptable for now because the
-    // writer only reads the two declared keys.
+  })
+
+  test('sessionKey: strict — rejects unknown nested fields to protect hash form', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    // Two writers that disagreed on sessionKey contents would hash to
+    // different canonical forms and break the chain. Strict rejection
+    // surfaces that mistake at parse time.
+    expect(() =>
+      JournalEvent.parse(
+        minimal({
+          sessionKey: { channel: 'C01', thread: 'T01', extra: 'oops' },
+        }),
+      ),
+    ).toThrow()
   })
 
   test('covers every EventKind value enumerated in the design doc', async () => {

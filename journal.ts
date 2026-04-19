@@ -125,11 +125,18 @@ const Sha256Hex = z
  *
  *  The `satisfies` assertion guarantees the shape stays in lock-step
  *  with the `SessionKey` type — a lib-side rename breaks the build
- *  here, forcing a schema bump. */
-const SessionKeyShape = z.object({
-  channel: z.string(),
-  thread: z.string(),
-}) satisfies z.ZodType<SessionKey>
+ *  here, forcing a schema bump.
+ *
+ *  `.strict()` for the same reason the top-level `JournalEvent` is
+ *  strict: two writers that disagree on what fields live inside
+ *  `sessionKey` would hash to different canonical forms and break the
+ *  chain. Reject unknown fields at parse time. */
+const SessionKeyShape = z
+  .object({
+    channel: z.string(),
+    thread: z.string(),
+  })
+  .strict() satisfies z.ZodType<SessionKey>
 
 // ---------------------------------------------------------------------------
 // JournalEvent — the on-disk record shape
