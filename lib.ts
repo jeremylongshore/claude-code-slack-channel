@@ -326,27 +326,6 @@ export interface SessionSummary {
  *  external tooling. */
 export const LIST_SESSIONS_MAX = 1000
 
-/** Enumerate every session file under `stateRoot/sessions/` and
- *  return a summary per (channel, thread) pair. Pure read; never
- *  mutates, never creates, never deletes.
- *
- *  Contract (ccsc-xa3.9):
- *    - Returns `SessionSummary[]` with NO body (`data` field) — the
- *      operator sees lifecycle metadata only.
- *    - Sorted by `lastActiveAt` descending so the most recently
- *      active thread is row 0. Stable for ties (insertion order).
- *    - Hard-capped at `LIST_SESSIONS_MAX` rows. Truncation is
- *      silent at this layer; the MCP tool wrapper is responsible
- *      for telling the operator they hit the cap.
- *    - Tolerant to a missing `sessions/` dir — returns `[]` for a
- *      fresh install.
- *    - Tolerant to unparseable or malformed files — logs to
- *      `process.stderr` and skips. A single corrupt thread does
- *      not take down the enumeration.
- *    - Realpath guards every file and channel dir against the state
- *      root so a symlink inside `sessions/` cannot surface a file
- *      from elsewhere on disk.
- */
 /** Read and validate one thread file, returning its summary or null
  *  if the file is missing, unparseable, outside the state root, or
  *  missing load-bearing fields. Log-and-skip on parse error so a
@@ -451,6 +430,27 @@ function collectChannelSummaries(
   }
 }
 
+/** Enumerate every session file under `stateRoot/sessions/` and
+ *  return a summary per (channel, thread) pair. Pure read; never
+ *  mutates, never creates, never deletes.
+ *
+ *  Contract (ccsc-xa3.9):
+ *    - Returns `SessionSummary[]` with NO body (`data` field) — the
+ *      operator sees lifecycle metadata only.
+ *    - Sorted by `lastActiveAt` descending so the most recently
+ *      active thread is row 0. Stable for ties (insertion order).
+ *    - Hard-capped at `LIST_SESSIONS_MAX` rows. Truncation is
+ *      silent at this layer; the MCP tool wrapper is responsible
+ *      for telling the operator they hit the cap.
+ *    - Tolerant to a missing `sessions/` dir — returns `[]` for a
+ *      fresh install.
+ *    - Tolerant to unparseable or malformed files — logs to
+ *      `process.stderr` and skips. A single corrupt thread does
+ *      not take down the enumeration.
+ *    - Realpath guards every file and channel dir against the state
+ *      root so a symlink inside `sessions/` cannot surface a file
+ *      from elsewhere on disk.
+ */
 export function listSessions(stateRoot: string): SessionSummary[] {
   const resolvedRoot = realpathSync.native(resolve(stateRoot))
   const sessionsDir = join(resolvedRoot, 'sessions')
