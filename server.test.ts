@@ -3,6 +3,7 @@ import {
   gate,
   assertSendable,
   parseSendableRoots,
+  validateSendableRoots,
   assertOutboundAllowed,
   isSlackFileUrl,
   chunkText,
@@ -1625,5 +1626,249 @@ describe('session persistence across restart', () => {
 
     expect(loadedOld.ownerId).toBe('U_A')
     expect(loadedNew.ownerId).toBe('U_B')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// validateSendableRoots — ccsc-a9z boot-time fail-fast
+//
+// Every configured SLACK_SENDABLE_ROOTS entry must exist and realpath-resolve
+// at server startup. Silently degrading to lexical resolution (the previous
+// behavior in assertSendable) created a TOCTOU window where a post-boot
+// symlink could flip a previously-inaccessible root into a structurally
+// different check. This test suite locks the fail-fast contract.
+// ---------------------------------------------------------------------------
+
+describe('validateSendableRoots', () => {
+  let rawRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'validateRoots-'))
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('empty input is a no-op', () => {
+    expect(() => validateSendableRoots([])).not.toThrow()
+  })
+
+  test('passes when every root exists', () => {
+    const a = mkdtempSync(join(tmpdir(), 'validateRoots-a-'))
+    const b = mkdtempSync(join(tmpdir(), 'validateRoots-b-'))
+    try {
+      expect(() => validateSendableRoots([a, b])).not.toThrow()
+    } finally {
+      rmSync(a, { recursive: true, force: true })
+      rmSync(b, { recursive: true, force: true })
+    }
+  })
+
+  test('throws with a detailed message listing each missing path', () => {
+    const missing = join(rawRoot, 'does-not-exist')
+    expect(() => validateSendableRoots([missing])).toThrow(/1 inaccessible path/)
+    expect(() => validateSendableRoots([missing])).toThrow(missing)
+  })
+
+  test('reports every missing root in the same error (not just the first)', () => {
+    const missingA = join(rawRoot, 'missing-a')
+    const missingB = join(rawRoot, 'missing-b')
+    try {
+      validateSendableRoots([missingA, missingB])
+      throw new Error('should have thrown')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      expect(msg).toContain('2 inaccessible path')
+      expect(msg).toContain(missingA)
+      expect(msg).toContain(missingB)
+    }
+  })
+
+  test('mixed valid + invalid: throws, naming only the invalid ones', () => {
+    const good = mkdtempSync(join(tmpdir(), 'validateRoots-good-'))
+    const bad = join(rawRoot, 'nope')
+    try {
+      validateSendableRoots([good, bad])
+      throw new Error('should have thrown')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      expect(msg).toContain('1 inaccessible path')
+      expect(msg).toContain(bad)
+      expect(msg).not.toContain(`${good}:`)
+    } finally {
+      rmSync(good, { recursive: true, force: true })
+    }
+  })
+
+  test('error message instructs the operator how to recover', () => {
+    const missing = join(rawRoot, 'gone')
+    try {
+      validateSendableRoots([missing])
+      throw new Error('should have thrown')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      // Operator-facing guidance must be present so the .env change is obvious.
+      expect(msg).toMatch(/exist and be readable/)
+      expect(msg).toMatch(/SLACK_SENDABLE_ROOTS/)
+      expect(msg).toMatch(/\.env/)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// PolicyRule Zod schema — ccsc-d3w follow-up test coverage for ccsc-v1b.1
+//
+// Exercises every branch of MatchSpec + the discriminated union's per-effect
+// shapes. Locks the 24h ttlMs ceiling and documents the intentional
+// deferral of id-uniqueness to the loader (ccsc-v1b.3's evaluator caller).
+// ---------------------------------------------------------------------------
+
+describe('PolicyRule schema (29-A.1)', () => {
+  // Imports done dynamically so this suite is independent of the other
+  // policy-engine test blocks that may land in later epics.
+  const loadPolicyModule = async () => await import('./policy.ts')
+
+  // ── MatchSpec refinement: at least one constrained field ──────────────
+
+  test('MatchSpec rejects zero-field match', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: {},
+      }),
+    ).toThrow(/at least one field/)
+  })
+
+  test('MatchSpec rejects argEquals: {} (empty object counts as zero fields)', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { argEquals: {} },
+      }),
+    ).toThrow(/at least one field/)
+  })
+
+  test('MatchSpec accepts a single-field constraint', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { tool: 'reply' },
+      }),
+    ).not.toThrow()
+  })
+
+  // ── Channel ID regex ──────────────────────────────────────────────────
+
+  test('MatchSpec accepts valid Slack channel IDs starting with C or D', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    for (const channel of ['C0123456789', 'D0123456789', 'CABCDEF1234']) {
+      expect(() =>
+        PolicyRule.parse({
+          id: 'r1',
+          effect: 'auto_approve',
+          match: { channel },
+        }),
+      ).not.toThrow()
+    }
+  })
+
+  test('MatchSpec rejects channel IDs not starting with C or D', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { channel: 'G0123456789' },
+      }),
+    ).toThrow()
+  })
+
+  // ── Discriminated union variance ──────────────────────────────────────
+
+  test('DenyRule requires a non-empty reason', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'deny',
+        match: { tool: 'upload_file' },
+      }),
+    ).toThrow()
+
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'deny',
+        match: { tool: 'upload_file' },
+        reason: 'blocks sensitive uploads',
+      }),
+    ).not.toThrow()
+  })
+
+  test('RequireApprovalRule accepts a default ttlMs of 5 minutes', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    const parsed = PolicyRule.parse({
+      id: 'r1',
+      effect: 'require_approval',
+      match: { tool: 'upload_file' },
+    }) as { effect: 'require_approval'; ttlMs: number }
+    expect(parsed.ttlMs).toBe(5 * 60 * 1000)
+  })
+
+  test('RequireApprovalRule accepts ttlMs up to 24h', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'require_approval',
+        match: { tool: 'upload_file' },
+        ttlMs: 24 * 60 * 60 * 1000,
+      }),
+    ).not.toThrow()
+  })
+
+  test('RequireApprovalRule rejects ttlMs > 24h', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'require_approval',
+        match: { tool: 'upload_file' },
+        ttlMs: 24 * 60 * 60 * 1000 + 1,
+      }),
+    ).toThrow()
+  })
+
+  // ── Defaults ──────────────────────────────────────────────────────────
+
+  test('priority defaults to 100 when omitted', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    const parsed = PolicyRule.parse({
+      id: 'r1',
+      effect: 'auto_approve',
+      match: { tool: 'reply' },
+    }) as { priority: number }
+    expect(parsed.priority).toBe(100)
+  })
+
+  // ── Loader-deferred invariants ────────────────────────────────────────
+
+  test('parsePolicyRules does NOT enforce id uniqueness (deferred to loader per design doc)', async () => {
+    // The doc specifies id-uniqueness is a load-time error. parsePolicyRules
+    // deliberately does not enforce it — the loader (29-A.5) will. This
+    // test locks the deferred behavior so a future refactor that quietly
+    // adds the check (and breaks the loader's error ordering) is loud.
+    const { parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      { id: 'dupe', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'dupe', effect: 'deny', match: { tool: 'reply' }, reason: 'x' },
+    ])
+    expect(rules).toHaveLength(2)
   })
 })

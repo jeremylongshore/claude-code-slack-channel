@@ -182,6 +182,12 @@ SLACK_SENDABLE_ROOTS=/Users/you/projects/report-outputs:/tmp/claude-artifacts
 ```
 
 - Paths must be absolute; relative entries are silently dropped.
+- **Every configured path must exist and be readable at server startup.** The
+  server fails fast (`process.exit(1)` with a message listing each bad path)
+  if any entry cannot be `realpath`-resolved — missing directory, broken
+  symlink, or permission denied. Fix the path or remove it from `.env` and
+  restart. This closes a TOCTOU window where a post-boot symlink could flip
+  a previously-inaccessible root into a structurally different check.
 - Symlinks are followed via `realpath` before the allowlist check, so
   symlinking a secret file into an allowed root will not bypass the guard.
 - The guard also applies a **basename denylist** that rejects common secret

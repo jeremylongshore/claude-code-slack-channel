@@ -498,6 +498,47 @@ export function parseSendableRoots(raw: string | undefined): string[] {
   return out
 }
 
+/** Fail-fast validator for SLACK_SENDABLE_ROOTS at server boot (ccsc-a9z).
+ *
+ *  Throws with a detailed message listing every root that could not be
+ *  realpath-resolved — missing directory, broken symlink, no-permission,
+ *  etc. Intended to run once at startup before the Slack socket is open
+ *  so a misconfigured state dir is a loud failure, not a silent degradation.
+ *
+ *  **Why this exists.** `assertSendable` has a defensive silent-fallback
+ *  (`realpath → catch → resolve`) on per-call root resolution. That
+ *  fallback meant a root path that did not exist at runtime would
+ *  silently be treated as a *lexical* path — so an attacker who could
+ *  create a symlink at the configured location *after* server start
+ *  could turn a previously inaccessible root into one with a structurally
+ *  different (non-canonicalized) check. Validating at boot ensures every
+ *  configured root is real + resolvable before any request arrives; the
+ *  silent fallback then becomes dead code for any in-production call.
+ *
+ *  Called from `server.ts` bootstrap. Empty input is a no-op — the
+ *  default allowlist (INBOX_DIR only) needs no extra validation.
+ */
+export function validateSendableRoots(roots: readonly string[]): void {
+  const errors: string[] = []
+  for (const r of roots) {
+    try {
+      realpathSync(resolve(r))
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException)?.code
+      const msg = code ?? (e instanceof Error ? e.message : 'inaccessible')
+      errors.push(`${r}: ${msg}`)
+    }
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `SLACK_SENDABLE_ROOTS contains ${errors.length} inaccessible path(s):\n` +
+        `  - ${errors.join('\n  - ')}\n\n` +
+        'Every configured root must exist and be readable at server startup. ' +
+        'Fix the path (or remove it from SLACK_SENDABLE_ROOTS in .env) before restarting.',
+    )
+  }
+}
+
 /**
  * Throws if `filePath` is not safe to hand to the Slack file-upload API.
  *

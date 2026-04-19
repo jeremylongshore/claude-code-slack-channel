@@ -33,6 +33,7 @@ import {
   generateCode as _generateCode,
   assertSendable as libAssertSendable,
   parseSendableRoots,
+  validateSendableRoots,
   assertOutboundAllowed as libAssertOutboundAllowed,
   isSlackFileUrl,
   chunkText,
@@ -62,7 +63,18 @@ const DEFAULT_CHUNK_LIMIT = 4000
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
 // reply tool may attach files. Colon-separated absolute paths. Default empty
 // (only INBOX_DIR is sendable). See ACCESS.md for details.
+//
+// Boot-time fail-fast (ccsc-a9z): every configured root must exist and be
+// readable at startup. A missing root used to degrade silently to lexical
+// resolution in assertSendable — a TOCTOU window where an attacker could
+// plant a symlink post-boot. Validating here closes that window.
 const SENDABLE_ROOTS = parseSendableRoots(process.env['SLACK_SENDABLE_ROOTS'])
+try {
+  validateSendableRoots(SENDABLE_ROOTS)
+} catch (err) {
+  console.error(`[slack] ${err instanceof Error ? err.message : String(err)}`)
+  process.exit(1)
+}
 
 // ---------------------------------------------------------------------------
 // Bootstrap — tokens & state directory
