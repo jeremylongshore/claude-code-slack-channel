@@ -236,29 +236,50 @@ Why separate the projection?
 
 ## Verification command
 
-Epic 30-A includes a `bun run verify-journal <path>` script. Behavior:
+Epic 30-A ships `verifyJournal(path)` as an exported function from
+`journal.ts`. Behavior:
 
 1. Read the file line-by-line, parse each as JSON.
-2. Reject if schema versions differ or the first event is not
-   `kind: system.boot`.
+2. Reject if schema versions differ or the event fails strict
+   `JournalEvent` validation.
 3. For each event, recompute
-   `expected = sha256(prev || jcs(event sans hash))` and compare.
-4. On mismatch, print:
-   ```
-   tamper at seq=12345 ts=2026-04-19T10:12:34.567Z
-   expected hash=abc123...
-   actual   hash=def456...
-   ```
-   and exit non-zero.
-5. On success print `ok: N events, chain intact`.
+   `expected = sha256(prevHash || jcs(event sans hash))` and compare.
+4. On any break, return a `VerifyResult` with `ok: false` and a
+   `break` describing `lineNumber`, `seq`, `ts`, `reason`, and — when
+   applicable — `expected` / `actual` hashes. The function never
+   modifies the file.
+5. On success return `{ ok: true, eventsVerified: N }`.
+
+### Example 3-line log
+
+A minimal intact chain — each `prevHash` equals the previous event's
+`hash`, and `seq` increments by one. (Hashes truncated for
+readability; real entries are 64-char hex.)
+
+```jsonl
+{"v":1,"seq":1,"ts":"2026-04-19T18:57:00.100Z","kind":"system.boot","actor":"system","prevHash":"0000…0000","hash":"a1b2…c3d4"}
+{"v":1,"seq":2,"ts":"2026-04-19T18:57:00.420Z","kind":"gate.inbound.deliver","actor":"system","sessionKey":{"channel":"C01","thread":"17..."},"prevHash":"a1b2…c3d4","hash":"5e6f…7890"}
+{"v":1,"seq":3,"ts":"2026-04-19T18:57:01.015Z","kind":"gate.outbound.allow","actor":"claude_process","sessionKey":{"channel":"C01","thread":"17..."},"prevHash":"5e6f…7890","hash":"9abc…def0"}
+```
+
+Any edit to any field in line 2 changes its recomputed `hash` —
+verification fails at line 2. Reordering lines 2 and 3 makes line 3's
+`prevHash` no longer equal line 2's new `hash` — verification fails
+at line 3. Deleting line 3 silently (tail truncation) is **not**
+detected by the chain alone; see §107-115 for why, and Epic 30-B for
+the external-anchor mitigation.
+
+### One-liner
+
+```bash
+bun -e 'const { verifyJournal } = await import("./journal.ts"); const r = await verifyJournal(process.argv[1]); if (r.ok) { console.log(`ok: ${r.eventsVerified} events, chain intact`); process.exit(0); } else { const b = r.break; console.error(`tamper at line=${b.lineNumber} seq=${b.seq} ts=${b.ts}\n  reason: ${b.reason}` + (b.expected ? `\n  expected: ${b.expected}\n  actual:   ${b.actual}` : "")); process.exit(1); }' ~/.claude/channels/slack/audit.log
+```
 
 Exit codes:
 
 - `0` — chain intact end-to-end.
-- `1` — chain break (mismatch, missing seq, version skew).
-- `2` — read error or malformed line.
-
-The command never modifies the file.
+- `1` — chain break (hash mismatch, `prevHash` mismatch, `seq` gap,
+  schema violation, version skew, or parse error).
 
 ---
 
