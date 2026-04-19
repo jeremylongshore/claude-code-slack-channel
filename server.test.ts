@@ -2436,3 +2436,165 @@ describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
     expect(checkMonotonicity([], next)).toEqual([])
   })
 })
+
+// ---------------------------------------------------------------------------
+// SessionSupervisor.activate — 000-docs/session-state-machine.md §221-267
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor.activate', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logged: Array<{ event: string; fields: Record<string, unknown> }>
+  let nowValue: number
+
+  const key = { channel: 'C_SUP', thread: 'T1.0' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-activate-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logged = []
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: (event, fields) => {
+        logged.push({ event, fields })
+      },
+      clock: () => nowValue,
+    })
+  }
+
+  test('activate with no existing file creates a new session and saves it', async () => {
+    const sup = makeSupervisor()
+
+    const handle = await sup.activate(key, 'U_OWNER')
+
+    expect(handle.key).toEqual(key)
+    expect(handle.state).toBe('active')
+    expect(handle.session.ownerId).toBe('U_OWNER')
+    expect(handle.session.v).toBe(1)
+    expect(handle.session.createdAt).toBe(nowValue)
+    expect(handle.session.lastActiveAt).toBe(nowValue)
+    expect(handle.session.data).toEqual({})
+
+    // File landed on disk with 0o600.
+    const p = sessionPath(tmpRoot, key)
+    const st = statSync(p)
+    expect(st.mode & 0o777).toBe(0o600)
+    const persisted = JSON.parse(readFileSync(p, 'utf8')) as Session
+    expect(persisted).toEqual(handle.session)
+  })
+
+  test('activate loads an existing session file and preserves ownerId', async () => {
+    // Pre-seed a session file that the supervisor should just load.
+    const pre: Session = {
+      v: 1,
+      key,
+      createdAt: 1_600_000_000_000,
+      lastActiveAt: 1_600_000_500_000,
+      ownerId: 'U_PRIOR',
+      data: { turns: [{ role: 'user', content: 'hi' }] },
+    }
+    const p = sessionPath(tmpRoot, key)
+    await saveSession(p, pre)
+
+    const sup = makeSupervisor()
+    // Supply a different initialOwnerId — it should be ignored because
+    // the file already exists.
+    const handle = await sup.activate(key, 'U_SHOULD_BE_IGNORED')
+
+    expect(handle.state).toBe('active')
+    expect(handle.session.ownerId).toBe('U_PRIOR')
+    expect(handle.session.data).toEqual({ turns: [{ role: 'user', content: 'hi' }] })
+  })
+
+  test('activate emits session.activate log with channel, thread, ownerId', async () => {
+    const sup = makeSupervisor()
+    await sup.activate(key, 'U_LOG_ME')
+
+    const hit = logged.find((l) => l.event === 'session.activate')
+    expect(hit).toBeDefined()
+    expect(hit!.fields).toEqual({
+      channel: 'C_SUP',
+      thread: 'T1.0',
+      ownerId: 'U_LOG_ME',
+    })
+  })
+
+  test('activate rejects when file missing and no initialOwnerId given', async () => {
+    const sup = makeSupervisor()
+    // No existing file; caller omits the owner. Contract says reject
+    // rather than synthesize identity.
+    await expect(sup.activate(key)).rejects.toThrow(/initialOwnerId/)
+  })
+
+  test('activate is single-flight: concurrent calls for same key share one handle', async () => {
+    const sup = makeSupervisor()
+    const [h1, h2, h3] = await Promise.all([
+      sup.activate(key, 'U_A'),
+      sup.activate(key, 'U_B'), // loses the race; owner should be U_A
+      sup.activate(key, 'U_C'), // loses the race; owner should be U_A
+    ])
+    expect(h1).toBe(h2)
+    expect(h2).toBe(h3)
+    expect(h1.session.ownerId).toBe('U_A')
+
+    // Only one session.activate log emission for three concurrent
+    // callers — the single-flight guarantee includes the log.
+    const events = logged.filter((l) => l.event === 'session.activate')
+    expect(events).toHaveLength(1)
+  })
+
+  test('cached activate: second call after first settles returns the same handle', async () => {
+    const sup = makeSupervisor()
+    const first = await sup.activate(key, 'U_OWNER')
+    const second = await sup.activate(key) // no owner needed, cached
+    expect(second).toBe(first)
+  })
+
+  test('activate allocates an empty in-flight AbortController map on the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    // The map is internal (not on the interface), but exposed as a
+    // readonly property on ConcreteHandle for server.ts (ccsc-xa3.15)
+    // to attach abort controllers onto. Shape-check it here.
+    const inFlight = (handle as unknown as { inFlight: Map<string, AbortController> })
+      .inFlight
+    expect(inFlight).toBeInstanceOf(Map)
+    expect(inFlight.size).toBe(0)
+  })
+
+  test('activate rejects with malformed SessionKey components (no disk write)', async () => {
+    const sup = makeSupervisor()
+    // `..` is rejected by sessionPath(); supervisor must surface the
+    // error without caching a handle.
+    await expect(
+      sup.activate({ channel: '..', thread: 'T1' }, 'U_X'),
+    ).rejects.toThrow(/invalid channel/)
+
+    // A subsequent good activate must not observe stale in-flight
+    // state (single-flight map cleared).
+    const handle = await sup.activate(key, 'U_OK')
+    expect(handle.state).toBe('active')
+  })
+
+  test('quiesce/deactivate/shutdown are staged stubs that reject with bead pointers', async () => {
+    const sup = makeSupervisor()
+    await expect(sup.quiesce(key)).rejects.toThrow(/xa3\.3/)
+    await expect(sup.deactivate(key)).rejects.toThrow(/xa3\.14/)
+    await expect(sup.shutdown()).rejects.toThrow(/xa3\.14/)
+  })
+
+  test('handle.update is a staged stub that rejects with a bead pointer', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    await expect(handle.update((s) => s)).rejects.toThrow(/not yet implemented/)
+  })
+})

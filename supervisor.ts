@@ -36,6 +36,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { loadSession, saveSession, sessionPath } from './lib'
 import type { Session, SessionKey } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -143,6 +144,15 @@ export interface SessionSupervisor {
   /** Activate the session for `key`: load the file if it exists, create
    *  an empty one if not, and return a live handle.
    *
+   *  `initialOwnerId` is the Slack user ID to record as `ownerId` on a
+   *  newly-created session file. It is consulted **only** on the create
+   *  branch; if the session file already exists, the stored owner wins
+   *  and the argument is ignored. A caller that knows the session
+   *  already exists may omit it. A caller that cannot vouch for owner
+   *  (supervisor rehydration on boot, internal bookkeeping) may omit it
+   *  as well — activate() will then reject if the file is missing,
+   *  rather than synthesize an owner.
+   *
    *  Contract:
    *    - Idempotent per key. Two concurrent activate() calls for the
    *      same key return the same handle (single-flight, per
@@ -158,7 +168,7 @@ export interface SessionSupervisor {
    *      recorded for the key.
    *    - Does not enforce idle TTL. Reaper logic lives in the deactivate
    *      path, not here. */
-  activate(key: SessionKey): Promise<SessionHandle>
+  activate(key: SessionKey, initialOwnerId?: string): Promise<SessionHandle>
 
   /** Refuse new work on `key` and wait for pending writes to flush.
    *
@@ -196,4 +206,292 @@ export interface SessionSupervisor {
    *  `activate()` call rejects. A new supervisor instance is required
    *  to resume, and it will rebuild state from disk. */
   shutdown(): Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// Factory — createSessionSupervisor
+// ---------------------------------------------------------------------------
+
+/** Structured log line emitted by the supervisor. `event` is a stable
+ *  identifier (e.g. `session.activate`); `fields` carries the event's
+ *  payload. Consumers are expected to inject their own writer; the
+ *  default writes one newline-delimited JSON object per call to stdout
+ *  so the journal sink (Epic 30-A) can tail the stream. */
+export type SupervisorLog = (
+  event: string,
+  fields: Record<string, unknown>,
+) => void
+
+/** Injection points for a SessionSupervisor. All are optional; defaults
+ *  give you a production-shaped supervisor that writes to stdout and
+ *  reads real wall-clock time. Tests supply their own `log` and `clock`
+ *  to keep assertions deterministic. */
+export interface SupervisorOptions {
+  /** State directory root, e.g. `~/.claude/channels/slack`. The same
+   *  root passed to `sessionPath()` and `loadSession()` in lib.ts. */
+  stateRoot: string
+  /** Optional structured log sink. Defaults to a stdout JSON-line
+   *  writer. */
+  log?: SupervisorLog
+  /** Optional wall-clock source, returning epoch-ms. Defaults to
+   *  `Date.now`. Injected for deterministic tests of `createdAt` and
+   *  `lastActiveAt`. */
+  clock?: () => number
+}
+
+/** Default structured log writer: one newline-delimited JSON object per
+ *  call, written to stdout. Matches the format the journal sink will
+ *  tail. Keeping this internal means callers who want a different sink
+ *  just pass their own `log` — no global config. */
+function defaultLog(event: string, fields: Record<string, unknown>): void {
+  const line = JSON.stringify({ event, ...fields })
+  // process.stdout.write is sync for TTYs, async for pipes; either way
+  // the supervisor does not await the flush. Structured logs are best-
+  // effort; loss of a line is not a correctness issue.
+  process.stdout.write(line + '\n')
+}
+
+/** Construct a SessionSupervisor bound to a state directory.
+ *
+ *  Build one of these at server boot per state root. The supervisor is
+ *  long-lived; every inbound event flows through the same instance.
+ *
+ *  This factory currently returns a supervisor whose `activate()` is
+ *  fully wired (ccsc-xa3.2) and whose `quiesce()`, `deactivate()`, and
+ *  `shutdown()` throw `not yet implemented`. Those land in sibling
+ *  beads (ccsc-xa3.3, ccsc-xa3.14). Handle `update()` is also staged
+ *  for a later bead and currently rejects — callers of `activate()`
+ *  can read state but not yet persist changes. See
+ *  000-docs/session-state-machine.md §221-267 for the full target
+ *  behaviour. */
+export function createSessionSupervisor(
+  opts: SupervisorOptions,
+): SessionSupervisor {
+  const log = opts.log ?? defaultLog
+  const clock = opts.clock ?? Date.now
+  const { stateRoot } = opts
+
+  // Live handles, keyed by the stringified SessionKey. Use a composite
+  // string because `Map<object, ...>` keys by reference and two equal-
+  // valued SessionKey literals would not collide.
+  const live = new Map<string, ConcreteHandle>()
+
+  // Single-flight: concurrent activate() calls for the same key share
+  // one load/create promise. Cleared after the promise settles so a
+  // post-deactivate re-activation is not served a stale entry.
+  const activating = new Map<string, Promise<SessionHandle>>()
+
+  function keyId(k: SessionKey): string {
+    // `\0` is not a legal character in a Slack channel/ts string, so it
+    // is safe as a separator. Avoids the `"C1:T1" vs "C:1T1"` collision
+    // you would get with a single-colon join.
+    return `${k.channel}\0${k.thread}`
+  }
+
+  async function doActivate(
+    key: SessionKey,
+    initialOwnerId: string | undefined,
+  ): Promise<SessionHandle> {
+    // Path validation runs first — a malformed key never touches disk.
+    // Any throw here propagates; no handle is recorded.
+    const path = sessionPath(stateRoot, key)
+
+    let session: Session
+    try {
+      session = await loadSession(stateRoot, path)
+    } catch (err) {
+      if (!isNotFound(err)) {
+        // Real read failure: permissions, I/O, corrupt JSON, realpath
+        // escape. Caller treats this as a Quarantined transition; the
+        // quarantine bookkeeping (bead-filing, live-map entry with
+        // `state: 'quarantined'`) lands in ccsc-xa3.14. For now, surface
+        // the error and do not cache a handle. See session-state-
+        // machine.md §259-267 for the target failure-mode matrix.
+        log('session.activate_error', {
+          channel: key.channel,
+          thread: key.thread,
+          error: errorMessage(err),
+        })
+        throw err
+      }
+      // ENOENT branch: this key has never been activated. Require the
+      // caller to name the initial owner; otherwise refuse rather than
+      // synthesize identity. Aligned with session-state-machine.md §39
+      // ("the identity primitive does not accept user-authored values").
+      if (initialOwnerId === undefined) {
+        throw new Error(
+          `activate: session file missing and no initialOwnerId provided for ${JSON.stringify(
+            key,
+          )}`,
+        )
+      }
+      const now = clock()
+      session = {
+        v: 1,
+        key,
+        createdAt: now,
+        lastActiveAt: now,
+        ownerId: initialOwnerId,
+        data: {},
+      }
+      await saveSession(path, session)
+    }
+
+    const handle = new ConcreteHandle(key, session, path)
+    handle.markActive()
+    live.set(keyId(key), handle)
+
+    log('session.activate', {
+      channel: key.channel,
+      thread: key.thread,
+      ownerId: session.ownerId,
+    })
+
+    return handle
+  }
+
+  return {
+    activate(
+      key: SessionKey,
+      initialOwnerId?: string,
+    ): Promise<SessionHandle> {
+      const id = keyId(key)
+
+      // Cached handle wins: subsequent activate() on a live key returns
+      // the same handle without re-reading the file (session-state-
+      // machine.md §266 invariant).
+      const existing = live.get(id)
+      if (existing !== undefined) {
+        return Promise.resolve(existing)
+      }
+
+      // Single-flight: if a concurrent activation is already in
+      // progress, join it. The initialOwnerId from the second caller is
+      // discarded — the first caller won the race and their owner
+      // (if any) is the authoritative first owner.
+      const inflight = activating.get(id)
+      if (inflight !== undefined) {
+        return inflight
+      }
+
+      const promise = doActivate(key, initialOwnerId).finally(() => {
+        activating.delete(id)
+      })
+      activating.set(id, promise)
+      return promise
+    },
+
+    quiesce(_key: SessionKey): Promise<void> {
+      // ccsc-xa3.3.
+      return Promise.reject(
+        new Error('SessionSupervisor.quiesce: not yet implemented (ccsc-xa3.3)'),
+      )
+    },
+
+    deactivate(_key: SessionKey): Promise<void> {
+      // Under ccsc-xa3.14 (deactivate + reaper sub-epic).
+      return Promise.reject(
+        new Error(
+          'SessionSupervisor.deactivate: not yet implemented (ccsc-xa3.14)',
+        ),
+      )
+    },
+
+    shutdown(): Promise<void> {
+      // Under ccsc-xa3.14 (deactivate + reaper sub-epic).
+      return Promise.reject(
+        new Error(
+          'SessionSupervisor.shutdown: not yet implemented (ccsc-xa3.14)',
+        ),
+      )
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal — ConcreteHandle
+// ---------------------------------------------------------------------------
+
+/** In-process implementation of SessionHandle.
+ *
+ *  Not exported: callers consume the `SessionHandle` interface. Keeping
+ *  the class private lets later beads (update(), quiesce()) grow its
+ *  internals without widening the public surface.
+ *
+ *  This bead (ccsc-xa3.2) provides just enough handle shape to return
+ *  from activate(): identity, state, snapshot, and the in-flight
+ *  tool-call map required by the bead description. The `update()` body
+ *  and quiesce-aware state transitions are staged in sibling beads. */
+class ConcreteHandle implements SessionHandle {
+  readonly key: SessionKey
+  session: Session
+
+  // Backing field for the public `state` accessor. Starts in
+  // 'activating' so a consumer who somehow observes the handle before
+  // markActive() runs sees the honest transient state rather than a
+  // false 'active'.
+  private _state: SessionState = 'activating'
+
+  /** Per-request AbortControllers for tool calls dispatched against
+   *  this session. Populated by server.ts when it issues a tool call;
+   *  consumed by quiesce/shutdown to abort in-flight work before
+   *  persisting the final snapshot. Allocated here to satisfy the
+   *  activate-time contract in ccsc-xa3.2; the wiring into the tool-
+   *  call path is ccsc-xa3.15. */
+  readonly inFlight: Map<string, AbortController> = new Map()
+
+  /** Resolved path this session's file lives at. Kept on the handle so
+   *  later beads' `update()` and quiesce paths do not re-run
+   *  `sessionPath()` (which would re-mkdir the parent). */
+  readonly path: string
+
+  constructor(key: SessionKey, session: Session, path: string) {
+    this.key = key
+    this.session = session
+    this.path = path
+  }
+
+  get state(): SessionState {
+    return this._state
+  }
+
+  /** Transition from `activating` → `active`. Called by the supervisor
+   *  once the handle is fully wired and live in the map. Package-
+   *  private by convention; callers outside this file must not invoke
+   *  it. Later beads replace this with a proper state-transition method
+   *  that accepts the full FSM. */
+  markActive(): void {
+    this._state = 'active'
+  }
+
+  update(_fn: (prev: Session) => Session): Promise<void> {
+    // Staged for a later bead. update() is documented in the interface
+    // so later code can rely on the shape, but the mutex + atomic-write
+    // plumbing lands with the first real consumer (29-B or 32-B.3).
+    return Promise.reject(
+      new Error('SessionHandle.update: not yet implemented (later 32-B bead)'),
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal — error helpers
+// ---------------------------------------------------------------------------
+
+/** True for errors thrown by `loadSession` when the session file does
+ *  not exist yet. `realpathSync.native` surfaces a NodeJS.ErrnoException
+ *  with `code === 'ENOENT'`; we check `code` defensively in case the
+ *  error was wrapped. */
+function isNotFound(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const e = err as { code?: unknown }
+  return e.code === 'ENOENT'
+}
+
+/** Best-effort error message extractor for structured logs. Uses
+ *  `Error.message` when available; falls back to the stringified value
+ *  so non-Error throws (string, number) still log something. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  return String(err)
 }
