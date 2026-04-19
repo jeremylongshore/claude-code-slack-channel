@@ -1279,3 +1279,99 @@ export function resolveJournalPath(
 
   return { path: null, source: null }
 }
+
+// ---------------------------------------------------------------------------
+// --verify-audit-log CLI subcommand (ccsc-t7j, Epic 30-A.15)
+// ---------------------------------------------------------------------------
+
+/** Parse `--verify-audit-log` from argv. Returns the configured path, or
+ *  null when the flag is absent or malformed. Mirrors the accept/reject
+ *  rules of `resolveJournalPath`: flag-shaped values (leading `-`) and
+ *  empty values fall through rather than being silently treated as a
+ *  path. Pure — does not touch the filesystem.
+ *
+ *  Forms accepted:
+ *    - `--verify-audit-log PATH`    (space-separated)
+ *    - `--verify-audit-log=PATH`    (equals form)
+ *
+ *  When present and valid, server.ts takes the verify-and-exit path
+ *  before any state setup (no state dir, no tokens, no Slack client).
+ *  That's intentional: verifying a journal file is a pure offline read.
+ */
+export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === '--verify-audit-log') {
+      const next = argv[i + 1]
+      if (
+        typeof next === 'string' &&
+        next.length > 0 &&
+        !next.startsWith('-')
+      ) {
+        return next
+      }
+      continue
+    }
+    if (arg.startsWith('--verify-audit-log=')) {
+      const val = arg.slice('--verify-audit-log='.length)
+      if (val.length > 0) {
+        return val
+      }
+      continue
+    }
+  }
+  return null
+}
+
+/** Shape mirror of `VerifyResult` from journal.ts, repeated here so
+ *  lib.ts stays framework-free (no journal.ts import — avoids a cycle
+ *  and keeps lib.ts pure). Discriminated on `ok`. */
+export type VerifyResultShape =
+  | { ok: true; eventsVerified: number }
+  | {
+      ok: false
+      eventsVerified: number
+      break: {
+        lineNumber: number
+        seq: number | null
+        ts: string | null
+        reason: string
+        expected?: string
+        actual?: string
+      }
+    }
+
+/** Format a `VerifyResult` for CLI output. Returns the text to print
+ *  and the process exit code (0 on ok, 1 on break). Pure. The formatter
+ *  is intentionally verbose on failure — the operator needs line number,
+ *  seq, and the hash mismatch to locate the tamper point in the file.
+ *
+ *  Output contract (stable — operators may grep):
+ *    Success: `OK: <N> event(s) verified in <path>`
+ *    Break:   multi-line, first line starts with `FAIL:` then a reason
+ *             block with `  line:`, `  seq:`, `  ts:`, `  reason:`,
+ *             `  expected:` / `  actual:` when present.
+ */
+export function formatVerifyResult(
+  result: VerifyResultShape,
+  path: string,
+): { text: string; exitCode: 0 | 1 } {
+  if (result.ok) {
+    return {
+      text: `OK: ${result.eventsVerified} event(s) verified in ${path}`,
+      exitCode: 0,
+    }
+  }
+  const b = result.break
+  const lines = [
+    `FAIL: audit journal broken at ${path}`,
+    `  line:     ${b.lineNumber}`,
+    `  seq:      ${b.seq === null ? '(unparsed)' : String(b.seq)}`,
+    `  ts:       ${b.ts ?? '(unparsed)'}`,
+    `  reason:   ${b.reason}`,
+  ]
+  if (b.expected !== undefined) lines.push(`  expected: ${b.expected}`)
+  if (b.actual !== undefined) lines.push(`  actual:   ${b.actual}`)
+  lines.push(`  events verified before break: ${result.eventsVerified}`)
+  return { text: lines.join('\n'), exitCode: 1 }
+}

@@ -269,17 +269,31 @@ at line 3. Deleting line 3 silently (tail truncation) is **not**
 detected by the chain alone; see §107-115 for why, and Epic 30-B for
 the external-anchor mitigation.
 
-### One-liner
+### CLI (`--verify-audit-log`)
+
+Epic 30-A.15 wires `verifyJournal()` as a `server.ts` subcommand. The
+intercept runs before any state setup — no `.env`, no `STATE_DIR`, no
+Slack client needed. An operator can copy a journal off the host and
+verify it from anywhere the repo is checked out.
 
 ```bash
-bun -e 'const { verifyJournal } = await import("./journal.ts"); const r = await verifyJournal(process.argv[1]); if (r.ok) { console.log(`ok: ${r.eventsVerified} events, chain intact`); process.exit(0); } else { const b = r.break; console.error(`tamper at line=${b.lineNumber} seq=${b.seq} ts=${b.ts}\n  reason: ${b.reason}` + (b.expected ? `\n  expected: ${b.expected}\n  actual:   ${b.actual}` : "")); process.exit(1); }' ~/.claude/channels/slack/audit.log
+bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log
 ```
+
+Output contract (stable — operators may grep):
+
+- Success: `OK: <N> event(s) verified in <path>` on stdout.
+- Break: multi-line `FAIL:` block on stderr with `line:`, `seq:`, `ts:`,
+  `reason:`, plus `expected:` / `actual:` when applicable and an
+  `events verified before break:` tail for truncation forensics.
 
 Exit codes:
 
 - `0` — chain intact end-to-end.
 - `1` — chain break (hash mismatch, `prevHash` mismatch, `seq` gap,
   schema violation, version skew, or parse error).
+- `2` — unexpected error in the verifier itself (should not happen in
+  production; surfaced for operator visibility over a silent success).
 
 ---
 

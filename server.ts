@@ -46,12 +46,52 @@ import {
   gate as libGate,
   isDuplicateEvent,
   resolveJournalPath,
+  parseVerifyArg,
+  formatVerifyResult,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   type Access,
   type GateResult,
 } from './lib.ts'
-import { JournalWriter, createBootAnchor } from './journal.ts'
+import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
+
+// ---------------------------------------------------------------------------
+// --verify-audit-log subcommand (ccsc-t7j, Epic 30-A.15)
+//
+// Intercept before any state setup runs. Verifying a journal file is a
+// pure offline read: no state dir, no tokens, no Slack client required.
+// Running this path through the normal bootstrap would fail on machines
+// that don't have `.env` or INBOX_DIR configured, which is exactly where
+// an operator is most likely to verify a copied-off journal file.
+//
+// Runs at module load via top-level await, not inside main(), because
+// the module-level code below (SENDABLE_ROOTS validation, mkdirSync for
+// STATE_DIR/INBOX_DIR, loadEnv) executes before main() is called and
+// would abort a pure verify invocation. The await also keeps the
+// process alive until verifyJournal resolves, so process.exit fires
+// before the synchronous bootstrap side-effects run.
+// ---------------------------------------------------------------------------
+const _verifyPath = parseVerifyArg(process.argv.slice(2))
+if (_verifyPath !== null) {
+  const absPath = resolve(_verifyPath)
+  try {
+    const result = await verifyJournal(absPath)
+    const { text, exitCode } = formatVerifyResult(result, absPath)
+    if (exitCode === 0) {
+      console.log(text)
+    } else {
+      console.error(text)
+    }
+    process.exit(exitCode)
+  } catch (err) {
+    console.error(
+      `[slack] verify-audit-log: unexpected error: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+    process.exit(2)
+  }
+}
 import {
   createSessionSupervisor,
   resolveIdleMs,

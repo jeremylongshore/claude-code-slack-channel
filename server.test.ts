@@ -5107,6 +5107,139 @@ describe('resolveJournalPath', () => {
 })
 
 // ---------------------------------------------------------------------------
+// parseVerifyArg — ccsc-t7j, Epic 30-A.15
+// ---------------------------------------------------------------------------
+
+describe('parseVerifyArg', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('returns null when the flag is absent', async () => {
+    const { parseVerifyArg } = await loadLib()
+    expect(parseVerifyArg([])).toBeNull()
+    expect(parseVerifyArg(['--audit-log-file', '/x'])).toBeNull()
+  })
+
+  test('picks up --verify-audit-log space-separated form', async () => {
+    const { parseVerifyArg } = await loadLib()
+    expect(parseVerifyArg(['--verify-audit-log', '/tmp/audit.log'])).toBe(
+      '/tmp/audit.log',
+    )
+  })
+
+  test('picks up --verify-audit-log=PATH equals form', async () => {
+    const { parseVerifyArg } = await loadLib()
+    expect(parseVerifyArg(['--verify-audit-log=/tmp/audit.log'])).toBe(
+      '/tmp/audit.log',
+    )
+  })
+
+  test('flag-shaped successor falls through (shell-mistake protection)', async () => {
+    // `--verify-audit-log --debug` is an operator mistake. Do not treat
+    // `--debug` as the path to verify. Mirrors resolveJournalPath rules
+    // so the two flags behave consistently.
+    const { parseVerifyArg } = await loadLib()
+    expect(parseVerifyArg(['--verify-audit-log', '--debug'])).toBeNull()
+    expect(parseVerifyArg(['--verify-audit-log', '-'])).toBeNull()
+  })
+
+  test('empty value (bare flag or trailing =) returns null', async () => {
+    const { parseVerifyArg } = await loadLib()
+    expect(parseVerifyArg(['--verify-audit-log'])).toBeNull()
+    expect(parseVerifyArg(['--verify-audit-log='])).toBeNull()
+  })
+
+  test('equals form preserves leading-hyphen literals', async () => {
+    const { parseVerifyArg } = await loadLib()
+    expect(parseVerifyArg(['--verify-audit-log=-weird.log'])).toBe(
+      '-weird.log',
+    )
+  })
+
+  test('flag works mid-argv with unrelated args around it', async () => {
+    const { parseVerifyArg } = await loadLib()
+    expect(
+      parseVerifyArg([
+        '--some-other',
+        'x',
+        '--verify-audit-log',
+        '/tmp/a.log',
+        '--trailing',
+      ]),
+    ).toBe('/tmp/a.log')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// formatVerifyResult — ccsc-t7j, Epic 30-A.15
+// ---------------------------------------------------------------------------
+
+describe('formatVerifyResult', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('success case prints count + path, exit 0', async () => {
+    const { formatVerifyResult } = await loadLib()
+    const out = formatVerifyResult(
+      { ok: true, eventsVerified: 42 },
+      '/tmp/audit.log',
+    )
+    expect(out.exitCode).toBe(0)
+    expect(out.text).toBe('OK: 42 event(s) verified in /tmp/audit.log')
+  })
+
+  test('break case prints FAIL with line/seq/ts/reason, exit 1', async () => {
+    const { formatVerifyResult } = await loadLib()
+    const out = formatVerifyResult(
+      {
+        ok: false,
+        eventsVerified: 7,
+        break: {
+          lineNumber: 8,
+          seq: 8,
+          ts: '2026-04-19T12:34:56.789Z',
+          reason: 'hash mismatch',
+          expected: 'a'.repeat(64),
+          actual: 'b'.repeat(64),
+        },
+      },
+      '/tmp/audit.log',
+    )
+    expect(out.exitCode).toBe(1)
+    expect(out.text).toContain('FAIL: audit journal broken at /tmp/audit.log')
+    expect(out.text).toContain('line:     8')
+    expect(out.text).toContain('seq:      8')
+    expect(out.text).toContain('ts:       2026-04-19T12:34:56.789Z')
+    expect(out.text).toContain('reason:   hash mismatch')
+    expect(out.text).toContain(`expected: ${'a'.repeat(64)}`)
+    expect(out.text).toContain(`actual:   ${'b'.repeat(64)}`)
+    expect(out.text).toContain('events verified before break: 7')
+  })
+
+  test('break case with unparsed seq/ts renders placeholders', async () => {
+    // Parse-error on line 1: no schema-valid event to pull seq/ts from.
+    const { formatVerifyResult } = await loadLib()
+    const out = formatVerifyResult(
+      {
+        ok: false,
+        eventsVerified: 0,
+        break: {
+          lineNumber: 1,
+          seq: null,
+          ts: null,
+          reason: 'parse error: Unexpected token',
+        },
+      },
+      '/tmp/audit.log',
+    )
+    expect(out.exitCode).toBe(1)
+    expect(out.text).toContain('seq:      (unparsed)')
+    expect(out.text).toContain('ts:       (unparsed)')
+    // Optional expected/actual omitted when absent.
+    expect(out.text).not.toContain('expected:')
+    expect(out.text).not.toContain('actual:')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // verifyJournal — ccsc-5pi.10 + happy-path E2E from ccsc-5pi.8
 // ---------------------------------------------------------------------------
 
