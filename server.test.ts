@@ -3083,7 +3083,7 @@ describe('createSessionSupervisor.reapIdle', () => {
     const sup = makeSupervisor(500)
     const handle = await sup.activate({ channel: 'C_SHORT', thread: 'T' }, 'U1')
 
-    // 1000ms >> 500ms threshold
+    // 1000ms elapsed > 500ms idle timeout
     clockNow += 1000
     await sup.reapIdle()
 
