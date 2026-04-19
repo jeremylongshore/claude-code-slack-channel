@@ -2961,3 +2961,307 @@ describe('JournalEvent', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// canonicalJson — RFC 8785 subset used by the hash chain
+// ---------------------------------------------------------------------------
+
+describe('canonicalJson', () => {
+  test('serializes primitives', async () => {
+    const { canonicalJson } = await import('./journal.ts')
+    expect(canonicalJson(null)).toBe('null')
+    expect(canonicalJson(true)).toBe('true')
+    expect(canonicalJson(false)).toBe('false')
+    expect(canonicalJson(0)).toBe('0')
+    expect(canonicalJson(42)).toBe('42')
+    expect(canonicalJson(-7)).toBe('-7')
+    expect(canonicalJson('hello')).toBe('"hello"')
+    expect(canonicalJson('with\nnewline')).toBe('"with\\nnewline"')
+  })
+
+  test('sorts object keys lexicographically', async () => {
+    const { canonicalJson } = await import('./journal.ts')
+    // Two objects with identical content but different key-insertion
+    // order must canonicalize to the same bytes — that is the whole
+    // point of canonicalization.
+    expect(canonicalJson({ b: 1, a: 2, c: 3 })).toBe('{"a":2,"b":1,"c":3}')
+    expect(canonicalJson({ c: 3, a: 2, b: 1 })).toBe('{"a":2,"b":1,"c":3}')
+  })
+
+  test('recurses into nested objects and arrays', async () => {
+    const { canonicalJson } = await import('./journal.ts')
+    const val = { outer: { z: 1, a: [3, 2, 1] }, alpha: null }
+    // Inner object keys sorted; array order preserved; outer keys sorted.
+    expect(canonicalJson(val)).toBe('{"alpha":null,"outer":{"a":[3,2,1],"z":1}}')
+  })
+
+  test('emits no whitespace', async () => {
+    const { canonicalJson } = await import('./journal.ts')
+    const out = canonicalJson({ a: 1, b: [1, 2, 3], c: { d: 'e' } })
+    expect(out).not.toMatch(/\s/)
+  })
+
+  test('rejects non-integer and non-finite numbers', async () => {
+    const { canonicalJson } = await import('./journal.ts')
+    expect(() => canonicalJson(1.5)).toThrow(/integer/)
+    expect(() => canonicalJson(Number.POSITIVE_INFINITY)).toThrow(/integer/)
+    expect(() => canonicalJson(Number.NaN)).toThrow(/integer/)
+  })
+
+  test('rejects unsupported value types', async () => {
+    const { canonicalJson } = await import('./journal.ts')
+    expect(() => canonicalJson(undefined)).toThrow()
+    expect(() => canonicalJson(() => 1)).toThrow()
+    expect(() => canonicalJson(Symbol('x'))).toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// sha256Hex
+// ---------------------------------------------------------------------------
+
+describe('sha256Hex', () => {
+  test('empty string has the known SHA-256 digest', async () => {
+    const { sha256Hex } = await import('./journal.ts')
+    expect(sha256Hex('')).toBe(
+      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    )
+  })
+
+  test('produces 64 lowercase hex chars for any input', async () => {
+    const { sha256Hex } = await import('./journal.ts')
+    const h = sha256Hex('some content')
+    expect(h).toMatch(/^[0-9a-f]{64}$/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// JournalWriter — ccsc-5pi.2
+// ---------------------------------------------------------------------------
+
+describe('JournalWriter', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logPath: string
+  const fixedNow = new Date('2026-04-19T12:34:56.789Z')
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'journal-writer-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logPath = join(tmpRoot, 'audit.log')
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  const stableAnchor = 'a'.repeat(64)
+  const sysBoot = { kind: 'system.boot' as const }
+
+  test('first write on an empty file seeds from initialPrevHash', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      const ev = await w.writeEvent(sysBoot)
+      expect(ev.v).toBe(1)
+      expect(ev.ts).toBe('2026-04-19T12:34:56.789Z')
+      expect(ev.seq).toBe(1)
+      expect(ev.prevHash).toBe(stableAnchor)
+      expect(ev.kind).toBe('system.boot')
+      expect(ev.hash).toMatch(/^[0-9a-f]{64}$/)
+      expect(ev.hash).not.toBe(stableAnchor)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('file is mode 0o600 after open', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      const st = statSync(logPath)
+      expect(st.mode & 0o777).toBe(0o600)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('hash chain: event N prevHash equals event N-1 hash', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      const a = await w.writeEvent(sysBoot)
+      const b = await w.writeEvent({ kind: 'session.activate' })
+      const c = await w.writeEvent({ kind: 'gate.inbound.drop' })
+      expect(b.prevHash).toBe(a.hash)
+      expect(c.prevHash).toBe(b.hash)
+      expect(a.seq).toBe(1)
+      expect(b.seq).toBe(2)
+      expect(c.seq).toBe(3)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('persisted bytes round-trip through JournalEvent.parse for each line', async () => {
+    const { JournalWriter, JournalEvent } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      await w.writeEvent(sysBoot)
+      await w.writeEvent({ kind: 'session.activate' })
+    } finally {
+      await w.close()
+    }
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {
+      const parsed = JournalEvent.parse(JSON.parse(line))
+      expect(parsed.v).toBe(1)
+    }
+  })
+
+  test('hash is reproducible: sha256(prevHash || canonicalJson(event sans hash))', async () => {
+    const { JournalWriter, canonicalJson, sha256Hex } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      const ev = await w.writeEvent(sysBoot)
+      const { hash: _h, ...rest } = ev
+      void _h
+      const recomputed = sha256Hex(stableAnchor + canonicalJson(rest))
+      expect(recomputed).toBe(ev.hash)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('reopening recovers lastHash and nextSeq from the existing file', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w1 = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    const first = await w1.writeEvent(sysBoot)
+    const second = await w1.writeEvent({ kind: 'session.activate' })
+    await w1.close()
+
+    // Reopen — no initialPrevHash provided; writer should read lastHash
+    // and next seq from disk.
+    const w2 = await JournalWriter.open({ path: logPath, now: () => fixedNow })
+    try {
+      expect(w2.headHash).toBe(second.hash)
+      expect(w2.nextSequenceNumber).toBe(3)
+      const third = await w2.writeEvent({ kind: 'session.quiesce' })
+      expect(third.prevHash).toBe(second.hash)
+      expect(third.seq).toBe(3)
+      // And the chain still ties back to the genesis anchor via `first`.
+      expect(first.prevHash).toBe(stableAnchor)
+    } finally {
+      await w2.close()
+    }
+  })
+
+  test('reopen rejects if the last line is not a valid JournalEvent', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    writeFileSync(logPath, 'this is not json\n', { mode: 0o600 })
+    await expect(
+      JournalWriter.open({ path: logPath, initialPrevHash: stableAnchor }),
+    ).rejects.toThrow(/valid JournalEvent/)
+  })
+
+  test('concurrent writeEvent calls serialize in call order', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      // Fire five writes without awaiting between them.
+      const promises = Array.from({ length: 5 }, (_, i) =>
+        w.writeEvent({ kind: 'session.activate', correlationId: `req-${i}` }),
+      )
+      const events = await Promise.all(promises)
+      // Monotonic seq in call order.
+      expect(events.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5])
+      // Hash chain intact — each event's prevHash matches the previous
+      // event's hash, regardless of microtask scheduling.
+      for (let i = 1; i < events.length; i++) {
+        expect(events[i]!.prevHash).toBe(events[i - 1]!.hash)
+      }
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('single-writer invariant: second open on same path rejects', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w1 = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      await expect(
+        JournalWriter.open({ path: logPath, initialPrevHash: stableAnchor }),
+      ).rejects.toThrow(/active writer/)
+    } finally {
+      await w1.close()
+    }
+    // After close, a fresh open must succeed — registry releases on close.
+    const w2 = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    await w2.close()
+  })
+
+  test('close is idempotent and subsequent writeEvent rejects', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    await w.close()
+    await w.close() // no throw
+    await expect(w.writeEvent(sysBoot)).rejects.toThrow(/closed/)
+  })
+
+  test('schema rejection at write time: invalid caller input does not land on disk', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      // Unknown kind — schema rejects. No line should be appended, seq
+      // should not advance.
+      await expect(
+        w.writeEvent({ kind: 'not.a.real.kind' as never }),
+      ).rejects.toThrow()
+      expect(w.nextSequenceNumber).toBe(1)
+      const content = readFileSync(logPath, 'utf8')
+      expect(content).toBe('')
+    } finally {
+      await w.close()
+    }
+  })
+})

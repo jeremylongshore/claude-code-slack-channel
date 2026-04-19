@@ -36,6 +36,9 @@
  */
 
 import { z } from 'zod'
+import { createHash, randomBytes } from 'crypto'
+import { open as fsOpen, type FileHandle } from 'fs/promises'
+import { existsSync, readFileSync } from 'fs'
 import type { SessionKey } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -242,3 +245,328 @@ export type JournalEvent = z.infer<typeof JournalEvent>
  *  `hash` to produce a full `JournalEvent`. Not exported as a Zod
  *  schema — it is a writer-internal shape, not a valid on-disk record. */
 export type PartialJournalEvent = Omit<JournalEvent, 'hash'>
+
+// ---------------------------------------------------------------------------
+// JournalWriter — SHA-256 hash-chained append-only writer (ccsc-5pi.2)
+// ---------------------------------------------------------------------------
+
+/** Everything a caller supplies for a new event. The writer fills in the
+ *  framing fields (`v`, `ts`, `seq`, `prevHash`, `hash`) so callers cannot
+ *  drift the hash-determining fields by accident.
+ *
+ *  Note the Omit excludes `v` even though it is a literal — the writer
+ *  always sets it to 1. When the schema version bumps, callers do not
+ *  need to update. */
+export type WriteInput = Omit<JournalEvent, 'v' | 'ts' | 'seq' | 'prevHash' | 'hash'>
+
+/** Construction options for `JournalWriter.open()`.
+ *
+ *  Defaults give you a production-shaped writer. Tests override `now` and
+ *  `initialPrevHash` to keep hash assertions deterministic.
+ */
+export interface WriterOptions {
+  /** Absolute path to the audit log file. Created with mode `0o600` if
+   *  it doesn't exist. */
+  path: string
+
+  /** Genesis `prevHash` for an empty file. Default is a fresh random
+   *  32-byte sha256, matching the "TRUSTED_ANCHOR" concept in
+   *  audit-journal-architecture.md §76-85. Callers that want the anchor
+   *  recorded in the first event's body pre-compute it and pass it here.
+   *  Ignored when the file is non-empty — existing chains dictate their
+   *  own lastHash. */
+  initialPrevHash?: string
+
+  /** Clock source for `ts`. Injected in tests so assertions can fix the
+   *  timestamp. Default: real wall clock. */
+  now?: () => Date
+}
+
+/** Module-level registry of open audit-log paths. Enforces the
+ *  "single JournalWriter per process" invariant (audit-journal-
+ *  architecture.md §148-151, invariant §312-326 #1). A second `open()`
+ *  on the same path while the first writer is still live rejects rather
+ *  than allowing two writers to interleave their hash chains silently. */
+const ACTIVE_PATHS = new Set<string>()
+
+/** Tamper-evident append-only writer. See audit-journal-architecture.md
+ *  §76-161 for the full contract. One writer per process per path.
+ *
+ *  Lifecycle:
+ *    1. `JournalWriter.open({ path })` — opens the file in append mode,
+ *       reads any existing content to recover `lastHash` + `seq`, and
+ *       registers the path.
+ *    2. `.writeEvent(input)` — serializes through an internal queue so
+ *       concurrent callers cannot interleave increments. Computes
+ *       `hash = sha256(lastHash || jcs(event sans hash))`, appends a
+ *       newline-delimited JSON line, and returns the full event.
+ *    3. `.close()` — flushes, closes the file descriptor, frees the
+ *       path registration.
+ *
+ *  Fail-loud posture: any write failure puts the writer into a broken
+ *  state and subsequent `writeEvent` calls reject. Recovery is an
+ *  operator concern — inspect and restart. Silent recovery would
+ *  violate the forensic-record invariant.
+ */
+export class JournalWriter {
+  private fh: FileHandle | null
+  private lastHash: string
+  private nextSeq: number
+  private readonly now: () => Date
+  private readonly path: string
+
+  /** Serialization queue. Every `writeEvent` chains onto this promise so
+   *  that increment → hash → append runs as a single critical section
+   *  per call, regardless of how many callers await concurrently. */
+  private queue: Promise<unknown> = Promise.resolve()
+
+  /** Non-null when the writer has encountered a fatal write error. All
+   *  subsequent `writeEvent` calls reject with this error. */
+  private broken: Error | null = null
+
+  private constructor(
+    fh: FileHandle,
+    lastHash: string,
+    nextSeq: number,
+    now: () => Date,
+    path: string,
+  ) {
+    this.fh = fh
+    this.lastHash = lastHash
+    this.nextSeq = nextSeq
+    this.now = now
+    this.path = path
+  }
+
+  /** Open (or create) an audit log at `opts.path` and return a ready-
+   *  to-write JournalWriter.
+   *
+   *  Recovers chain state from the existing file: reads the last
+   *  newline-delimited JSON line, parses it through the `JournalEvent`
+   *  schema, and uses its `hash` and `seq + 1` as the seeds for new
+   *  writes. If the file is empty or absent, seeds from
+   *  `opts.initialPrevHash` (or a fresh random sha256 if unset) and
+   *  seq 1.
+   *
+   *  Throws if:
+   *    - Another `JournalWriter` is already open on the same path in
+   *      this process (single-writer invariant).
+   *    - The existing file's last line is not valid `JournalEvent`
+   *      JSON — fail loudly rather than silently start a new chain
+   *      that the verifier would reject anyway.
+   */
+  static async open(opts: WriterOptions): Promise<JournalWriter> {
+    if (ACTIVE_PATHS.has(opts.path)) {
+      throw new Error(
+        `JournalWriter.open: path already has an active writer in this process: ${opts.path}`,
+      )
+    }
+
+    let lastHash: string
+    let nextSeq: number
+
+    if (existsSync(opts.path)) {
+      const content = readFileSync(opts.path, 'utf8')
+      const lines = content.split('\n').filter((line) => line.length > 0)
+      if (lines.length === 0) {
+        // File exists but is empty — treat as fresh chain. Not an error;
+        // happens when an operator pre-created the file with `touch`.
+        lastHash = opts.initialPrevHash ?? sha256Hex(randomBytes(32))
+        nextSeq = 1
+      } else {
+        const lastLine = lines[lines.length - 1]!
+        let parsed: JournalEvent
+        try {
+          parsed = JournalEvent.parse(JSON.parse(lastLine))
+        } catch (err) {
+          throw new Error(
+            `JournalWriter.open: last line of ${opts.path} is not a valid JournalEvent — refusing to start a new chain that would be unverifiable. Underlying error: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          )
+        }
+        lastHash = parsed.hash
+        nextSeq = parsed.seq + 1
+      }
+    } else {
+      lastHash = opts.initialPrevHash ?? sha256Hex(randomBytes(32))
+      nextSeq = 1
+    }
+
+    // Mode 0o600 on creation; 'a' flag sets O_APPEND|O_WRONLY|O_CREAT.
+    // POSIX guarantees O_APPEND writes land atomically at EOF even with
+    // concurrent writers — we still serialize via the queue for the
+    // hash chain, not for write safety.
+    const fh = await fsOpen(opts.path, 'a', 0o600)
+    ACTIVE_PATHS.add(opts.path)
+
+    return new JournalWriter(
+      fh,
+      lastHash,
+      nextSeq,
+      opts.now ?? ((): Date => new Date()),
+      opts.path,
+    )
+  }
+
+  /** Append a new event. Returns the fully-framed `JournalEvent` that
+   *  was persisted, including the writer-assigned `v`, `ts`, `seq`,
+   *  `prevHash`, and `hash`.
+   *
+   *  Concurrent calls are serialized: if caller A and caller B both
+   *  `writeEvent()` without awaiting, the promises resolve in call
+   *  order and each sees a contiguous seq/hash chain.
+   */
+  async writeEvent(input: WriteInput): Promise<JournalEvent> {
+    if (this.broken) {
+      return Promise.reject(
+        new Error(
+          `JournalWriter is broken after a prior write failure: ${this.broken.message}`,
+        ),
+      )
+    }
+    if (this.fh === null) {
+      return Promise.reject(new Error('JournalWriter.writeEvent: writer is closed'))
+    }
+    // Chain onto the existing queue so increments are serialized. Using
+    // .then (not await) captures the write call's position in line
+    // immediately; callers observe monotonic order regardless of
+    // microtask scheduling.
+    const p = this.queue.then(() => this._doWrite(input))
+    // Swallow rejections on the queue itself so one failed write does
+    // not poison the queue chain. The caller still sees the rejection
+    // from `p`. The writer's `broken` field guards future calls.
+    this.queue = p.then(
+      () => undefined,
+      () => undefined,
+    )
+    return p
+  }
+
+  private async _doWrite(input: WriteInput): Promise<JournalEvent> {
+    if (this.fh === null) {
+      throw new Error('JournalWriter._doWrite: writer closed mid-queue')
+    }
+    const partial: PartialJournalEvent = {
+      v: 1,
+      ts: this.now().toISOString(),
+      seq: this.nextSeq,
+      prevHash: this.lastHash,
+      ...input,
+    }
+    const hash = sha256Hex(this.lastHash + canonicalJson(partial))
+    const event: JournalEvent = { ...partial, hash }
+
+    // Validate through the schema at the boundary. Catches caller-
+    // supplied fields that violate the strict schema (unknown keys,
+    // malformed types) before they land on disk and desync the chain.
+    JournalEvent.parse(event)
+
+    const line = JSON.stringify(event) + '\n'
+    try {
+      await this.fh.write(line)
+    } catch (err) {
+      this.broken = err instanceof Error ? err : new Error(String(err))
+      throw this.broken
+    }
+
+    // Advance chain state only after the write succeeds. A crash mid-
+    // write leaves `lastHash` and `nextSeq` at the pre-write values,
+    // so a restart-then-write resumes at the same point rather than
+    // gapping the seq or duplicating the hash.
+    this.nextSeq += 1
+    this.lastHash = hash
+
+    return event
+  }
+
+  /** The current chain-head hash. Exposed so callers that need the
+   *  "latest known good" pointer (e.g. the tail-anchor publisher in
+   *  Epic 30-B) can read it without parsing the last line of disk. */
+  get headHash(): string {
+    return this.lastHash
+  }
+
+  /** The seq the next successful write will carry. Useful for tests
+   *  and for operator diagnostics. */
+  get nextSequenceNumber(): number {
+    return this.nextSeq
+  }
+
+  /** Flush and release the file descriptor. Idempotent: calling
+   *  `close()` on an already-closed writer is a no-op. After close,
+   *  `writeEvent()` rejects. */
+  async close(): Promise<void> {
+    if (this.fh === null) return
+    try {
+      await this.fh.close()
+    } finally {
+      this.fh = null
+      ACTIVE_PATHS.delete(this.path)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical JSON (RFC 8785 subset for integer-only event shapes)
+// ---------------------------------------------------------------------------
+
+/** Canonicalise `value` for hashing. Two independent encoders must
+ *  produce identical byte output so the verifier can recompute the
+ *  chain bit-for-bit.
+ *
+ *  RFC 8785 compliance notes:
+ *    - Strings: `JSON.stringify` matches the RFC 8785 escape rules for
+ *      all inputs that avoid non-BMP Unicode. Our event schema never
+ *      has strings chosen from outside the BMP (hashes are hex; ts is
+ *      ISO-8601; Slack IDs are ASCII; policy reason strings are
+ *      operator-authored ASCII).
+ *    - Numbers: the RFC mandates shortest IEEE-754 double form. Our
+ *      schema permits only integers (`seq`); other number forms throw.
+ *    - Objects: keys sorted by UTF-16 code-unit order (the RFC form),
+ *      which `Array.prototype.sort` delivers for the ASCII key names
+ *      the schema uses.
+ *    - Arrays: order-preserving.
+ *    - No whitespace.
+ *
+ *  Throws on `undefined`, functions, symbols, bigints — none are valid
+ *  `JournalEvent` content; the throw turns a schema-validation miss
+ *  into a loud failure at hash time.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null) return 'null'
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || !Number.isInteger(value)) {
+      throw new Error(
+        `canonicalJson: only finite integer numbers supported (got ${String(value)})`,
+      )
+    }
+    return String(value)
+  }
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (Array.isArray(value)) {
+    return '[' + value.map(canonicalJson).join(',') + ']'
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const keys = Object.keys(obj).sort()
+    const pairs = keys.map(
+      (k) => JSON.stringify(k) + ':' + canonicalJson(obj[k]),
+    )
+    return '{' + pairs.join(',') + '}'
+  }
+  throw new Error(`canonicalJson: unsupported value type: ${typeof value}`)
+}
+
+// ---------------------------------------------------------------------------
+// sha256 helper
+// ---------------------------------------------------------------------------
+
+/** Compute SHA-256 over `input` and return 64-char lowercase hex. Used
+ *  by the writer for the hash chain and re-used by the verifier
+ *  (ccsc-5pi.9). Kept close to the type + writer so all hash producers
+ *  in this module share one implementation. */
+export function sha256Hex(input: string | Uint8Array): string {
+  return createHash('sha256').update(input).digest('hex')
+}
