@@ -366,6 +366,12 @@ export class JournalWriter {
     let nextSeq: number
 
     if (existsSync(opts.path)) {
+      // ccsc-otd: this reads the whole file into memory to recover the
+      // last line. Fine for a per-developer install whose journal is
+      // MB-scale; not fine at GB-scale. Follow-up replaces this with a
+      // reverse-chunked scan (64 KiB windows from EOF until the last
+      // newline). Rotation (Epic 30-B) bounds file size further; this
+      // fallback just stops being the bottleneck once files grow.
       const content = readFileSync(opts.path, 'utf8')
       const lines = content.split('\n').filter((line) => line.length > 0)
       if (lines.length === 0) {
