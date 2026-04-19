@@ -2309,6 +2309,40 @@ describe('PolicyRule schema (29-A.1)', () => {
     ).toThrow()
   })
 
+  // ── thread_ts predicate (schema-only until Epic 29-B wires evaluate()) ─
+
+  test('MatchSpec accepts a valid Slack thread_ts', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { thread_ts: '1712345678.001100' },
+      }),
+    ).not.toThrow()
+  })
+
+  test('MatchSpec accepts thread_ts alone as the only constraint (satisfies at-least-one-field)', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    const parsed = PolicyRule.parse({
+      id: 'r1',
+      effect: 'auto_approve',
+      match: { thread_ts: '1712345678.001100' },
+    }) as { match: { thread_ts?: string } }
+    expect(parsed.match.thread_ts).toBe('1712345678.001100')
+  })
+
+  test('MatchSpec rejects malformed thread_ts (missing fractional component)', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { thread_ts: '1712345678' },
+      }),
+    ).toThrow()
+  })
+
   // ── Discriminated union variance ──────────────────────────────────────
 
   test('DenyRule requires a non-empty reason', async () => {

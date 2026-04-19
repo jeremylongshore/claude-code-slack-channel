@@ -72,6 +72,7 @@ const MatchSpec = z.object({
   tool:       z.string().optional(),        // exact tool name
   pathPrefix: z.string().optional(),        // canonicalized via realpath before compare
   channel:    z.string().optional(),        // Slack channel ID
+  thread_ts:  z.string().optional(),        // Slack thread timestamp — schema-only in v0.5.x; Epic 29-B wires into evaluate()
   actor:      z.enum(['session_owner', 'claude_process']).optional(),
   argEquals:  z.record(z.string(), z.unknown()).optional(),
 }).refine(hasAtLeastOneField, 'match must constrain at least one field')
@@ -79,6 +80,10 @@ const MatchSpec = z.object({
 
 Three effects, first-applicable combining (see below). `priority` tie-breaks
 within effect when two rules would otherwise be equivalent.
+
+The `thread_ts` predicate is present in the v1 schema so operators can author
+thread-scoped rules against a stable shape; enforcement is deferred to Epic
+29-B alongside `evaluate()` wiring.
 
 **Why no `allow_any_of`, `allow_if_*` forms?** Every extra combinator is
 another place for a shadow. The three-effect schema is deliberately narrow;

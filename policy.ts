@@ -33,6 +33,12 @@ import { resolve, sep } from 'path'
  *  - `pathPrefix` — canonicalized via realpath by evaluate() (29-A.4);
  *                   the value stored here is the pre-resolve literal.
  *  - `channel`    — Slack channel ID, e.g. "C0123456789".
+ *  - `thread_ts`  — Slack thread timestamp, e.g. "1712345678.001100".
+ *                   Scopes a rule to a single thread within a channel.
+ *                   Schema-only in v0.5.x: reserved for Epic 29-B's
+ *                   evaluate() wiring so operators can ship thread-
+ *                   scoped rules against a stable v1 schema without a
+ *                   migration edit once enforcement lands.
  *  - `actor`      — who is calling the tool. Approvers arrive on a
  *                   later turn so they are not a valid `actor` here.
  *  - `argEquals`  — subset equality on validated MCP input args. Keys
@@ -44,6 +50,7 @@ export const MatchSpec = z
     tool: z.string().min(1).optional(),
     pathPrefix: z.string().min(1).optional(),
     channel: z.string().regex(/^[CD][A-Z0-9]+$/).optional(),
+    thread_ts: z.string().regex(/^\d+\.\d+$/).optional(),
     actor: z.enum(['session_owner', 'claude_process']).optional(),
     argEquals: z.record(z.string(), z.unknown()).optional(),
   })
@@ -52,6 +59,7 @@ export const MatchSpec = z
       m.tool !== undefined ||
       m.pathPrefix !== undefined ||
       m.channel !== undefined ||
+      m.thread_ts !== undefined ||
       m.actor !== undefined ||
       (m.argEquals !== undefined && Object.keys(m.argEquals).length > 0),
     { message: 'match must constrain at least one field' },
