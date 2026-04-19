@@ -3450,6 +3450,201 @@ describe('redact', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Redaction — full pattern coverage table (ccsc-5pi.9)
+// ---------------------------------------------------------------------------
+//
+// Drives every documented pattern through one harness so a
+// pattern list change forces a test change. Positive cases prove
+// each kind redacts; negative cases prove near-misses do NOT.
+
+describe('redact — documented pattern table', () => {
+  // Constructed at runtime where needed so literals don't trip the
+  // GitHub push-protection secret scanner on source files.
+  const xoxb =
+    'xoxb' + '-' + '111111111111' + '-' + '222222222222' + '-' + 'AbCdEfGhIjKlMnOp'
+  const xapp =
+    'xapp' + '-' + '1' + '-' + 'A0B1C2D3E4F' + '-' + '1234567890123' + '-' +
+    'a'.repeat(32)
+  const ghp = 'ghp_' + 'A'.repeat(36)
+  const sk = 'sk-ant-api03-' + 'z'.repeat(30)
+  const akia = 'AKIAIOSFODNN7EXAMPLE'
+  const jwt =
+    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.abc-_DEF123'
+
+  const positiveCases: ReadonlyArray<{
+    kind: string
+    label: string
+    input: string
+    expected: string
+  }> = [
+    {
+      kind: 'anthropic',
+      label: 'Anthropic API key (sk-ant-...)',
+      input: `ANTHROPIC_API_KEY=${sk}`,
+      expected: 'ANTHROPIC_API_KEY=[REDACTED:anthropic]',
+    },
+    {
+      kind: 'slack_bot',
+      label: 'Slack bot token (xoxb-*)',
+      input: `token: ${xoxb}`,
+      expected: 'token: [REDACTED:slack_bot]',
+    },
+    {
+      kind: 'slack_app',
+      label: 'Slack app-level token (xapp-*)',
+      input: `app=${xapp}`,
+      expected: 'app=[REDACTED:slack_app]',
+    },
+    {
+      kind: 'github',
+      label: 'GitHub PAT (ghp_*)',
+      input: `Authorization: Bearer ${ghp}`,
+      expected: 'Authorization: Bearer [REDACTED:github]',
+    },
+    {
+      kind: 'aws_access',
+      label: 'AWS access key (AKIA*)',
+      input: `AWS_ACCESS_KEY_ID=${akia}`,
+      expected: 'AWS_ACCESS_KEY_ID=[REDACTED:aws_access]',
+    },
+    {
+      kind: 'jwt',
+      label: 'JWT (eyJ...eyJ...)',
+      input: `cookie: session=${jwt}`,
+      expected: 'cookie: session=[REDACTED:jwt]',
+    },
+  ]
+
+  test('table covers every pattern returned by tokenPatterns()', async () => {
+    const { tokenPatterns } = await import('./journal.ts')
+    // If journal.ts adds a new pattern, this test fails until the
+    // table above gets a row — forcing coverage to stay in lockstep
+    // with the documented pattern list.
+    const documented = tokenPatterns().map((p) => p.kind).sort()
+    const covered = positiveCases.map((c) => c.kind).sort()
+    expect(covered).toEqual(documented)
+  })
+
+  for (const c of positiveCases) {
+    test(`positive: ${c.label} redacts to [REDACTED:${c.kind}]`, async () => {
+      const { redact } = await import('./journal.ts')
+      expect(redact(c.input)).toBe(c.expected)
+    })
+  }
+
+  // Negative: strings that look superficially like tokens but do not
+  // satisfy the full pattern. If any of these redact, the pattern is
+  // too loose — a tightening regression.
+  const negativeCases: ReadonlyArray<{ label: string; input: string }> = [
+    {
+      label: 'random 40-char hex (git SHA-like) is not a token',
+      input: 'commit ' + 'a1b2c3d4'.repeat(5),
+    },
+    {
+      label: 'ghp_ prefix with too few chars (35, not 36) stays',
+      input: 'ghp_' + 'A'.repeat(35),
+    },
+    {
+      label: 'AKIA prefix with lowercase body stays (pattern requires [0-9A-Z])',
+      input: 'AKIA' + 'abcdefghijklmnop',
+    },
+    {
+      label: 'sk- prefix shorter than 20 chars stays',
+      input: 'sk-abc',
+    },
+    {
+      label: 'xoxb- prefix missing numeric segments stays',
+      input: 'xoxb-not-a-real-token',
+    },
+    {
+      label: 'single eyJ segment (no JWT body/sig) stays',
+      input: 'eyJhbGciOiJIUzI1NiJ9',
+    },
+    {
+      label: 'plain path that contains "sk-" as a fragment stays',
+      input: '/home/user/tasks/task-sk-review.md',
+    },
+    {
+      label: 'base64 data that happens to start with AKIA but has lowercase stays',
+      input: 'AKIAlowercasenope',
+    },
+  ]
+
+  for (const c of negativeCases) {
+    test(`negative: ${c.label}`, async () => {
+      const { redact } = await import('./journal.ts')
+      expect(redact(c.input)).toBe(c.input)
+    })
+  }
+
+  // Edge: tokens inside stringified JSON. Stringification does not
+  // escape token characters (no quotes, slashes, or control chars
+  // show up inside token bodies) so the regex catches them even
+  // after JSON.stringify wraps them in quotes.
+  test('edge: token inside a JSON-stringified payload redacts', async () => {
+    const { redact } = await import('./journal.ts')
+    const payload = JSON.stringify({ key: sk, safe: 'ok' })
+    // The string contains `"key":"sk-ant-api03-zzz..."` — the sk- body
+    // is a contiguous run of [a-zA-Z0-9-] so the pattern matches
+    // despite the surrounding quotes.
+    expect(redact(payload)).toBe(
+      JSON.stringify({ key: '[REDACTED:anthropic]', safe: 'ok' }),
+    )
+  })
+
+  test('edge: token embedded in error-message JSON quote redacts', async () => {
+    const { redact } = await import('./journal.ts')
+    const msg = `Error: {"AWS_ACCESS_KEY_ID":"${akia}"} — check env`
+    expect(redact(msg)).toBe(
+      'Error: {"AWS_ACCESS_KEY_ID":"[REDACTED:aws_access]"} — check env',
+    )
+  })
+
+  test('edge: all six kinds in one blob redact to all six placeholders', async () => {
+    const { redact } = await import('./journal.ts')
+    const blob = [
+      `anthropic=${sk}`,
+      `slack_bot=${xoxb}`,
+      `slack_app=${xapp}`,
+      `github=${ghp}`,
+      `aws=${akia}`,
+      `jwt=${jwt}`,
+    ].join(' | ')
+    const out = redact(blob) as string
+    expect(out).toContain('[REDACTED:anthropic]')
+    expect(out).toContain('[REDACTED:slack_bot]')
+    expect(out).toContain('[REDACTED:slack_app]')
+    expect(out).toContain('[REDACTED:github]')
+    expect(out).toContain('[REDACTED:aws_access]')
+    expect(out).toContain('[REDACTED:jwt]')
+    // And none of the original secrets survive.
+    expect(out).not.toContain(sk)
+    expect(out).not.toContain(xoxb)
+    expect(out).not.toContain(xapp)
+    expect(out).not.toContain(ghp)
+    expect(out).not.toContain(akia)
+    expect(out).not.toContain(jwt)
+  })
+
+  test('edge: token as object key value deep inside nested structure', async () => {
+    const { redact } = await import('./journal.ts')
+    const input = {
+      outer: {
+        middle: {
+          inner: [
+            { creds: { api_key: sk } },
+            { creds: { api_key: 'safe-value' } },
+          ],
+        },
+      },
+    }
+    const out = redact(input) as typeof input
+    expect(out.outer.middle.inner[0]!.creds.api_key).toBe('[REDACTED:anthropic]')
+    expect(out.outer.middle.inner[1]!.creds.api_key).toBe('safe-value')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // JournalWriter ↔ redaction integration
 // ---------------------------------------------------------------------------
 
