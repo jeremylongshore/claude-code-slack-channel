@@ -8,7 +8,7 @@ Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP 
 
 ## Architecture
 
-Two-file MCP server: `server.ts` (stateful runtime, ~1000 lines) and `lib.ts` (pure functions, ~460 lines). Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
+Two-file MCP server: `server.ts` (stateful runtime, ~1100 lines) and `lib.ts` (pure functions, ~915 lines). Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
 
 ```
 Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude Code
@@ -62,7 +62,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 
 - `server.ts` — MCP server runtime: bootstrap, Slack clients, tools, event handling
 - `lib.ts` — pure functions: gate logic, security guards, text chunking, session types
-- `policy.ts` — Zod schema for PolicyRule (29-A.1 landed; evaluator lands in follow-up beads)
+- `policy.ts` — PolicyRule Zod schema, `evaluate()` decision procedure, `detectShadowing` linter, `checkMonotonicity` (Epic 29-A closed)
 - `server.test.ts` — test suite covering security-critical functions (uses `bun:test`)
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
