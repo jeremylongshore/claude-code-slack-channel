@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test'
 import {
   gate,
   assertSendable,
@@ -28,9 +28,12 @@ import {
   writeFileSync,
   symlinkSync,
   rmSync,
+  statSync,
+  readlinkSync,
+  realpathSync,
 } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { join, sep } from 'path'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1019,54 +1022,149 @@ describe('isDuplicateEvent', () => {
 })
 
 // ---------------------------------------------------------------------------
-// sessionPath — ccsc-z78.3 failing test (spec-first)
+// sessionPath — 000-docs/session-state-machine.md §47-68
 //
-// Locks the thread-scoped layout from 000-docs/session-state-machine.md §47-68
-// before any implementation lands. Skipped tests below are the red side of
-// the TDD cycle; ccsc-z78.4 un-skips and implements sessionPath() to go
-// green. Do not delete these assertions without updating the design doc.
+// Three safety rules enforced inside sessionPath():
+//   1. Component validation against /^[A-Za-z0-9._-]+$/.
+//   2. Realpath containment — resolved per-channel dir must sit under the
+//      realpathed state root (CWE-22 symlink smuggling).
+//   3. sessions/<channel>/ created with mode 0o700 on first use.
+//
+// Rules 2 and 3 are one primitive: the mkdir is what makes realpath
+// resolvable. Tests below cover the distinctness invariant from
+// ccsc-z78.3 plus the three safety rules.
 // ---------------------------------------------------------------------------
 
 describe('sessionPath', () => {
   const key = (channel: string, thread: string): SessionKey => ({ channel, thread })
 
-  test('stub throws until ccsc-z78.4 lands — locks the export contract', () => {
-    // Active gate so ccsc-z78.4 cannot quietly rename, remove, or change
-    // the signature of this symbol without a visible test failure.
-    expect(() => sessionPath('/tmp/state', key('C0000000001', '1700000000.000100'))).toThrow(
-      /not implemented/,
-    )
+  let rawRoot: string
+  let tmpRoot: string // realpathed — /tmp is a symlink on some platforms
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'sessionPath-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
   })
 
-  test.skip('two threads in one channel produce two distinct file paths', () => {
-    // ccsc-z78.4 un-skips. The bug this epic fixes: a flat
-    // <root>/sessions/<channel>.json layout cannot represent two
-    // parallel threads in one channel. The path must encode `thread`.
-    const root = '/tmp/state-root'
-    const p1 = sessionPath(root, key('C_CHAN', 'T1700000000.000100'))
-    const p2 = sessionPath(root, key('C_CHAN', 'T1700000000.000200'))
+  // ── Core invariants from ccsc-z78.3 ────────────────────────────────────
+
+  test('two threads in one channel produce two distinct file paths', () => {
+    const p1 = sessionPath(tmpRoot, key('C_CHAN', 'T1700000000.000100'))
+    const p2 = sessionPath(tmpRoot, key('C_CHAN', 'T1700000000.000200'))
 
     expect(p1).not.toBe(p2)
     expect(p1.endsWith('/T1700000000.000100.json')).toBe(true)
     expect(p2.endsWith('/T1700000000.000200.json')).toBe(true)
 
-    // Both live under the same per-channel directory.
+    // Both share the per-channel directory.
     const dir1 = p1.slice(0, p1.lastIndexOf('/'))
     const dir2 = p2.slice(0, p2.lastIndexOf('/'))
     expect(dir1).toBe(dir2)
-    expect(dir1.endsWith('/sessions/C_CHAN')).toBe(true)
+    expect(dir1).toBe(join(tmpRoot, 'sessions', 'C_CHAN'))
   })
 
-  test.skip('different channels produce paths under different per-channel dirs', () => {
-    // ccsc-z78.4 un-skips. Sibling threads may collide in filename
-    // (same thread_ts across channels is improbable but legal); the
-    // per-channel parent directory keeps them isolated.
-    const root = '/tmp/state-root'
-    const p1 = sessionPath(root, key('C_AAA', '1700000000.000100'))
-    const p2 = sessionPath(root, key('C_BBB', '1700000000.000100'))
+  test('different channels produce paths under different per-channel dirs', () => {
+    const p1 = sessionPath(tmpRoot, key('C_AAA', '1700000000.000100'))
+    const p2 = sessionPath(tmpRoot, key('C_BBB', '1700000000.000100'))
 
     expect(p1).not.toBe(p2)
-    expect(p1.includes('/sessions/C_AAA/')).toBe(true)
-    expect(p2.includes('/sessions/C_BBB/')).toBe(true)
+    expect(p1.startsWith(join(tmpRoot, 'sessions', 'C_AAA') + sep)).toBe(true)
+    expect(p2.startsWith(join(tmpRoot, 'sessions', 'C_BBB') + sep)).toBe(true)
+  })
+
+  test('is idempotent — second call with same key does not throw', () => {
+    const k = key('C_CHAN', 'T1.0')
+    const first = sessionPath(tmpRoot, k)
+    const second = sessionPath(tmpRoot, k)
+    expect(first).toBe(second)
+  })
+
+  // ── Rule 1: component validation (rejects path-escape primitives) ────
+
+  test('rejects channel component that is exactly ..', () => {
+    // The doc regex /^[A-Za-z0-9._-]+$/ allows "..", but '..' would
+    // escape the sessions/ layer via path.join even though the final
+    // path stays under the state root. Explicit rejection in lib.ts.
+    expect(() => sessionPath(tmpRoot, key('..', 'T1.0'))).toThrow(/invalid channel component/)
+  })
+
+  test('rejects channel component that is exactly .', () => {
+    // '.' as a component collapses sessions/./T1.0.json → sessions/T1.0.json,
+    // making every channel share a single file. Explicit rejection.
+    expect(() => sessionPath(tmpRoot, key('.', 'T1.0'))).toThrow(/invalid channel component/)
+  })
+
+  test('allows channel component with multi-dot literals (e.g. "...")', () => {
+    // Only bare . and .. are escapes; "..." is a normal filename.
+    expect(() => sessionPath(tmpRoot, key('...', 'T1.0'))).not.toThrow()
+  })
+
+  test('rejects channel component with /', () => {
+    expect(() => sessionPath(tmpRoot, key('C/X', 'T1.0'))).toThrow(/invalid channel component/)
+  })
+
+  test('rejects empty channel component', () => {
+    expect(() => sessionPath(tmpRoot, key('', 'T1.0'))).toThrow(/invalid channel component/)
+  })
+
+  test('rejects thread component that is exactly ..', () => {
+    expect(() => sessionPath(tmpRoot, key('C_CHAN', '..'))).toThrow(/invalid thread component/)
+  })
+
+  test('rejects thread component containing ../', () => {
+    expect(() => sessionPath(tmpRoot, key('C_CHAN', '../x'))).toThrow(/invalid thread component/)
+  })
+
+  test('rejects thread component with NUL byte', () => {
+    expect(() => sessionPath(tmpRoot, key('C_CHAN', 'T1\u00000'))).toThrow(
+      /invalid thread component/,
+    )
+  })
+
+  test('rejects thread component with /', () => {
+    expect(() => sessionPath(tmpRoot, key('C_CHAN', 'T1/etc'))).toThrow(/invalid thread component/)
+  })
+
+  // ── Rule 3: directory created at mode 0o700 on first use ─────────────
+
+  test('creates sessions/<channel>/ at mode 0o700', () => {
+    sessionPath(tmpRoot, key('C_MODE', 'T1.0'))
+    const st = statSync(join(tmpRoot, 'sessions', 'C_MODE'))
+    // Mask off file-type bits; only permission bits matter.
+    expect(st.mode & 0o777).toBe(0o700)
+  })
+
+  // ── Rule 2: realpath containment (symlink smuggling guard) ───────────
+
+  test('rejects when sessions/<channel> is a symlink pointing outside root', () => {
+    // Set up the parent sessions/ dir ourselves, then plant a symlink
+    // where sessionPath() would otherwise mkdir. mkdirSync(recursive)
+    // will succeed (symlink-to-dir counts as an existing directory),
+    // but the realpath check must reject because the target escapes.
+    const outside = mkdtempSync(join(tmpdir(), 'sessionPath-escape-'))
+    try {
+      mkdirSync(join(tmpRoot, 'sessions'), { recursive: true, mode: 0o700 })
+      symlinkSync(outside, join(tmpRoot, 'sessions', 'C_EVIL'))
+
+      expect(() => sessionPath(tmpRoot, key('C_EVIL', 'T1.0'))).toThrow(
+        /escapes state root/,
+      )
+
+      // Sanity: the symlink we planted really does point outside.
+      expect(readlinkSync(join(tmpRoot, 'sessions', 'C_EVIL'))).toBe(outside)
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  // ── State root precondition ──────────────────────────────────────────
+
+  test('throws if the state root does not exist', () => {
+    expect(() =>
+      sessionPath(join(tmpRoot, 'nope-does-not-exist'), key('C_CHAN', 'T1.0')),
+    ).toThrow()
   })
 })
