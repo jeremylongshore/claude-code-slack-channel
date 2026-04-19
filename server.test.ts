@@ -1872,3 +1872,164 @@ describe('PolicyRule schema (29-A.1)', () => {
     expect(rules).toHaveLength(2)
   })
 })
+
+// ---------------------------------------------------------------------------
+// PolicyDecision — ccsc-v1b.2 tagged union
+//
+// Decisions are produced by evaluate() (not yet landed), so these tests
+// just verify all three kinds construct cleanly and carry the fields the
+// design doc (§27-30) specifies. No runtime parse — the type alone is
+// the contract.
+// ---------------------------------------------------------------------------
+
+describe('PolicyDecision shape (29-A.2)', () => {
+  test('allow decision constructs with optional rule', () => {
+    // Using typeof import so TS narrows PolicyDecision correctly.
+    type PD = import('./policy.ts').PolicyDecision
+    const allowWithRule: PD = { kind: 'allow', rule: 'r1' }
+    const allowDefault: PD = { kind: 'allow' }
+    expect(allowWithRule.kind).toBe('allow')
+    expect(allowDefault.kind).toBe('allow')
+    expect(allowDefault.rule).toBeUndefined()
+  })
+
+  test('deny decision requires rule + reason', async () => {
+    type PD = import('./policy.ts').PolicyDecision
+    const d: PD = {
+      kind: 'deny',
+      rule: 'no-upload-env',
+      reason: 'uploads of env files are not permitted',
+    }
+    expect(d.kind).toBe('deny')
+    // Type-narrowing: only the deny branch carries reason.
+    if (d.kind === 'deny') {
+      expect(d.reason.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('require decision carries rule + approver + ttlMs', async () => {
+    type PD = import('./policy.ts').PolicyDecision
+    const r: PD = {
+      kind: 'require',
+      rule: 'upload-approval',
+      approver: 'human_approver',
+      ttlMs: 5 * 60 * 1000,
+    }
+    expect(r.kind).toBe('require')
+    if (r.kind === 'require') {
+      expect(r.approver).toBe('human_approver')
+      expect(r.ttlMs).toBeGreaterThan(0)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Path canonicalization (ccsc-v1b.4) — see policy-evaluation-flow.md §174-196
+// ---------------------------------------------------------------------------
+
+describe('path canonicalization for match.pathPrefix (29-A.4)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'policy-canon-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('canonicalizeRulePathPrefix resolves symlinks at load time', async () => {
+    const { canonicalizeRulePathPrefix } = await import('./policy.ts')
+    const real = join(tmpRoot, 'real-target')
+    mkdirSync(real, { recursive: true })
+    const link = join(tmpRoot, 'link-to-target')
+    symlinkSync(real, link)
+
+    expect(canonicalizeRulePathPrefix(link)).toBe(real)
+  })
+
+  test('canonicalizeRulePathPrefix throws on a nonexistent prefix (fail-loud at load)', async () => {
+    const { canonicalizeRulePathPrefix } = await import('./policy.ts')
+    expect(() => canonicalizeRulePathPrefix(join(tmpRoot, 'nope-does-not-exist'))).toThrow()
+  })
+
+  test('canonicalizeRequestPath resolves symlinks at call time', async () => {
+    const { canonicalizeRequestPath } = await import('./policy.ts')
+    const real = join(tmpRoot, 'doc.txt')
+    writeFileSync(real, 'content', { mode: 0o600 })
+    const link = join(tmpRoot, 'alias.txt')
+    symlinkSync(real, link)
+
+    expect(canonicalizeRequestPath(link)).toBe(real)
+  })
+
+  test('canonicalizeRequestPath throws on nonexistent path (fail-closed)', async () => {
+    const { canonicalizeRequestPath } = await import('./policy.ts')
+    expect(() => canonicalizeRequestPath(join(tmpRoot, 'ghost.txt'))).toThrow()
+  })
+
+  test('pathMatchesPrefix: exact-equal match returns true', async () => {
+    const { pathMatchesPrefix } = await import('./policy.ts')
+    expect(pathMatchesPrefix('/var/log/app', '/var/log/app')).toBe(true)
+  })
+
+  test('pathMatchesPrefix: descendant returns true', async () => {
+    const { pathMatchesPrefix } = await import('./policy.ts')
+    expect(pathMatchesPrefix('/var/log/app/today.log', '/var/log/app')).toBe(true)
+  })
+
+  test('pathMatchesPrefix: sibling rejected (no partial-prefix match)', async () => {
+    const { pathMatchesPrefix } = await import('./policy.ts')
+    // The classic bug: /etc/passwd should NOT match prefix /etc/pass.
+    expect(pathMatchesPrefix('/etc/passwd', '/etc/pass')).toBe(false)
+  })
+
+  test('pathMatchesPrefix: non-descendant rejected', async () => {
+    const { pathMatchesPrefix } = await import('./policy.ts')
+    expect(pathMatchesPrefix('/var/other', '/var/log/app')).toBe(false)
+  })
+
+  test('CWE-22: ../ traversal is defeated by canonicalizing both sides', async () => {
+    const { canonicalizeRulePathPrefix, canonicalizeRequestPath, pathMatchesPrefix } =
+      await import('./policy.ts')
+    // Rule scopes reads to /<tmpRoot>/safe/. A request asks for
+    // /<tmpRoot>/safe/../secrets — lexically inside, realpath-wise outside.
+    const safe = join(tmpRoot, 'safe')
+    const secrets = join(tmpRoot, 'secrets')
+    mkdirSync(safe, { recursive: true })
+    mkdirSync(secrets, { recursive: true })
+    const secretFile = join(secrets, 'key.txt')
+    writeFileSync(secretFile, 'SENSITIVE', { mode: 0o600 })
+
+    const resolvedPrefix = canonicalizeRulePathPrefix(safe)
+    // Compose a traversal: /safe/../secrets/key.txt → /secrets/key.txt
+    const traversalInput = join(safe, '..', 'secrets', 'key.txt')
+    const resolvedInput = canonicalizeRequestPath(traversalInput)
+
+    expect(pathMatchesPrefix(resolvedInput, resolvedPrefix)).toBe(false)
+  })
+
+  test('Symlink-out escape is defeated by realpath in canonicalizeRequestPath', async () => {
+    const { canonicalizeRulePathPrefix, canonicalizeRequestPath, pathMatchesPrefix } =
+      await import('./policy.ts')
+    // Rule allows /<tmpRoot>/safe/. Attacker plants a symlink inside
+    // /safe pointing to /<tmpRoot>/secrets/key.txt.
+    const safe = join(tmpRoot, 'safe')
+    const secrets = join(tmpRoot, 'secrets')
+    mkdirSync(safe, { recursive: true })
+    mkdirSync(secrets, { recursive: true })
+    const secretFile = join(secrets, 'key.txt')
+    writeFileSync(secretFile, 'SENSITIVE', { mode: 0o600 })
+
+    const link = join(safe, 'looks-innocent.txt')
+    symlinkSync(secretFile, link)
+
+    const resolvedPrefix = canonicalizeRulePathPrefix(safe)
+    const resolvedInput = canonicalizeRequestPath(link)
+
+    // realpath collapses the symlink to /secrets/key.txt — outside /safe.
+    expect(resolvedInput).toBe(secretFile)
+    expect(pathMatchesPrefix(resolvedInput, resolvedPrefix)).toBe(false)
+  })
+})
