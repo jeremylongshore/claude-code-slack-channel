@@ -402,13 +402,75 @@ export function createSessionSupervisor(
       return handle.beginQuiesce()
     },
 
-    deactivate(_key: SessionKey): Promise<void> {
-      // Under ccsc-xa3.14 (deactivate + reaper sub-epic).
-      return Promise.reject(
-        new Error(
-          'SessionSupervisor.deactivate: not yet implemented (ccsc-xa3.14)',
-        ),
-      )
+    async deactivate(key: SessionKey): Promise<void> {
+      const id = keyId(key)
+      const handle = live.get(id)
+      if (handle === undefined) {
+        // No live handle — nothing to release. Matches quiesce()'s
+        // Nonexistent-key no-op per session-state-machine.md §124.
+        // Do not log an empty-case line; a deactivate on an already-
+        // dropped key is a recovery idempotency guarantee, not an
+        // event worth correlating.
+        return
+      }
+
+      // Quarantined handles are out of scope per the interface contract
+      // (§197-198): only a human clears the quarantine flag. Fail loudly
+      // rather than silently release a handle that the supervisor has
+      // marked as needing SO attention.
+      if (handle.state === 'quarantined') {
+        throw new Error(
+          `deactivate: handle for ${JSON.stringify(key)} is quarantined; human action required`,
+        )
+      }
+
+      // Deactivation is only legal after a completed quiesce. Refusing
+      // the active path is how the supervisor enforces the "work has
+      // drained before release" invariant — session-state-machine.md
+      // §210 invariant 2. An active-state deactivate would race with
+      // in-flight update()/tool calls and violate the at-most-one-
+      // writer rule.
+      if (handle.state !== 'quiescing') {
+        throw new Error(
+          `deactivate: handle for ${JSON.stringify(key)} is in state '${handle.state}'; must be quiesced first`,
+        )
+      }
+
+      handle.markDeactivating()
+
+      // Defensive final persist. `saveSession` is atomic (tmp + rename
+      // under `wx`). In the current supervisor shape `session` never
+      // drifts from disk between update() calls (update() is still
+      // unwired and the one field mutated by the supervisor itself is
+      // `_state`, which is not persisted). Still, writing here makes
+      // deactivate the single "this file is now stable on disk" fence
+      // so future beads that add in-memory fields (e.g. lastActiveAt
+      // refresh in the reaper) don't leak drift at shutdown.
+      try {
+        await saveSession(handle.path, handle.session)
+      } catch (err) {
+        // A write failure at the deactivation boundary is not something
+        // we can recover from on this handle — the on-disk copy may or
+        // may not be the last-known-good. Transition to quarantine so
+        // the next activate() reloads from disk AND surfaces the
+        // failure to the SO. Bead-filing for quarantine lands with the
+        // reaper work (ccsc-xa3.8); for now the state change alone is
+        // the forensic trail.
+        handle.markQuarantined()
+        log('session.deactivate_error', {
+          channel: key.channel,
+          thread: key.thread,
+          error: errorMessage(err),
+        })
+        throw err
+      }
+
+      live.delete(id)
+
+      log('session.deactivate', {
+        channel: key.channel,
+        thread: key.thread,
+      })
     },
 
     shutdown(): Promise<void> {
@@ -489,6 +551,21 @@ class ConcreteHandle implements SessionHandle {
    *  that accepts the full FSM. */
   markActive(): void {
     this._state = 'active'
+  }
+
+  /** Transition from `quiescing` → `deactivating`. Only the supervisor
+   *  invokes this, and only after the drain promise has resolved.
+   *  Package-private by convention; external callers must go through
+   *  `SessionSupervisor.deactivate()`. */
+  markDeactivating(): void {
+    this._state = 'deactivating'
+  }
+
+  /** Transition to `quarantined`. Terminal from the supervisor's
+   *  perspective — only a human clears it. Called on save-path
+   *  failures that leave the on-disk state uncertain. */
+  markQuarantined(): void {
+    this._state = 'quarantined'
   }
 
   /** Begin a graceful drain. Transitions state `active` → `quiescing`

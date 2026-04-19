@@ -2586,9 +2586,8 @@ describe('createSessionSupervisor.activate', () => {
     expect(handle.state).toBe('active')
   })
 
-  test('deactivate/shutdown are staged stubs that reject with bead pointers', async () => {
+  test('shutdown is a staged stub that rejects with a bead pointer', async () => {
     const sup = makeSupervisor()
-    await expect(sup.deactivate(key)).rejects.toThrow(/xa3\.14/)
     await expect(sup.shutdown()).rejects.toThrow(/xa3\.14/)
   })
 
@@ -2774,6 +2773,134 @@ describe('createSessionSupervisor.quiesce', () => {
 
     handle.endWork('abort-me')
     await drain
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SessionSupervisor.deactivate (ccsc-xa3.4)
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor.deactivate', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logged: Array<{ event: string; fields: Record<string, unknown> }>
+
+  const key = { channel: 'C_DA', thread: 'T1.0' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-deactivate-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logged = []
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: (event, fields) => {
+        logged.push({ event, fields })
+      },
+      clock: () => 1_700_000_000_000,
+    })
+  }
+
+  test('deactivate on an unknown key is a silent no-op and emits no log', async () => {
+    const sup = makeSupervisor()
+    await expect(sup.deactivate(key)).resolves.toBeUndefined()
+    expect(logged.filter((l) => l.event === 'session.deactivate')).toHaveLength(0)
+  })
+
+  test('deactivate on an active (not quiesced) key rejects with a programmer-error message', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    expect(handle.state).toBe('active')
+
+    await expect(sup.deactivate(key)).rejects.toThrow(
+      /must be quiesced first/,
+    )
+    // State must not be mutated by the rejected call.
+    expect(handle.state).toBe('active')
+    // Live map must still contain the handle.
+    await expect(sup.activate(key)).resolves.toBe(handle)
+  })
+
+  test('deactivate after quiesce transitions to deactivating, removes from live map, emits log', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    await sup.quiesce(key)
+    expect(handle.state).toBe('quiescing')
+
+    await sup.deactivate(key)
+
+    expect(handle.state).toBe('deactivating')
+    const deactivateLogs = logged.filter((l) => l.event === 'session.deactivate')
+    expect(deactivateLogs).toHaveLength(1)
+    expect(deactivateLogs[0]!.fields).toEqual({
+      channel: key.channel,
+      thread: key.thread,
+    })
+  })
+
+  test('post-deactivate activate() re-reads from disk and returns a fresh handle', async () => {
+    const sup = makeSupervisor()
+    const first = await sup.activate(key, 'U_OWNER')
+    await sup.quiesce(key)
+    await sup.deactivate(key)
+
+    // A new activate() must NOT return the deactivated handle — it
+    // must reload from disk and produce a new live entry.
+    const second = await sup.activate(key)
+    expect(second).not.toBe(first)
+    expect(second.state).toBe('active')
+    expect(second.session.ownerId).toBe('U_OWNER')
+  })
+
+  test('deactivate persists the session file (atomic writer) before releasing', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    await sup.quiesce(key)
+    await sup.deactivate(key)
+
+    // Reload directly from disk and verify the persisted body matches
+    // the handle snapshot at deactivation time.
+    const { sessionPath, loadSession } = await import('./lib.ts')
+    const path = sessionPath(tmpRoot, key)
+    const fromDisk = await loadSession(tmpRoot, path)
+    expect(fromDisk.ownerId).toBe('U_OWNER')
+    expect(fromDisk.key).toEqual(key)
+    expect(fromDisk.createdAt).toBe(handle.session.createdAt)
+  })
+
+  test('deactivate is idempotent-ish: second call on a released key is a no-op', async () => {
+    const sup = makeSupervisor()
+    await sup.activate(key, 'U_OWNER')
+    await sup.quiesce(key)
+    await sup.deactivate(key)
+
+    // Second deactivate: handle is no longer in the live map, so the
+    // call resolves without error (Nonexistent-key no-op branch).
+    await expect(sup.deactivate(key)).resolves.toBeUndefined()
+    // No duplicate log line.
+    expect(logged.filter((l) => l.event === 'session.deactivate')).toHaveLength(1)
+  })
+
+  test('deactivate rejects on quarantined handles — human action required', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    await sup.quiesce(key)
+
+    // Force quarantine via the package-private transition — simulates a
+    // failure path that ccsc-xa3.8 (reaper) will produce organically.
+    // Cast through unknown to reach the internal method without
+    // widening the public SessionHandle interface for tests.
+    const h = handle as unknown as { markQuarantined(): void }
+    h.markQuarantined()
+
+    await expect(sup.deactivate(key)).rejects.toThrow(/quarantined/)
   })
 })
 
