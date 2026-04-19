@@ -2905,6 +2905,193 @@ describe('createSessionSupervisor.deactivate', () => {
 })
 
 // ---------------------------------------------------------------------------
+// resolveIdleMs + SessionSupervisor.reapIdle (ccsc-xa3.8)
+// ---------------------------------------------------------------------------
+
+describe('resolveIdleMs', () => {
+  test('returns DEFAULT_IDLE_MS (4h) when env var is unset', async () => {
+    const { resolveIdleMs, DEFAULT_IDLE_MS } = await import('./supervisor.ts')
+    expect(resolveIdleMs({})).toBe(DEFAULT_IDLE_MS)
+    expect(DEFAULT_IDLE_MS).toBe(4 * 60 * 60 * 1000)
+  })
+
+  test('returns DEFAULT_IDLE_MS when env var is empty / non-numeric / negative', async () => {
+    const { resolveIdleMs, DEFAULT_IDLE_MS } = await import('./supervisor.ts')
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: '' })).toBe(DEFAULT_IDLE_MS)
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: 'abc' })).toBe(DEFAULT_IDLE_MS)
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: '-100' })).toBe(DEFAULT_IDLE_MS)
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: '0' })).toBe(DEFAULT_IDLE_MS)
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: 'Infinity' })).toBe(DEFAULT_IDLE_MS)
+  })
+
+  test('honors a valid positive integer in ms', async () => {
+    const { resolveIdleMs } = await import('./supervisor.ts')
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: '60000' })).toBe(60000)
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: '3600000' })).toBe(3600000)
+  })
+
+  test('floors fractional values', async () => {
+    const { resolveIdleMs } = await import('./supervisor.ts')
+    expect(resolveIdleMs({ SLACK_SESSION_IDLE_MS: '1500.9' })).toBe(1500)
+  })
+})
+
+describe('createSessionSupervisor.reapIdle', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logged: Array<{ event: string; fields: Record<string, unknown> }>
+  let clockNow: number
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-reap-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logged = []
+    clockNow = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor(idleMs: number) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: (event, fields) => {
+        logged.push({ event, fields })
+      },
+      clock: () => clockNow,
+      idleMs,
+    })
+  }
+
+  type DrainHandle = import('./supervisor.ts').SessionHandle & {
+    beginWork(requestId: string): AbortController
+    endWork(requestId: string): void
+    readonly inFlight: Map<string, AbortController>
+  }
+
+  test('no-op when live map is empty', async () => {
+    const sup = makeSupervisor(60_000)
+    await sup.reapIdle()
+    expect(logged.filter((l) => l.event === 'session.reap_tick')).toHaveLength(0)
+  })
+
+  test('leaves sessions within the idle window untouched', async () => {
+    const sup = makeSupervisor(60_000)
+    const handle = await sup.activate({ channel: 'C_R1', thread: 'T' }, 'U1')
+    expect(handle.session.lastActiveAt).toBe(clockNow)
+
+    // Advance clock but not past the idle threshold.
+    clockNow += 30_000
+    await sup.reapIdle()
+
+    expect(handle.state).toBe('active')
+    expect(logged.filter((l) => l.event === 'session.reap_tick')).toHaveLength(0)
+  })
+
+  test('reaps sessions past the idle threshold through quiesce → deactivate', async () => {
+    const sup = makeSupervisor(60_000)
+    const handle = await sup.activate({ channel: 'C_R2', thread: 'T' }, 'U1')
+
+    // Push clock past the threshold.
+    clockNow += 120_000
+    await sup.reapIdle()
+
+    // Handle must have moved through the full lifecycle — ends at
+    // 'deactivating' (terminal from the caller's view; the live map
+    // removal is the true "gone" signal).
+    expect(handle.state).toBe('deactivating')
+
+    const events = logged.map((l) => l.event)
+    expect(events).toContain('session.reap_tick')
+    expect(events).toContain('session.quiesce')
+    expect(events).toContain('session.deactivate')
+
+    // A fresh activate() must reload from disk, not return the reaped
+    // handle.
+    const fresh = await sup.activate({ channel: 'C_R2', thread: 'T' })
+    expect(fresh).not.toBe(handle)
+    expect(fresh.state).toBe('active')
+  })
+
+  test('skips sessions with in-flight work, even when past the threshold', async () => {
+    const sup = makeSupervisor(60_000)
+    const handle = (await sup.activate(
+      { channel: 'C_R3', thread: 'T' },
+      'U1',
+    )) as DrainHandle
+    handle.beginWork('tool-call-1')
+
+    clockNow += 120_000
+    await sup.reapIdle()
+
+    // In-flight guard: handle must still be active, no reap events.
+    expect(handle.state).toBe('active')
+    expect(handle.inFlight.has('tool-call-1')).toBe(true)
+    expect(logged.filter((l) => l.event === 'session.reap_tick')).toHaveLength(0)
+    expect(logged.filter((l) => l.event === 'session.deactivate')).toHaveLength(0)
+
+    // Clean up so afterEach doesn't leave dangling AbortControllers.
+    handle.endWork('tool-call-1')
+  })
+
+  test('skips handles whose state is not active (quiescing / quarantined)', async () => {
+    const sup = makeSupervisor(60_000)
+    const quiescingHandle = await sup.activate(
+      { channel: 'C_R4a', thread: 'T' },
+      'U1',
+    )
+    const quarantinedHandle = await sup.activate(
+      { channel: 'C_R4b', thread: 'T' },
+      'U2',
+    )
+
+    // Manually drive into non-active states without going through the
+    // full quiesce() helper (which would resolve immediately with no
+    // in-flight work and let deactivate run).
+    ;(quiescingHandle as unknown as { _state: string })._state = 'quiescing'
+    ;(quarantinedHandle as unknown as { markQuarantined(): void }).markQuarantined()
+
+    clockNow += 120_000
+    await sup.reapIdle()
+
+    expect(quiescingHandle.state).toBe('quiescing')
+    expect(quarantinedHandle.state).toBe('quarantined')
+    expect(logged.filter((l) => l.event === 'session.reap_tick')).toHaveLength(0)
+  })
+
+  test('reaps multiple eligible sessions in a single tick', async () => {
+    const sup = makeSupervisor(60_000)
+    const h1 = await sup.activate({ channel: 'C_A', thread: 'T' }, 'U1')
+    const h2 = await sup.activate({ channel: 'C_B', thread: 'T' }, 'U2')
+    const h3 = await sup.activate({ channel: 'C_C', thread: 'T' }, 'U3')
+
+    clockNow += 120_000
+    await sup.reapIdle()
+
+    expect(h1.state).toBe('deactivating')
+    expect(h2.state).toBe('deactivating')
+    expect(h3.state).toBe('deactivating')
+
+    const reapTicks = logged.filter((l) => l.event === 'session.reap_tick')
+    expect(reapTicks).toHaveLength(1)
+    expect(reapTicks[0]!.fields['candidates']).toBe(3)
+  })
+
+  test('honors a custom idleMs (short window for tests)', async () => {
+    const sup = makeSupervisor(500)
+    const handle = await sup.activate({ channel: 'C_SHORT', thread: 'T' }, 'U1')
+
+    // 1000ms >> 500ms threshold
+    clockNow += 1000
+    await sup.reapIdle()
+
+    expect(handle.state).toBe('deactivating')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // JournalEvent schema — 000-docs/audit-journal-architecture.md §19-59
 // ---------------------------------------------------------------------------
 

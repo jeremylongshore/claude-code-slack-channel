@@ -206,6 +206,28 @@ export interface SessionSupervisor {
    *  `activate()` call rejects. A new supervisor instance is required
    *  to resume, and it will rebuild state from disk. */
   shutdown(): Promise<void>
+
+  /** One pass of the idle reaper. Finds every `active` handle whose
+   *  `session.lastActiveAt` is older than `idleMs` and has no in-flight
+   *  work, then drives it through quiesce → deactivate.
+   *
+   *  Contract:
+   *    - Never reaps a handle with `inFlight.size > 0` (session-state-
+   *      machine.md §265 — the idle TTL check runs before quiesce and
+   *      does not pre-empt in-flight work).
+   *    - Never reaps a handle whose state is not `active`. Quiescing /
+   *      deactivating / quarantined handles are on their own edge of
+   *      the FSM; the reaper stays out of their way.
+   *    - Errors on a single session do not stop the tick. The reaper
+   *      logs the failure and moves on so one quarantined handle can't
+   *      starve the rest of the population.
+   *    - Pure relative to wall-clock — tests inject a `clock` to drive
+   *      the threshold deterministically.
+   *
+   *  Timer wiring lives in `server.ts`: this function is the reapable
+   *  unit so the server can decide tick frequency, or a test can call
+   *  it directly. */
+  reapIdle(): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +259,30 @@ export interface SupervisorOptions {
    *  `Date.now`. Injected for deterministic tests of `createdAt` and
    *  `lastActiveAt`. */
   clock?: () => number
+  /** Idle threshold for the reaper, in milliseconds. A session is
+   *  eligible for reaping when `clock() - session.lastActiveAt >
+   *  idleMs`. Default: 4 hours (14_400_000 ms). Matches the
+   *  `SLACK_SESSION_IDLE_MS` env var documented in
+   *  session-state-machine.md §119. */
+  idleMs?: number
+}
+
+/** Default idle threshold: 4 hours in ms. Documented in
+ *  session-state-machine.md §119. */
+export const DEFAULT_IDLE_MS = 4 * 60 * 60 * 1000
+
+/** Parse `SLACK_SESSION_IDLE_MS` from an env record and return a valid
+ *  idle threshold in ms. Falls back to `DEFAULT_IDLE_MS` when the var
+ *  is unset, empty, non-numeric, negative, or non-finite. Pure; no
+ *  process.env access — caller passes the env map. */
+export function resolveIdleMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env['SLACK_SESSION_IDLE_MS']
+  if (raw === undefined || raw === '') return DEFAULT_IDLE_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_IDLE_MS
+  return Math.floor(parsed)
 }
 
 /** Default structured log writer: one newline-delimited JSON object per
@@ -269,6 +315,7 @@ export function createSessionSupervisor(
 ): SessionSupervisor {
   const log = opts.log ?? defaultLog
   const clock = opts.clock ?? Date.now
+  const idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
   const { stateRoot } = opts
 
   // Live handles, keyed by the stringified SessionKey. Use a composite
@@ -480,6 +527,51 @@ export function createSessionSupervisor(
           'SessionSupervisor.shutdown: not yet implemented (ccsc-xa3.14)',
         ),
       )
+    },
+
+    async reapIdle(): Promise<void> {
+      const now = clock()
+      const threshold = now - idleMs
+
+      // Snapshot candidate keys first so we don't iterate the live map
+      // while mutating it through deactivate(). Capture only what the
+      // filter allows; the quiesce/deactivate pair per candidate runs
+      // on the snapshot list.
+      const candidates: SessionKey[] = []
+      for (const handle of live.values()) {
+        if (handle.state !== 'active') continue
+        if (handle.inFlight.size > 0) continue
+        if (handle.session.lastActiveAt > threshold) continue
+        candidates.push(handle.key)
+      }
+
+      if (candidates.length === 0) return
+
+      log('session.reap_tick', {
+        idleMs,
+        threshold,
+        candidates: candidates.length,
+      })
+
+      // Sequential rather than parallel: keeps log ordering predictable
+      // and keeps contention on the filesystem (one atomic rename at a
+      // time) down on reapers that drain dozens of sessions at once.
+      // For a developer install the population is small; the parallel
+      // win is not worth the log-interleaving loss.
+      for (const key of candidates) {
+        try {
+          await this.quiesce(key)
+          await this.deactivate(key)
+        } catch (err) {
+          // One quarantined or racing handle must not starve the rest
+          // of the tick. Log and continue.
+          log('session.reap_error', {
+            channel: key.channel,
+            thread: key.thread,
+            error: errorMessage(err),
+          })
+        }
+      }
     },
   }
 }
