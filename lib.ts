@@ -952,12 +952,26 @@ export function resolveJournalPath(
     const arg = argv[i]!
     if (arg === '--audit-log-file') {
       const next = argv[i + 1]
-      if (typeof next === 'string' && next.length > 0) {
+      // Reject values that look like another flag (start with `-`).
+      // Scenarios:
+      //   - `--audit-log-file --debug` — operator forgot the path;
+      //     don't silently journal to a file literally named
+      //     `--debug`.
+      //   - `--audit-log-file -` — stdin convention; never a sensible
+      //     audit destination.
+      // A filename that genuinely starts with `-` is an
+      // operator-side edge case resolved by passing `./-name` through
+      // the shell or by using the `--audit-log-file=-name` equals
+      // form (which keeps the literal).
+      if (
+        typeof next === 'string' &&
+        next.length > 0 &&
+        !next.startsWith('-')
+      ) {
         return { path: next, source: 'flag' }
       }
-      // `--audit-log-file` with no value or an empty value is a
-      // shell/launcher mistake. Fall through to env; don't silently
-      // enable journaling at an unexpected path.
+      // Missing / empty / flag-shaped value: fall through. Don't
+      // silently enable journaling at an unexpected path.
       continue
     }
     if (arg.startsWith('--audit-log-file=')) {

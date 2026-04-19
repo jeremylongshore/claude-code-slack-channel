@@ -3823,4 +3823,32 @@ describe('resolveJournalPath', () => {
       ),
     ).toEqual({ path: '/first', source: 'flag' })
   })
+
+  test('space-separated flag rejects a flag-shaped value and falls through', () => {
+    // `--audit-log-file --debug` is an operator mistake — forgot the
+    // path. Do not journal to a file literally named `--debug`.
+    expect(
+      resolveJournalPath(
+        ['--audit-log-file', '--debug'],
+        { SLACK_AUDIT_LOG: '/from/env' },
+      ),
+    ).toEqual({ path: '/from/env', source: 'env' })
+
+    // Same for a bare `-`, which is the stdin convention and never a
+    // sensible audit destination.
+    expect(resolveJournalPath(['--audit-log-file', '-'], {})).toEqual({
+      path: null,
+      source: null,
+    })
+  })
+
+  test('equals form preserves literal values that start with a hyphen', () => {
+    // Escape hatch for the rare filename that genuinely starts with
+    // `-` — operator can use the equals form to bypass the
+    // flag-shape heuristic.
+    expect(resolveJournalPath(['--audit-log-file=-weird.log'], {})).toEqual({
+      path: '-weird.log',
+      source: 'flag',
+    })
+  })
 })
