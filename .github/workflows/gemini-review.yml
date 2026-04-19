@@ -44,6 +44,38 @@ jobs:
           gcp_location: ${{ vars.GOOGLE_CLOUD_LOCATION }}
           use_vertex_ai: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
           gemini_model: gemini-2.5-pro
+          # Without this prompt the action defaults to "You are a helpful
+          # assistant." and the reviewer produces no output. See ccsc-304.
+          prompt: |-
+            You are reviewing pull request #${{ github.event.pull_request.number }} in
+            ${{ github.repository }}. This repo is a Slack↔Claude-Code MCP bridge where
+            prompt injection and file exfiltration are the primary threat model; read
+            000-docs/THREAT-MODEL.md, ARCHITECTURE.md, and any design doc under
+            000-docs/ that the diff touches before commenting.
+
+            Steps:
+              1. Use `pull_request_read` to fetch the PR metadata and diff.
+              2. Post inline comments with `add_comment_to_pending_review`, then submit
+                 the pending review with `pull_request_review_write`.
+
+            What to flag:
+              - Correctness bugs, concurrency issues, unchecked failure paths.
+              - Security issues — especially anything touching `gate()`,
+                `assertSendable()`, `assertOutboundAllowed()`, `sessionPath()`, or the
+                policy evaluator in `policy.ts`.
+              - Drift between the diff and the matching design doc under 000-docs/
+                (the doc is authoritative; flag the code if they disagree).
+              - Missing tests for new runtime code. Interface-only / design-doc PRs
+                legitimately ship without tests — do not insist on tests there.
+
+            What NOT to flag:
+              - Style / formatting already enforced by `tsc --noEmit`.
+              - Comments on the user's personal preferences (beads IDs, branch names,
+                commit signature, Epic/sub-epic numbering).
+              - Speculative "what if we refactored this entirely" comments.
+
+            If nothing material is wrong, submit an approving review with a short LGTM
+            body rather than inventing concerns.
           settings: |
             {
               "tools": {
