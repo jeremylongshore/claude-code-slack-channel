@@ -2775,3 +2775,179 @@ describe('createSessionSupervisor.quiesce', () => {
     await drain
   })
 })
+
+// ---------------------------------------------------------------------------
+// JournalEvent schema — 000-docs/audit-journal-architecture.md §19-59
+// ---------------------------------------------------------------------------
+
+describe('JournalEvent', () => {
+  // Any 64-char lowercase hex string is a valid sha256 for the schema.
+  // Using deterministic literals keeps the assertions readable.
+  const SHA_A = 'a'.repeat(64)
+  const SHA_B = 'b'.repeat(64)
+
+  function minimal(overrides: Record<string, unknown> = {}) {
+    return {
+      v: 1,
+      ts: '2026-04-19T12:34:56.789Z',
+      seq: 1,
+      kind: 'system.boot',
+      prevHash: SHA_A,
+      hash: SHA_B,
+      ...overrides,
+    }
+  }
+
+  test('accepts a minimal event with only required fields', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    const parsed = JournalEvent.parse(minimal())
+    expect(parsed.v).toBe(1)
+    expect(parsed.kind).toBe('system.boot')
+    expect(parsed.hash).toBe(SHA_B)
+  })
+
+  test('accepts a full event with every optional field populated', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    const full = {
+      ...minimal({ kind: 'policy.require' }),
+      toolName: 'upload_file',
+      input: { path: '/safe/upload.txt', size: 1024 },
+      outcome: 'require' as const,
+      reason: 'tool requires human approval under rule allow-uploads',
+      ruleId: 'allow-uploads',
+      sessionKey: { channel: 'C0123456789', thread: '1711000000.000100' },
+      actor: 'session_owner' as const,
+      correlationId: 'req-abc123',
+    }
+    const parsed = JournalEvent.parse(full)
+    expect(parsed.outcome).toBe('require')
+    expect(parsed.actor).toBe('session_owner')
+    expect(parsed.sessionKey).toEqual({
+      channel: 'C0123456789',
+      thread: '1711000000.000100',
+    })
+  })
+
+  test('rejects wrong schema version', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    expect(() => JournalEvent.parse(minimal({ v: 2 }))).toThrow()
+    expect(() => JournalEvent.parse(minimal({ v: '1' }))).toThrow()
+  })
+
+  test('rejects unknown event kind', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    expect(() =>
+      JournalEvent.parse(minimal({ kind: 'gate.inbound.maybe' })),
+    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ kind: '' }))).toThrow()
+  })
+
+  test('rejects malformed sha256 hex in prevHash or hash', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    // Too short
+    expect(() => JournalEvent.parse(minimal({ prevHash: 'abcd' }))).toThrow()
+    // Uppercase — canonical form is lowercase
+    expect(() =>
+      JournalEvent.parse(minimal({ hash: 'A'.repeat(64) })),
+    ).toThrow()
+    // Non-hex char
+    expect(() =>
+      JournalEvent.parse(minimal({ hash: 'g'.repeat(64) })),
+    ).toThrow()
+    // Off-by-one
+    expect(() =>
+      JournalEvent.parse(minimal({ prevHash: 'a'.repeat(63) })),
+    ).toThrow()
+  })
+
+  test('rejects non-ISO / non-UTC ts', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    // Missing ms precision
+    expect(() =>
+      JournalEvent.parse(minimal({ ts: '2026-04-19T12:34:56Z' })),
+    ).toThrow()
+    // No timezone
+    expect(() =>
+      JournalEvent.parse(minimal({ ts: '2026-04-19T12:34:56.789' })),
+    ).toThrow()
+    // Space instead of T
+    expect(() =>
+      JournalEvent.parse(minimal({ ts: '2026-04-19 12:34:56.789Z' })),
+    ).toThrow()
+  })
+
+  test('rejects negative or non-integer seq', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    expect(() => JournalEvent.parse(minimal({ seq: -1 }))).toThrow()
+    expect(() => JournalEvent.parse(minimal({ seq: 1.5 }))).toThrow()
+    expect(() => JournalEvent.parse(minimal({ seq: '1' }))).toThrow()
+    // Zero is allowed (nonnegative); the writer starts at 1 by convention
+    // but the schema itself is permissive here so boot-time bootstrapping
+    // has room to use 0 as a sentinel.
+    expect(() => JournalEvent.parse(minimal({ seq: 0 }))).not.toThrow()
+  })
+
+  test('strict: rejects unknown top-level fields to prevent hash-form drift', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    // An extra field that would be silently stripped in lax mode would
+    // get included in some serializers' output but not others, breaking
+    // the chain property. Must reject at parse time.
+    expect(() =>
+      JournalEvent.parse(minimal({ extraneous: 'oops' })),
+    ).toThrow()
+  })
+
+  test('outcome enum rejects unknown values', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    expect(() =>
+      JournalEvent.parse(minimal({ outcome: 'maybe' })),
+    ).toThrow()
+    // All five legitimate values pass
+    for (const o of ['allow', 'deny', 'require', 'drop', 'n/a']) {
+      expect(() =>
+        JournalEvent.parse(minimal({ outcome: o })),
+      ).not.toThrow()
+    }
+  })
+
+  test('actor enum rejects unknown values', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    expect(() =>
+      JournalEvent.parse(minimal({ actor: 'admin' })),
+    ).toThrow()
+    for (const a of [
+      'session_owner',
+      'claude_process',
+      'human_approver',
+      'peer_agent',
+      'system',
+    ]) {
+      expect(() =>
+        JournalEvent.parse(minimal({ actor: a })),
+      ).not.toThrow()
+    }
+  })
+
+  test('sessionKey: both channel and thread required when present', async () => {
+    const { JournalEvent } = await import('./journal.ts')
+    expect(() =>
+      JournalEvent.parse(minimal({ sessionKey: { channel: 'C01' } })),
+    ).toThrow()
+    expect(() =>
+      JournalEvent.parse(minimal({ sessionKey: { thread: 'T01' } })),
+    ).toThrow()
+    // Extra fields on sessionKey also rejected (strict nested shape)
+    // — Zod objects default to strip, but the critical invariant is at
+    // the top level; nested loose is acceptable for now because the
+    // writer only reads the two declared keys.
+  })
+
+  test('covers every EventKind value enumerated in the design doc', async () => {
+    const { JournalEvent, EventKind } = await import('./journal.ts')
+    const kinds = EventKind.options
+    expect(kinds).toHaveLength(19)
+    for (const k of kinds) {
+      expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
+    }
+  })
+})
