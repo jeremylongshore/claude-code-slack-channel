@@ -65,6 +65,25 @@ export interface GateResult {
   isResend?: boolean
 }
 
+/** Identity of a thread-scoped session. See 000-docs/session-state-machine.md.
+ *
+ *  Sessions are keyed by (channel, thread) so two parallel threads in the
+ *  same Slack channel do not observe each other's state. Both fields are
+ *  strings that arrive from the Slack event payload — never constructed
+ *  from message content.
+ *
+ *  For top-level (non-threaded) messages the supervisor synthesises
+ *  `thread = event.ts` at session-activation time so this type stays
+ *  total (no null case to handle downstream). That synthesis happens in
+ *  server.ts, not here. */
+export interface SessionKey {
+  /** Slack channel ID, e.g. `C0123456789` or `D0123456789` (DM). */
+  channel: string
+  /** Slack thread_ts, e.g. `1711000000.000100`. For top-level messages the
+   *  supervisor uses the message `ts` as the thread value. */
+  thread: string
+}
+
 // ---------------------------------------------------------------------------
 // Access helpers
 // ---------------------------------------------------------------------------
