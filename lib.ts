@@ -19,6 +19,11 @@ export const MAX_PENDING = 3
 export const MAX_PAIRING_REPLIES = 2
 export const PAIRING_EXPIRY_MS = 60 * 60 * 1000 // 1 hour
 
+/** Matches permission relay replies (e.g. "y abcde", "no xyzwq").
+ *  Used in gate() to block peer-bot messages that look like permission
+ *  approvals, and in server.ts to route human permission replies. */
+export const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -28,6 +33,9 @@ export type DmPolicy = 'pairing' | 'allowlist' | 'disabled'
 export interface ChannelPolicy {
   requireMention: boolean
   allowFrom: string[]
+  /** Opt-in list of bot user IDs allowed to deliver messages in this channel.
+   *  Absent or empty = all bot messages dropped (default-safe). */
+  allowBotIds?: string[]
 }
 
 export interface PendingEntry {
@@ -374,15 +382,49 @@ export interface GateOptions {
   staticMode: boolean
   /** Persist the mutated access object (only called when staticMode is false) */
   saveAccess: (access: Access) => void
-  /** Current bot user ID for mention detection */
+  /** Current bot user ID for mention detection + self-echo filtering */
   botUserId: string
+  /** Bot ID from auth.test (matches ev.bot_id for self-echo detection) */
+  selfBotId: string
+  /** App ID from auth.test (matches ev.bot_profile.app_id for self-echo in multi-workspace) */
+  selfAppId: string
 }
 
 export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
   const ev = event as Record<string, unknown>
 
-  // 1. Drop bot messages immediately
-  if (ev['bot_id']) return { action: 'drop' }
+  // 1. Bot message handling — self-echo detection + per-channel opt-in
+  if (ev['bot_id']) {
+    // Self-echo: drop if ANY identifier matches our own bot. Covers payload
+    // variants where user is missing, bot_id differs from user, or app posts
+    // via chat.postMessage with as_user=false across workspaces.
+    const botProfile = (ev['bot_profile'] as Record<string, unknown>) || {}
+    const isSelfEcho =
+      (opts.selfBotId && ev['bot_id'] === opts.selfBotId) ||
+      (opts.selfAppId && botProfile['app_id'] === opts.selfAppId) ||
+      (ev['user'] && ev['user'] === opts.botUserId)
+    if (isSelfEcho) return { action: 'drop' }
+
+    // Per-channel opt-in: only deliver if the channel explicitly lists this
+    // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
+    const channel = ev['channel'] as string
+    const policy = opts.access.channels[channel]
+    const botUser = ev['user'] as string | undefined
+    if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
+      return { action: 'drop' }
+    }
+
+    // Belt-and-suspenders: drop peer-bot messages that look like permission
+    // relay replies. The global allowFrom check at server.ts already blocks
+    // peer bots from approving tool calls, but this gate-level check prevents
+    // regression if that guard is ever loosened.
+    const text = ((ev['text'] as string) || '').trim()
+    if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
+
+    // Fall through to normal access-control checks (subtype, allowFrom,
+    // requireMention). The channel policy's allowFrom and requireMention
+    // still apply to bot messages — allowBotIds only gets them past step 1.
+  }
 
   // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
   if (ev['subtype'] && ev['subtype'] !== 'file_share') return { action: 'drop' }
