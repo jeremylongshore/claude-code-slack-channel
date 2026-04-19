@@ -6264,3 +6264,306 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
     expect(elapsed).toBeGreaterThanOrEqual(40) // at least ~50ms of work done
   })
 })
+
+// ---------------------------------------------------------------------------
+// Journal event wiring (ccsc-3fo)
+//
+// These tests exercise the integration points added in the B2 bead:
+//   1. gate.inbound.deliver emitted on allowed inbound messages.
+//   2. gate.inbound.drop emitted when gate returns 'drop'.
+//   3. gate.outbound.deny emitted when assertOutboundAllowed throws.
+//   4. exfil.block emitted when assertSendable throws.
+//   5. session.* events emitted in order by the supervisor (activate →
+//      quiesce → deactivate).
+//   6. A broken journal writer does not crash the message-delivery hot path.
+//
+// Importing server.ts directly would trigger its side-effectful bootstrap.
+// The journal-write glue is therefore inlined here, exactly as activateAndTouch
+// is inlined in the 'Supervisor wiring' suite above. Keep both in sync with
+// server.ts.
+// ---------------------------------------------------------------------------
+
+/** Inlined from server.ts journalWrite — fire-and-forget wrapper that
+ *  swallows write errors so a broken journal never interrupts the hot path. */
+async function journalWriteInline(
+  journal: import('./journal.ts').JournalWriter,
+  input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0],
+  onError?: (err: unknown) => void,
+): Promise<void> {
+  try {
+    await journal.writeEvent(input)
+  } catch (err) {
+    onError?.(err)
+  }
+}
+
+describe('Journal event wiring (ccsc-3fo)', () => {
+  let rawRoot: string
+  let logPath: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'journal-wiring-'))
+    logPath = join(realpathSync.native(rawRoot), 'audit.log')
+  })
+
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  // -------------------------------------------------------------------------
+  // Test 1 — Deliver emits gate.inbound.deliver
+  // -------------------------------------------------------------------------
+  test('gate.inbound.deliver is emitted on an allowed inbound message', async () => {
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const anchor = 'b'.repeat(64)
+    const w = await JournalWriter.open({ path: logPath, initialPrevHash: anchor })
+
+    // Inline the deliver-path journal write from server.ts handleMessage:
+    //   case 'deliver': { journalWrite({ kind: 'gate.inbound.deliver', ... }) }
+    await journalWriteInline(w, {
+      kind: 'gate.inbound.deliver',
+      outcome: 'allow',
+      actor: 'session_owner',
+      sessionKey: { channel: 'C001', thread: '1700000000.000001' },
+      input: { channel: 'C001', user: 'U_ALICE', thread_ts: '1700000000.000001' },
+    })
+
+    await w.close()
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(1)
+
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(1)
+    const ev = JSON.parse(lines[0]!)
+    expect(ev.kind).toBe('gate.inbound.deliver')
+    expect(ev.outcome).toBe('allow')
+    expect(ev.actor).toBe('session_owner')
+    expect(ev.sessionKey).toEqual({ channel: 'C001', thread: '1700000000.000001' })
+  })
+
+  // -------------------------------------------------------------------------
+  // Test 2 — Drop emits gate.inbound.drop
+  // -------------------------------------------------------------------------
+  test('gate.inbound.drop is emitted when gate returns drop', async () => {
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const anchor = 'c'.repeat(64)
+    const w = await JournalWriter.open({ path: logPath, initialPrevHash: anchor })
+
+    // Inline the drop-path journal write from server.ts handleMessage:
+    //   case 'drop': { journalWrite({ kind: 'gate.inbound.drop', ... }); return }
+    await journalWriteInline(w, {
+      kind: 'gate.inbound.drop',
+      outcome: 'drop',
+      actor: 'session_owner',
+      input: { channel: 'C001', user: 'U_BOB' },
+    })
+
+    await w.close()
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(1)
+    const ev = JSON.parse(lines[0]!)
+    expect(ev.kind).toBe('gate.inbound.drop')
+    expect(ev.outcome).toBe('drop')
+    // The drop payload must not contain the message body — only identifiers.
+    expect(ev.input).not.toHaveProperty('text')
+  })
+
+  // -------------------------------------------------------------------------
+  // Test 3 — Outbound deny emits gate.outbound.deny
+  // -------------------------------------------------------------------------
+  test('gate.outbound.deny is emitted when assertOutboundAllowed throws', async () => {
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const anchor = 'd'.repeat(64)
+    const w = await JournalWriter.open({ path: logPath, initialPrevHash: anchor })
+
+    // Inline the tool-handler try/catch from server.ts (e.g. reply case):
+    //   try { assertOutboundAllowed(chatId, threadTs) } catch (err) {
+    //     journalWrite({ kind: 'gate.outbound.deny', ... }); throw err }
+    const deliveredSet = new Set<string>()
+    const access = makeAccess()
+    let thrown: Error | null = null
+    let writeError: unknown = null
+    try {
+      assertOutboundAllowed('C999', undefined, access, deliveredSet)
+    } catch (outboundErr) {
+      thrown = outboundErr instanceof Error ? outboundErr : new Error(String(outboundErr))
+      await journalWriteInline(
+        w,
+        {
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'reply',
+          input: { channel: 'C999' },
+          reason: 'outbound gate blocked: channel not delivered',
+        },
+        (err) => { writeError = err },
+      )
+    }
+
+    await w.close()
+
+    expect(thrown).not.toBeNull()
+    expect(writeError).toBeNull()
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(1)
+    const ev = JSON.parse(lines[0]!)
+    expect(ev.kind).toBe('gate.outbound.deny')
+    expect(ev.outcome).toBe('deny')
+    expect(ev.toolName).toBe('reply')
+    // reason must be present as a string
+    expect(typeof ev.reason).toBe('string')
+  })
+
+  // -------------------------------------------------------------------------
+  // Test 4 — Exfil block emits exfil.block (non-leaky reason)
+  // -------------------------------------------------------------------------
+  test('exfil.block is emitted when assertSendable blocks a state-dir file', async () => {
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const anchor = 'e'.repeat(64)
+    const w = await JournalWriter.open({ path: logPath, initialPrevHash: anchor })
+
+    // Inline the file-upload try/catch from server.ts reply handler:
+    //   try { assertSendable(filePath) } catch (exfilErr) {
+    //     journalWrite({ kind: 'exfil.block', ..., reason: exfilErr.message })
+    //     throw exfilErr }
+    const stateDir = rawRoot
+    const blockedFile = join(stateDir, '.env')
+    writeFileSync(blockedFile, 'SLACK_BOT_TOKEN=xoxb-fake')
+    const inboxDir = join(stateDir, 'inbox')
+    mkdirSync(inboxDir, { recursive: true })
+
+    let thrown: Error | null = null
+    try {
+      assertSendable(blockedFile, inboxDir, [], stateDir)
+    } catch (exfilErr) {
+      thrown = exfilErr instanceof Error ? exfilErr : new Error(String(exfilErr))
+      // IMPORTANT: do NOT include the file path — only a short reason string.
+      await journalWriteInline(w, {
+        kind: 'exfil.block',
+        outcome: 'deny',
+        toolName: 'reply',
+        reason: thrown.message,
+      })
+    }
+
+    await w.close()
+
+    expect(thrown).not.toBeNull()
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(1)
+    const ev = JSON.parse(lines[0]!)
+    expect(ev.kind).toBe('exfil.block')
+    expect(ev.outcome).toBe('deny')
+    // The reason must NOT contain the full file path (leakage risk per brief)
+    expect(ev.reason ?? '').not.toContain(stateDir)
+  })
+
+  // -------------------------------------------------------------------------
+  // Test 5 — Session lifecycle emits session.activate → quiesce → deactivate
+  //           in order, with a valid hash chain
+  // -------------------------------------------------------------------------
+  test('supervisor emits session.activate, session.quiesce, session.deactivate in order', async () => {
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const anchor = 'f'.repeat(64)
+    const w = await JournalWriter.open({ path: logPath, initialPrevHash: anchor })
+
+    const sup = createSessionSupervisor({
+      stateRoot: rawRoot,
+      journal: w,
+      idleMs: 1, // make everything eligible for reaping immediately
+      clock: () => Date.now() - 1000, // back-date so lastActiveAt < threshold
+    })
+
+    const key: SessionKey = { channel: 'C_LIFECYCLE', thread: '1700000001.000001' }
+
+    // 1. activate
+    await activateAndTouch(sup, key, 'U_LIFECYCLE')
+
+    // 2. quiesce (needed before deactivate)
+    await sup.quiesce(key)
+
+    // 3. deactivate
+    await sup.deactivate(key)
+
+    await w.close()
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+
+    const lines = readFileSync(logPath, 'utf8').trim().split('\n')
+    const events = lines.map((l) => JSON.parse(l))
+
+    const kinds = events.map((e: { kind: string }) => e.kind)
+    expect(kinds).toContain('session.activate')
+    expect(kinds).toContain('session.quiesce')
+    expect(kinds).toContain('session.deactivate')
+
+    // Order: activate < quiesce < deactivate
+    const idxActivate = kinds.indexOf('session.activate')
+    const idxQuiesce = kinds.indexOf('session.quiesce')
+    const idxDeactivate = kinds.indexOf('session.deactivate')
+    expect(idxActivate).toBeLessThan(idxQuiesce)
+    expect(idxQuiesce).toBeLessThan(idxDeactivate)
+
+    // seq must be strictly increasing
+    for (let i = 1; i < events.length; i++) {
+      expect(events[i].seq).toBe(events[i - 1].seq + 1)
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // Test 6 — Broken journal writer does not crash the hot path
+  // -------------------------------------------------------------------------
+  test('a broken journal writer does not prevent inbound message delivery or supervisor activation', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const anchor = '9'.repeat(64)
+    const w = await JournalWriter.open({ path: logPath, initialPrevHash: anchor })
+    // Close immediately to put the writer into the "closed" broken state.
+    // writeEvent() on a closed writer rejects (not throws synchronously).
+    await w.close()
+
+    const errors: unknown[] = []
+    const onError = (err: unknown) => errors.push(err)
+
+    // Simulate the deliver path writing an event to a broken journal.
+    // journalWriteInline must not throw even though the writer is closed.
+    await expect(
+      journalWriteInline(
+        w,
+        {
+          kind: 'gate.inbound.deliver',
+          outcome: 'allow',
+          actor: 'session_owner',
+          input: { channel: 'C001', user: 'U_ALICE' },
+        },
+        onError,
+      ),
+    ).resolves.toBeUndefined()
+
+    // The error must have been forwarded to the onError callback,
+    // not swallowed silently (the handler can log it).
+    expect(errors.length).toBeGreaterThan(0)
+
+    // The supervisor with the same broken writer must still activate successfully.
+    const sup = createSessionSupervisor({ stateRoot: rawRoot, journal: w })
+    const key: SessionKey = { channel: 'C_BROKEN', thread: '1700000002.000002' }
+    // activate must succeed — the supervisor's journalWrite swallows errors.
+    await expect(activateAndTouch(sup, key, 'U_BROKEN')).resolves.toBeUndefined()
+
+    // Session file must have been created on disk.
+    const { sessionPath: sPath } = await import('./lib.ts')
+    expect(existsSync(sPath(rawRoot, key))).toBe(true)
+  })
+})
