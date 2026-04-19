@@ -529,9 +529,7 @@ class ConcreteHandle implements SessionHandle {
 
     if (this._state !== 'active') {
       return Promise.reject(
-        new Error(
-          `beginQuiesce: cannot quiesce from state ${JSON.stringify(this._state)}`,
-        ),
+        new Error(`beginQuiesce: cannot quiesce from state '${this._state}'`),
       )
     }
 
@@ -567,7 +565,7 @@ class ConcreteHandle implements SessionHandle {
   beginWork(requestId: string): AbortController {
     if (this.inFlight.has(requestId)) {
       throw new Error(
-        `beginWork: requestId already in flight: ${JSON.stringify(requestId)}`,
+        `beginWork: requestId already in flight: '${requestId}'`,
       )
     }
     const ctrl = new AbortController()

@@ -2706,23 +2706,16 @@ describe('createSessionSupervisor.quiesce', () => {
     const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
     handle.beginWork('req-A')
 
-    // Three parallel quiesce() calls. The first emits the log; the
-    // other two must join the same drain without firing a second log.
+    // Three parallel quiesce() calls. Each call is audit-worthy and
+    // emits a log line on entry; they all join the same underlying
+    // drain promise on the handle so only one real drain runs.
     const [p1, p2, p3] = [sup.quiesce(key), sup.quiesce(key), sup.quiesce(key)]
 
-    // quiesce() returns a fresh resolved promise for the no-log path,
-    // but in the log-emitting path they all point at the same handle
-    // drain. We don't rely on reference equality across the three
-    // promises (Promise.resolve wrappers differ); we rely on behaviour
-    // — exactly one log, and all three resolve together.
     handle.endWork('req-A')
     await Promise.all([p1, p2, p3])
 
+    // One log per quiesce() call (audit), one shared drain (behaviour).
     expect(logged.filter((l) => l.event === 'session.quiesce')).toHaveLength(3)
-    // Three log lines because each supervisor.quiesce() call logs on
-    // entry. The underlying drain is shared; only the log is
-    // per-call. That matches the 'session.quiesce' contract — each
-    // quiesce *request* is audit-worthy even if they coalesce.
   })
 
   test('quiesce called again after drain already completed resolves without changing state', async () => {
