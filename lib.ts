@@ -757,12 +757,16 @@ export function validateSendableRoots(roots: readonly string[]): void {
  * Throws if `filePath` is not safe to hand to the Slack file-upload API.
  *
  * Policy (allowlist + denylist):
- *   1. The path must resolve (via realpath) to a location under at least one
+ *   1. If `stateRoot` is provided, the realpath of the file must NOT be under
+ *      the realpath of the state dir. This fires BEFORE the allowlist check
+ *      so an operator who configures SLACK_SENDABLE_ROOTS upstream of the
+ *      state dir still cannot exfiltrate state files (S1).
+ *   2. The path must resolve (via realpath) to a location under at least one
  *      root in `allowlistRoots`. `inboxDir` is ALWAYS implicitly included so
  *      downloaded attachments can be re-shared.
- *   2. The input path must not contain any `..` component.
- *   3. The basename must not match SENDABLE_BASENAME_DENY.
- *   4. No path component may match SENDABLE_PARENT_DENY_SINGLE, and no
+ *   3. The input path must not contain any `..` component.
+ *   4. The basename must not match SENDABLE_BASENAME_DENY.
+ *   5. No path component may match SENDABLE_PARENT_DENY_SINGLE, and no
  *      adjacent pair may match SENDABLE_PARENT_DENY_PAIRS.
  *
  * Error messages name WHICH check failed (for debugging) but never echo the
@@ -773,12 +777,13 @@ export function assertSendable(
   filePath: string,
   inboxDir: string,
   allowlistRoots: readonly string[] = [],
+  stateRoot?: string,
 ): void {
   if (typeof filePath !== 'string' || filePath.length === 0) {
     throw new Error('Blocked: file path is empty or not a string')
   }
 
-  // (2) Reject `..` BEFORE resolving — we never want to accept a path that
+  // (3) Reject `..` BEFORE resolving — we never want to accept a path that
   // the caller expressed with a traversal component, even if realpath would
   // flatten it. `resolve` collapses `..` so this must be checked on raw input.
   const rawParts = filePath.split(/[\\/]+/)
@@ -788,7 +793,7 @@ export function assertSendable(
     }
   }
 
-  // (1) Resolve via realpath to follow symlinks. If the path does not exist,
+  // (2) Resolve via realpath to follow symlinks. If the path does not exist,
   // we reject outright — there is nothing to upload anyway, and silently
   // falling back to lexical resolution would weaken the symlink check.
   let real: string
@@ -798,6 +803,9 @@ export function assertSendable(
     throw new Error('Blocked: file does not exist or is not accessible')
   }
 
+  // Resolve the inbox once — used by both the state-dir denylist (to carve
+  // the inbox out of the state-root block) and the allowlist-roots check
+  // below.
   const inboxReal = (() => {
     try {
       return realpathSync(resolve(inboxDir))
@@ -805,6 +813,28 @@ export function assertSendable(
       return resolve(inboxDir)
     }
   })()
+
+  // (1) State-dir denylist (S1). Production callers thread STATE_DIR through
+  // from `server.ts`. This check runs BEFORE the allowlist so a state-dir
+  // path that also happens to live under SLACK_SENDABLE_ROOTS is still
+  // rejected. The inbox lives under the state dir, so we only enforce this
+  // guard for files that are NOT under the inbox (which is an explicitly
+  // sendable subdirectory).
+  if (stateRoot !== undefined && stateRoot.length > 0) {
+    const stateRootReal = (() => {
+      try {
+        return realpathSync(resolve(stateRoot))
+      } catch {
+        return resolve(stateRoot)
+      }
+    })()
+    if (
+      isUnderRoot(real, stateRootReal) &&
+      !isUnderRoot(real, inboxReal)
+    ) {
+      throw new Error('Blocked: file path is under the state directory')
+    }
+  }
 
   const roots: string[] = [inboxReal, ...allowlistRoots.map((r) => {
     try { return realpathSync(resolve(r)) } catch { return resolve(r) }
@@ -821,7 +851,7 @@ export function assertSendable(
     throw new Error('Blocked: file path is not under any allowlisted root')
   }
 
-  // (3) Basename denylist — evaluated on the real path's basename.
+  // (4) Basename denylist — evaluated on the real path's basename.
   const base = basename(real)
   for (const re of SENDABLE_BASENAME_DENY) {
     if (re.test(base)) {
@@ -829,7 +859,7 @@ export function assertSendable(
     }
   }
 
-  // (4) Parent-component denylist — evaluated on the real path.
+  // (5) Parent-component denylist — evaluated on the real path.
   const components = real.split(sep).filter((c) => c.length > 0)
   for (const comp of components) {
     if (SENDABLE_PARENT_DENY_SINGLE.has(comp)) {
