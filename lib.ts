@@ -347,6 +347,110 @@ export const LIST_SESSIONS_MAX = 1000
  *      root so a symlink inside `sessions/` cannot surface a file
  *      from elsewhere on disk.
  */
+/** Read and validate one thread file, returning its summary or null
+ *  if the file is missing, unparseable, outside the state root, or
+ *  missing load-bearing fields. Log-and-skip on parse error so a
+ *  single corrupt file can't poison the enumeration. */
+function readThreadSummary(
+  channel: string,
+  entry: string,
+  resolvedChannelDir: string,
+  resolvedRoot: string,
+): SessionSummary | null {
+  if (!entry.endsWith('.json')) return null
+  if (entry.startsWith('.')) return null
+
+  const threadFile = join(resolvedChannelDir, entry)
+  let resolvedThreadFile: string
+  try {
+    resolvedThreadFile = realpathSync.native(threadFile)
+  } catch {
+    return null
+  }
+  if (!isUnderRoot(resolvedThreadFile, resolvedRoot)) return null
+
+  let raw: string
+  try {
+    raw = readFileSync(resolvedThreadFile, 'utf8')
+  } catch {
+    return null
+  }
+
+  let parsed: Partial<Session>
+  try {
+    parsed = JSON.parse(raw) as Partial<Session>
+  } catch (err) {
+    process.stderr.write(
+      `[listSessions] skipping unparseable file ${threadFile}: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    )
+    return null
+  }
+
+  if (
+    typeof parsed.createdAt !== 'number' ||
+    typeof parsed.lastActiveAt !== 'number' ||
+    typeof parsed.ownerId !== 'string'
+  ) {
+    return null
+  }
+
+  return {
+    channel,
+    thread: entry.slice(0, -'.json'.length),
+    createdAt: parsed.createdAt,
+    lastActiveAt: parsed.lastActiveAt,
+    ownerId: parsed.ownerId,
+  }
+}
+
+/** Enumerate all thread files under one channel directory, appending
+ *  valid summaries to `out`. Returns when `out` hits the cap so the
+ *  outer loop stops too. */
+function collectChannelSummaries(
+  channel: string,
+  resolvedSessionsDir: string,
+  resolvedRoot: string,
+  out: SessionSummary[],
+): void {
+  const channelDir = join(resolvedSessionsDir, channel)
+  let chanStat: ReturnType<typeof statSync>
+  try {
+    chanStat = statSync(channelDir)
+  } catch {
+    return
+  }
+  if (!chanStat.isDirectory()) return
+
+  let resolvedChannelDir: string
+  try {
+    resolvedChannelDir = realpathSync.native(channelDir)
+  } catch {
+    return
+  }
+  if (!isUnderRoot(resolvedChannelDir, resolvedRoot)) return
+
+  let threadEntries: string[]
+  try {
+    threadEntries = readdirSync(resolvedChannelDir)
+  } catch {
+    return
+  }
+
+  for (const entry of threadEntries) {
+    const summary = readThreadSummary(
+      channel,
+      entry,
+      resolvedChannelDir,
+      resolvedRoot,
+    )
+    if (summary === null) continue
+    out.push(summary)
+    if (out.length >= LIST_SESSIONS_MAX) return
+  }
+}
+
 export function listSessions(stateRoot: string): SessionSummary[] {
   const resolvedRoot = realpathSync.native(resolve(stateRoot))
   const sessionsDir = join(resolvedRoot, 'sessions')
@@ -364,90 +468,12 @@ export function listSessions(stateRoot: string): SessionSummary[] {
 
   const out: SessionSummary[] = []
 
-  const channelEntries = readdirSync(resolvedSessionsDir)
-  for (const channel of channelEntries) {
-    // Skip the migration sentinel and anything that isn't a directory
+  for (const channel of readdirSync(resolvedSessionsDir)) {
+    // Skip the migration sentinel and any other top-level dotfile
     // (pre-0.5.0 flat files should have been migrated by now; if one
     // lingers, it's ignored — the list is best-effort introspection).
     if (channel.startsWith('.')) continue
-    const channelDir = join(resolvedSessionsDir, channel)
-    let chanStat: ReturnType<typeof statSync>
-    try {
-      chanStat = statSync(channelDir)
-    } catch {
-      continue
-    }
-    if (!chanStat.isDirectory()) continue
-
-    let resolvedChannelDir: string
-    try {
-      resolvedChannelDir = realpathSync.native(channelDir)
-    } catch {
-      continue
-    }
-    if (!isUnderRoot(resolvedChannelDir, resolvedRoot)) continue
-
-    let threadEntries: string[]
-    try {
-      threadEntries = readdirSync(resolvedChannelDir)
-    } catch {
-      continue
-    }
-
-    for (const entry of threadEntries) {
-      if (!entry.endsWith('.json')) continue
-      if (entry.startsWith('.')) continue
-      const threadFile = join(resolvedChannelDir, entry)
-
-      let resolvedThreadFile: string
-      try {
-        resolvedThreadFile = realpathSync.native(threadFile)
-      } catch {
-        continue
-      }
-      if (!isUnderRoot(resolvedThreadFile, resolvedRoot)) continue
-
-      let raw: string
-      try {
-        raw = readFileSync(resolvedThreadFile, 'utf8')
-      } catch {
-        continue
-      }
-
-      let parsed: Partial<Session>
-      try {
-        parsed = JSON.parse(raw) as Partial<Session>
-      } catch (err) {
-        // Log and skip — one malformed file doesn't poison the list.
-        process.stderr.write(
-          `[listSessions] skipping unparseable file ${threadFile}: ${
-            err instanceof Error ? err.message : String(err)
-          }\n`,
-        )
-        continue
-      }
-
-      // Defensive: require the load-bearing fields before surfacing
-      // the row. A file with partial shape is the forensic concern
-      // of loadSession(); here it just gets skipped.
-      if (
-        typeof parsed.createdAt !== 'number' ||
-        typeof parsed.lastActiveAt !== 'number' ||
-        typeof parsed.ownerId !== 'string'
-      ) {
-        continue
-      }
-
-      out.push({
-        channel,
-        thread: entry.slice(0, -'.json'.length),
-        createdAt: parsed.createdAt,
-        lastActiveAt: parsed.lastActiveAt,
-        ownerId: parsed.ownerId,
-      })
-
-      if (out.length >= LIST_SESSIONS_MAX) break
-    }
+    collectChannelSummaries(channel, resolvedSessionsDir, resolvedRoot, out)
     if (out.length >= LIST_SESSIONS_MAX) break
   }
 

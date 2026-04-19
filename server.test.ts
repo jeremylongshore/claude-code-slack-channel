@@ -1738,8 +1738,6 @@ describe('listSessions', () => {
     const { listSessions } = await import('./lib.ts')
     const outside = mkdtempSync(join(tmpdir(), 'list-sessions-out-'))
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { symlinkSync } = require('fs') as typeof import('fs')
       symlinkSync(outside, join(tmpRoot, 'sessions'), 'dir')
 
       expect(() => listSessions(tmpRoot)).toThrow(
