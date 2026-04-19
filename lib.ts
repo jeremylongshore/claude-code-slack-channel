@@ -8,8 +8,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { resolve, sep, basename } from 'path'
-import { realpathSync } from 'fs'
+import { resolve, sep, basename, join } from 'path'
+import { realpathSync, mkdirSync } from 'fs'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -123,22 +123,89 @@ export interface Session {
   data: Record<string, unknown>
 }
 
+/** Component validator for session path segments.
+ *
+ *  The design doc (000-docs/session-state-machine.md §59-62) specifies
+ *  `/^[A-Za-z0-9._-]+$/`. That regex is necessary but not sufficient:
+ *  the literal strings `.` and `..` both match it, yet `..` as a
+ *  component would escape the `sessions/` layer via `path.join` even
+ *  though the result stays under the state root (so realpath
+ *  containment wouldn't catch it). We reject bare `.` and `..`
+ *  separately below. Multi-dot strings like `...` are real filenames
+ *  and stay allowed — `path.join` treats them as literals. */
+const SESSION_COMPONENT_RE = /^[A-Za-z0-9._-]+$/
+
+function isValidSessionComponent(component: string): boolean {
+  if (component === '.' || component === '..') return false
+  return SESSION_COMPONENT_RE.test(component)
+}
+
 /** Construct the on-disk path for a session file.
  *
- *  Contract per 000-docs/session-state-machine.md §47-68:
+ *  Contract (000-docs/session-state-machine.md §47-68):
  *    <root>/sessions/<channel>/<thread>.json
  *
- *  Implementation lands in ccsc-z78.4 with three safety rules:
- *    1. Validate every component against /^[A-Za-z0-9._-]+$/.
- *    2. Resolve parent via fs.realpathSync.native and verify the state
- *       root is still a prefix (CWE-22 symlink smuggling).
- *    3. Create sessions/<channel>/ with mode 0o700 on first use.
+ *  Three safety rules — all enforced before the path is returned:
  *
- *  Stub until then so the boundary type is exported and ccsc-z78.3's
- *  failing spec test has a symbol to reference.
+ *  1. **Component validation.** Both `key.channel` and `key.thread` must
+ *     match `SESSION_COMPONENT_RE`. This rejects `..`, `/`, `\`, NUL, and
+ *     the empty string — every shape that could climb out of the
+ *     per-channel directory or smuggle separators through `path.join`.
+ *
+ *  2. **Realpath containment (CWE-22).** The per-channel directory is
+ *     resolved via `realpathSync.native` after creation and checked
+ *     against the state root via `isUnderRoot`. An attacker who races a
+ *     symlink at `sessions/<channel>/` pointing outside the root is
+ *     rejected here — the returned path is guaranteed to sit under the
+ *     canonical root, not a symlink target.
+ *
+ *  3. **Directory mode.** `sessions/<channel>/` is created with mode
+ *     `0o700` on first use. Subsequent calls are idempotent and do NOT
+ *     re-apply the mode — operator-visible mode drift is a separate
+ *     state-dir-integrity concern, not a `sessionPath()` problem.
+ *
+ *  Rules 2 and 3 are one security primitive: the mkdir exists to let
+ *  realpath resolve the parent. Splitting them would allow a caller to
+ *  skip the mkdir and defeat the symlink check.
+ *
+ *  Called by the session supervisor (Epic 32-B) and the atomic writer
+ *  (`ccsc-z78.5`). Not called by event-path code directly.
  */
-export function sessionPath(_root: string, _key: SessionKey): string {
-  throw new Error('sessionPath not implemented (ccsc-z78.4)')
+export function sessionPath(root: string, key: SessionKey): string {
+  if (!isValidSessionComponent(key.channel)) {
+    throw new Error(
+      `sessionPath: invalid channel component: ${JSON.stringify(key.channel)}`,
+    )
+  }
+  if (!isValidSessionComponent(key.thread)) {
+    throw new Error(
+      `sessionPath: invalid thread component: ${JSON.stringify(key.thread)}`,
+    )
+  }
+
+  // Canonicalize the state root. Throws ENOENT if the caller did not
+  // pre-create it — matches server.ts bootstrap which mkdirs STATE_DIR
+  // before any session activity.
+  const resolvedRoot = realpathSync.native(resolve(root))
+
+  // Rule 3: create sessions/<channel>/ at 0o700. mkdirSync(recursive)
+  // is idempotent; the mode applies only to newly created dirs, which
+  // is the doc's "on first use" semantic.
+  const channelDir = join(resolvedRoot, 'sessions', key.channel)
+  mkdirSync(channelDir, { recursive: true, mode: 0o700 })
+
+  // Rule 2: realpath the (now-extant) per-channel dir and assert the
+  // state root is still a prefix. Catches symlink-based escape.
+  const resolvedChannelDir = realpathSync.native(channelDir)
+  if (!isUnderRoot(resolvedChannelDir, resolvedRoot)) {
+    throw new Error(
+      `sessionPath: resolved channel dir escapes state root (channel=${JSON.stringify(
+        key.channel,
+      )})`,
+    )
+  }
+
+  return join(resolvedChannelDir, `${key.thread}.json`)
 }
 
 // ---------------------------------------------------------------------------

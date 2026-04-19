@@ -58,13 +58,21 @@ function sessionPath(root: string, key: SessionKey): string
 
 `sessionPath()` constructs the path with three safety rules:
 
-1. Every component is validated against `/^[A-Za-z0-9._-]+$/` — Slack IDs
-   and `ts` strings satisfy this; anything else is rejected before joining.
+1. Every component is validated against `/^[A-Za-z0-9._-]+$/` **and**
+   must not be the literal strings `.` or `..` — Slack IDs and `ts`
+   strings satisfy this; anything else is rejected before joining. The
+   regex alone admits `.` and `..`, both of which would escape the
+   `sessions/` layer via `path.join` while still resolving inside the
+   state root (so realpath containment would not catch them). Multi-dot
+   strings like `...` stay allowed — `path.join` treats them as
+   literals, not traversal operators.
 2. The final joined path is resolved with `fs.realpathSync.native` on its
    parent directory, and the result must still have the state root as a
    prefix. This catches symlink smuggling (CWE-22).
 3. The parent `sessions/<channel>/` directory is created with mode `0o700`
-   on first use.
+   on first use. Rules 2 and 3 are one primitive: the `mkdir` is what
+   makes the `realpath` in Rule 2 resolvable. Splitting them would let a
+   caller skip the `mkdir` and defeat the symlink check.
 
 All files are written with mode `0o600`.
 
