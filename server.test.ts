@@ -3912,3 +3912,227 @@ describe('resolveJournalPath', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// verifyJournal — ccsc-5pi.10 + happy-path E2E from ccsc-5pi.8
+// ---------------------------------------------------------------------------
+
+describe('verifyJournal', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logPath: string
+  const fixedNow = new Date('2026-04-19T12:34:56.789Z')
+  const stableAnchor = 'a'.repeat(64)
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'journal-verify-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logPath = join(tmpRoot, 'audit.log')
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  async function writeN(count: number, kind = 'session.activate' as const) {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      for (let i = 0; i < count; i++) {
+        await w.writeEvent({
+          kind,
+          correlationId: `req-${i}`,
+        })
+      }
+    } finally {
+      await w.close()
+    }
+  }
+
+  test('ok over a clean 1000-event chain (end-to-end, ccsc-5pi.8)', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(1000)
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.eventsVerified).toBe(1000)
+    }
+  })
+
+  test('ok over a small clean chain (3 events)', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3)
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(3)
+  })
+
+  test('detects a body edit: flipping a byte in entry 42 breaks its hash', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(100)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    const target = lines[41]! // 0-indexed → seq 42 since writer starts at seq 1
+    const tampered = target.replace('"req-41"', '"req-ZZ"')
+    lines[41] = tampered
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.eventsVerified).toBe(41) // 41 events verified before break
+      expect(result.break.lineNumber).toBe(42)
+      expect(result.break.seq).toBe(42)
+      expect(result.break.reason).toMatch(/hash mismatch/)
+      expect(result.break.expected).not.toBe(result.break.actual)
+    }
+  })
+
+  test('detects a hash-field edit: flipping one char of stored hash breaks verification', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(10)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    // Parse entry 5, swap one hex char in its `hash`, re-serialize.
+    const parsed = JSON.parse(lines[4]!) as Record<string, unknown>
+    const badHash = (parsed.hash as string).replace(/^./, (c) =>
+      c === 'a' ? 'b' : 'a',
+    )
+    parsed.hash = badHash
+    lines[4] = JSON.stringify(parsed)
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(5)
+      expect(result.break.reason).toMatch(/hash mismatch/)
+    }
+  })
+
+  test('detects a prevHash edit: breaks the chain at the next event', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(5)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    // Swap prevHash of entry 3. Entry 3 itself will fail hash-mismatch
+    // first (recomputed hash includes prevHash in the preimage), so
+    // the verifier reports a break at entry 3, not 4.
+    const parsed = JSON.parse(lines[2]!) as Record<string, unknown>
+    parsed.prevHash = 'd'.repeat(64)
+    lines[2] = JSON.stringify(parsed)
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(3)
+      // Either hash mismatch (since hash depends on prevHash) or
+      // prevHash mismatch — both are tamper signals.
+      expect(result.break.reason).toMatch(/hash mismatch|prevHash mismatch/)
+    }
+  })
+
+  test('detects a reorder: swapping two lines breaks prevHash continuity', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(5)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    // Swap lines 2 and 3.
+    ;[lines[1], lines[2]] = [lines[2]!, lines[1]!]
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      // First out-of-order line is line 2 (the swapped-in seq=3).
+      expect(result.break.lineNumber).toBe(2)
+    }
+  })
+
+  test('detects seq gap: deleting a middle line breaks monotonicity', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(5)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    // Remove seq=3 entry. The next line has seq=4 but prevHash
+    // points to seq=3's hash, which no longer chains from seq=2.
+    lines.splice(2, 1)
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      // Break surfaces at line 3 (formerly the seq=4 entry) via
+      // prevHash mismatch — hash of the removed seq=3 is what seq=4
+      // expected.
+      expect(result.break.lineNumber).toBe(3)
+    }
+  })
+
+  test('parse error: invalid JSON on a middle line is reported with line number', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    lines[1] = 'NOT VALID JSON AT ALL'
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(2)
+      expect(result.break.reason).toMatch(/parse\/schema error/)
+      expect(result.break.seq).toBeNull()
+    }
+  })
+
+  test('schema rejection: unknown EventKind surfaces as parse/schema error', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(2)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    const parsed = JSON.parse(lines[0]!) as Record<string, unknown>
+    parsed.kind = 'not.a.real.kind'
+    lines[0] = JSON.stringify(parsed)
+    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/parse\/schema error/)
+    }
+  })
+
+  test('tolerates the writer-produced trailing newline', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3)
+    // Writer emits `JSON + "\n"` per event, so the file ends with a
+    // trailing newline that split('\n') turns into an empty string.
+    // The verifier must not flag that tail as structural damage.
+    const content = readFileSync(logPath, 'utf8')
+    expect(content.endsWith('\n')).toBe(true)
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+  })
+
+  test('empty file is vacuously ok (0 events verified)', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    writeFileSync(logPath, '', { mode: 0o600 })
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(0)
+  })
+
+  test('missing file: reports a read error, not a crash', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    const result = await verifyJournal(join(tmpRoot, 'does-not-exist.log'))
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/read failed/)
+    }
+  })
+})

@@ -37,7 +37,7 @@
 
 import { z } from 'zod'
 import { createHash, randomBytes } from 'crypto'
-import { open as fsOpen, type FileHandle } from 'fs/promises'
+import { open as fsOpen, readFile, type FileHandle } from 'fs/promises'
 import { existsSync, readFileSync } from 'fs'
 import type { SessionKey } from './lib'
 
@@ -845,4 +845,190 @@ export function truncateEventFields(
     out.input = truncate(input.input, max) as Record<string, unknown>
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// Verifier — Schneier-Kelsey chain integrity check (ccsc-5pi.10)
+// ---------------------------------------------------------------------------
+
+/** Shape of a verification failure. All fields aside from `reason`
+ *  are best-effort — a parse error on the first line, for example,
+ *  has no `seq` or `ts` to surface. The operator reads `reason` for
+ *  the human explanation and uses `lineNumber` to locate the
+ *  offending entry. */
+export interface VerifyBreak {
+  /** 1-indexed line number where the break was detected. The first
+   *  real JSON line is line 1. */
+  lineNumber: number
+  /** Parsed `seq` of the offending event if it passed schema
+   *  validation, else null. */
+  seq: number | null
+  /** Parsed `ts` of the offending event if it passed schema
+   *  validation, else null. */
+  ts: string | null
+  /** One-line human summary: `"hash mismatch"`, `"version skew"`,
+   *  `"seq gap"`, `"prevHash mismatch"`, `"parse error: ..."`, etc. */
+  reason: string
+  /** Expected hash (or prevHash) when applicable. */
+  expected?: string
+  /** Actual hash (or prevHash) when applicable. */
+  actual?: string
+}
+
+/** Result of a full-file verification pass. `eventsVerified` counts
+ *  events that matched expectations strictly before a break — useful
+ *  for a truncation-tolerance story in follow-up tooling. */
+export type VerifyResult =
+  | { ok: true; eventsVerified: number }
+  | { ok: false; eventsVerified: number; break: VerifyBreak }
+
+/** Verify a journal file end-to-end per audit-journal-architecture.md
+ *  §237-261. Reads the file line-by-line, schema-validates each
+ *  record, and recomputes `sha256(prevHash || canonicalJson(event
+ *  sans hash))` for every event. Any mismatch is reported as a
+ *  `VerifyBreak`.
+ *
+ *  Invariants checked (in line order):
+ *    - Schema v1 and the full strict `JournalEvent` shape.
+ *    - `hash` matches the recomputed value bit-for-bit.
+ *    - `prevHash` matches the previous accepted event's `hash`
+ *      (first event's `prevHash` is trusted as the genesis value —
+ *      that's the `TRUSTED_ANCHOR` contract from §76-85; validating
+ *      the anchor is a caller concern for now).
+ *    - `seq` is strictly monotonic by +1 with no gaps.
+ *
+ *  The function never modifies the file (read-only contract).
+ *  Returns on the first break; a second broken event after a fixed
+ *  first break is outside the verify-and-report-one-location
+ *  semantic the doc describes. */
+export async function verifyJournal(path: string): Promise<VerifyResult> {
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (err) {
+    return {
+      ok: false,
+      eventsVerified: 0,
+      break: {
+        lineNumber: 0,
+        seq: null,
+        ts: null,
+        reason: `read failed: ${err instanceof Error ? err.message : String(err)}`,
+      },
+    }
+  }
+
+  const lines = raw.split('\n')
+  let prevAcceptedHash: string | null = null
+  let prevAcceptedSeq: number | null = null
+  let eventsVerified = 0
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!
+    // Tolerate a trailing empty line (from the writer's final
+    // newline). Empty lines mid-file would indicate structural
+    // damage; those are flagged.
+    if (line.length === 0) {
+      if (i === lines.length - 1) continue
+      return {
+        ok: false,
+        eventsVerified,
+        break: {
+          lineNumber: i + 1,
+          seq: prevAcceptedSeq,
+          ts: null,
+          reason: 'empty line in middle of journal (structural damage)',
+        },
+      }
+    }
+
+    const lineNumber = i + 1
+
+    let event: JournalEvent
+    try {
+      event = JournalEvent.parse(JSON.parse(line))
+    } catch (err) {
+      return {
+        ok: false,
+        eventsVerified,
+        break: {
+          lineNumber,
+          seq: null,
+          ts: null,
+          reason: `parse/schema error: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        },
+      }
+    }
+
+    if (event.v !== 1) {
+      return {
+        ok: false,
+        eventsVerified,
+        break: {
+          lineNumber,
+          seq: event.seq,
+          ts: event.ts,
+          reason: `version skew: expected 1, got ${String(event.v)}`,
+        },
+      }
+    }
+
+    if (prevAcceptedHash !== null && event.prevHash !== prevAcceptedHash) {
+      return {
+        ok: false,
+        eventsVerified,
+        break: {
+          lineNumber,
+          seq: event.seq,
+          ts: event.ts,
+          reason: 'prevHash mismatch — chain break',
+          expected: prevAcceptedHash,
+          actual: event.prevHash,
+        },
+      }
+    }
+
+    if (prevAcceptedSeq !== null && event.seq !== prevAcceptedSeq + 1) {
+      return {
+        ok: false,
+        eventsVerified,
+        break: {
+          lineNumber,
+          seq: event.seq,
+          ts: event.ts,
+          reason: `seq gap — expected ${prevAcceptedSeq + 1}, got ${event.seq}`,
+          expected: String(prevAcceptedSeq + 1),
+          actual: String(event.seq),
+        },
+      }
+    }
+
+    // Recompute the hash. This is the primary tamper check: any edit
+    // to the event body (kind, input, reason, anything) will change
+    // the canonical serialization and so the computed hash.
+    const { hash: stored, ...rest } = event
+    const recomputed = sha256Hex(event.prevHash + canonicalJson(rest))
+    if (recomputed !== stored) {
+      return {
+        ok: false,
+        eventsVerified,
+        break: {
+          lineNumber,
+          seq: event.seq,
+          ts: event.ts,
+          reason: 'hash mismatch — event body or prevHash was tampered',
+          expected: recomputed,
+          actual: stored,
+        },
+      }
+    }
+
+    prevAcceptedHash = event.hash
+    prevAcceptedSeq = event.seq
+    eventsVerified += 1
+  }
+
+  return { ok: true, eventsVerified }
 }
