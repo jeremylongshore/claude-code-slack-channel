@@ -3980,6 +3980,136 @@ describe('JournalWriter', () => {
       await w.close()
     }
   })
+
+  // -------------------------------------------------------------------------
+  // S2 + S3 regression tests (ccsc-z09)
+  // -------------------------------------------------------------------------
+
+  test('S2: queue-after-broken — second enqueued call rejects with broken-state error', async () => {
+    // Two calls fired concurrently. The first will hit a broken file
+    // descriptor (closed before writing). The second is already in the
+    // queue. After the first fails and sets this.broken, the second
+    // must NOT succeed — it must also reject with the "JournalWriter is
+    // broken" message, not silently write a valid event.
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+
+    // Force-close the underlying file handle without going through
+    // w.close() so the writer's fh is left non-null but the fd is dead.
+    // writeEvent still enqueues normally; the fh.write() inside _doWrite
+    // will throw, setting this.broken.
+    const fhAny = (w as unknown as Record<string, unknown>).fh as {
+      close: () => Promise<void>
+    }
+    await fhAny.close()
+
+    // Fire two writes without awaiting between them so both land in the
+    // queue before the first one resolves. Use allSettled so neither
+    // rejection is "unhandled" while the other is being awaited.
+    const [r1, r2] = await Promise.allSettled([
+      w.writeEvent(sysBoot),
+      w.writeEvent({ kind: 'session.activate' }),
+    ])
+
+    // First write must fail (dead fd).
+    expect(r1.status).toBe('rejected')
+
+    // Second write, draining after the first has set this.broken, must
+    // also reject specifically with the broken-state message — not
+    // succeed, and not throw a raw I/O error.
+    expect(r2.status).toBe('rejected')
+    if (r2.status === 'rejected') {
+      expect(String(r2.reason)).toMatch(/JournalWriter is broken/)
+    }
+  })
+
+  test('S3: ZodError is retryable — bad input does not mark writer broken', async () => {
+    // A caller supplying an invalid event kind gets a ZodError.
+    // That is a caller mistake, not a write-layer failure. The writer
+    // must NOT set this.broken; a subsequent valid writeEvent must
+    // succeed and headHash must not change after the bad call.
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      const hashBefore = w.headHash
+
+      // Bad input — invalid kind is rejected by the pre-hash schema check.
+      await expect(
+        w.writeEvent({ kind: 'bad.kind.that.does.not.exist' as never }),
+      ).rejects.toThrow()
+
+      // headHash must be unchanged — the bad call must not have advanced
+      // the hash chain.
+      expect(w.headHash).toBe(hashBefore)
+
+      // Writer is NOT broken — the next valid call must succeed.
+      const ev = await w.writeEvent(sysBoot)
+      expect(ev.seq).toBe(1)
+      expect(ev.prevHash).toBe(stableAnchor)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('S3: ZodError does not advance nextSequenceNumber', async () => {
+    // seq must not increment when the caller supplies bad input.
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      expect(w.nextSequenceNumber).toBe(1)
+
+      await expect(
+        w.writeEvent({ kind: 'not.valid' as never }),
+      ).rejects.toThrow()
+
+      // Seq must still be 1 — the bad call must not have consumed a
+      // sequence number before failing.
+      expect(w.nextSequenceNumber).toBe(1)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('S2: fs.write error marks broken — next writeEvent rejects with broken-state error', async () => {
+    // A genuine I/O failure (write syscall throws) must flip this.broken.
+    // All subsequent writeEvent calls — whether already queued or new —
+    // must reject with the "JournalWriter is broken" message.
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+
+    // Sabotage the fd so the first write throws an I/O error.
+    const fhAny = (w as unknown as Record<string, unknown>).fh as {
+      close: () => Promise<void>
+    }
+    await fhAny.close()
+
+    // First write — hits the dead fd, sets this.broken.
+    await expect(w.writeEvent(sysBoot)).rejects.toThrow()
+
+    // A second call, arriving after the first has already marked broken,
+    // must also reject with the broken-state message (not a different
+    // error), confirming the enqueue-time guard works for new calls
+    // after a failure.
+    await expect(
+      w.writeEvent({ kind: 'session.activate' }),
+    ).rejects.toThrow(/JournalWriter is broken/)
+  })
 })
 
 // ---------------------------------------------------------------------------

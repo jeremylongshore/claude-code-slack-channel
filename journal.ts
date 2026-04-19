@@ -458,9 +458,40 @@ export class JournalWriter {
   }
 
   private async _doWrite(input: WriteInput): Promise<JournalEvent> {
+    // S2: guard broken state at the top of _doWrite so calls that were
+    // already enqueued before the break are also rejected. The enqueue-time
+    // check in writeEvent() catches fresh calls; this check catches calls
+    // that raced in before broken was set and are now draining the queue.
+    if (this.broken) {
+      throw new Error(
+        `JournalWriter is broken after a prior write failure: ${this.broken.message}`,
+      )
+    }
     if (this.fh === null) {
       throw new Error('JournalWriter._doWrite: writer closed mid-queue')
     }
+
+    // S3: validate caller-supplied fields BEFORE redaction/truncation and
+    // BEFORE hash computation. A ZodError on bad input must propagate
+    // without advancing seq/lastHash and without touching this.broken —
+    // bad input is a caller bug, not a writer failure; the writer remains
+    // usable for the next call. Ordering invariant: validate → redact →
+    // truncate → build partial → hash → post-hash sanity parse → write.
+    //
+    // We validate only the caller-supplied fields (WriteInput) here.
+    // The writer-assigned framing fields (v, ts, seq, prevHash, hash) are
+    // not yet available, so we cannot parse the full JournalEvent shape.
+    // The post-hash JournalEvent.parse below remains as a cheap sanity
+    // check that the writer assembled the full event correctly.
+    const WriteInputShape = JournalEvent.omit({
+      v: true,
+      ts: true,
+      seq: true,
+      prevHash: true,
+      hash: true,
+    })
+    WriteInputShape.parse(input)
+
     // Redact token-shaped values BEFORE hashing so the on-disk bytes,
     // the hash chain, and the journal the operator inspects all agree.
     // Surgical per audit-journal-architecture.md §183-184: only `input`
@@ -487,9 +518,10 @@ export class JournalWriter {
     const hash = sha256Hex(this.lastHash + canonicalJson(partial))
     const event: JournalEvent = { ...partial, hash }
 
-    // Validate through the schema at the boundary. Catches caller-
-    // supplied fields that violate the strict schema (unknown keys,
-    // malformed types) before they land on disk and desync the chain.
+    // Post-hash sanity check: the full assembled event must pass the strict
+    // JournalEvent schema. This is a belt-and-suspenders check after the
+    // pre-hash WriteInput validation above — it catches writer-side bugs
+    // (e.g. a framing field assembled incorrectly) rather than caller bugs.
     JournalEvent.parse(event)
 
     const line = JSON.stringify(event) + '\n'
