@@ -312,6 +312,66 @@ const mcp = new Server(
 // Tools — definition
 // ---------------------------------------------------------------------------
 
+// Per-tool Zod input schemas. Co-located with the tools list so the
+// JSON Schema (what the MCP client sees) and the runtime validator
+// stay visibly in sync. `.strict()` rejects unknown keys so a malformed
+// or crafted tool call cannot smuggle in extra fields. Each schema
+// mirrors the corresponding `inputSchema` below — required/optional
+// fields must match so a previously-accepted call still works.
+const ReplyInput = z
+  .object({
+    chat_id: z.string().min(1),
+    text: z.string().min(1),
+    thread_ts: z.string().optional(),
+    files: z.array(z.string()).optional(),
+  })
+  .strict()
+
+const ReactInput = z
+  .object({
+    chat_id: z.string().min(1),
+    message_id: z.string().min(1),
+    emoji: z.string().min(1),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
+const EditMessageInput = z
+  .object({
+    chat_id: z.string().min(1),
+    message_id: z.string().min(1),
+    text: z.string().min(1),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
+const FetchMessagesInput = z
+  .object({
+    channel: z.string().min(1),
+    limit: z.number().int().positive().optional(),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
+const DownloadAttachmentInput = z
+  .object({
+    chat_id: z.string().min(1),
+    message_id: z.string().min(1),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
+const ListSessionsInput = z.object({}).strict()
+
+export const toolSchemas = {
+  reply: ReplyInput,
+  react: ReactInput,
+  edit_message: EditMessageInput,
+  fetch_messages: FetchMessagesInput,
+  download_attachment: DownloadAttachmentInput,
+  list_sessions: ListSessionsInput,
+} as const
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -419,7 +479,37 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params
-  const args = (request.params.arguments || {}) as Record<string, any>
+  let args = (request.params.arguments || {}) as Record<string, any>
+
+  // Defense-in-depth: validate tool inputs with per-tool Zod schemas
+  // before dispatch. Without this, a malformed tool call (wrong type,
+  // missing required field, extra field) reaches the tool body and
+  // e.g. `assertOutboundAllowed(undefined, ...)` / Slack API calls
+  // with undefined values. `safeParse` returns a structured error
+  // (isError: true) rather than throwing so the MCP client sees a
+  // proper error result. The error message intentionally surfaces
+  // only Zod's path+type text, never argument values, since a
+  // malformed call could carry a token-shaped string.
+  const schema = toolSchemas[name as keyof typeof toolSchemas]
+  if (schema) {
+    const result = schema.safeParse(args)
+    if (!result.success) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Invalid arguments for tool "${name}": ${result.error.message}`,
+          },
+        ],
+        isError: true,
+      }
+    }
+    args = result.data as Record<string, any>
+  } else {
+    // Tool exists in the switch but not in toolSchemas — reviewer oversight.
+    // Log a warning so it surfaces in operator logs.
+    console.warn(`[mcp] tool "${name}" has no input schema; skipping validation`)
+  }
 
   switch (name) {
     // -----------------------------------------------------------------------

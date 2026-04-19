@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test'
+import { z } from 'zod'
 import {
   gate,
   assertSendable,
@@ -5583,5 +5584,296 @@ describe('SessionSupervisor quarantine (S6)', () => {
     // Both should complete without throwing.
     await expect(sup.reapIdle()).resolves.toBeUndefined()
     await expect(aggressiveSup.reapIdle()).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// MCP tool input schemas (S5)
+//
+// Defense-in-depth: every MCP tool's argument payload is validated with a
+// per-tool Zod schema before dispatch in server.ts. Without these,
+// malformed tool calls reach the handler body and e.g.
+// `assertOutboundAllowed(undefined, ...)` / the Slack API gets undefined.
+//
+// These schemas are mirrored from `toolSchemas` in server.ts. Importing
+// server.ts directly would execute its top-level bootstrap (token load,
+// STATE_DIR mkdir, process.exit(1) on missing .env), so we duplicate the
+// shapes here deliberately and unit-test them in isolation. If a schema
+// in server.ts changes, update the copy below AND add a corresponding
+// test — the two must stay visibly in sync.
+// ---------------------------------------------------------------------------
+
+describe('MCP tool input schemas (S5)', () => {
+  const ReplyInput = z
+    .object({
+      chat_id: z.string().min(1),
+      text: z.string().min(1),
+      thread_ts: z.string().optional(),
+      files: z.array(z.string()).optional(),
+    })
+    .strict()
+
+  const ReactInput = z
+    .object({
+      chat_id: z.string().min(1),
+      message_id: z.string().min(1),
+      emoji: z.string().min(1),
+      thread_ts: z.string().optional(),
+    })
+    .strict()
+
+  const EditMessageInput = z
+    .object({
+      chat_id: z.string().min(1),
+      message_id: z.string().min(1),
+      text: z.string().min(1),
+      thread_ts: z.string().optional(),
+    })
+    .strict()
+
+  const FetchMessagesInput = z
+    .object({
+      channel: z.string().min(1),
+      limit: z.number().int().positive().optional(),
+      thread_ts: z.string().optional(),
+    })
+    .strict()
+
+  const DownloadAttachmentInput = z
+    .object({
+      chat_id: z.string().min(1),
+      message_id: z.string().min(1),
+      thread_ts: z.string().optional(),
+    })
+    .strict()
+
+  const ListSessionsInput = z.object({}).strict()
+
+  // -------------------------------------------------------------------------
+  // reply — the primary S5 target. Handler at server.ts case 'reply' calls
+  // assertOutboundAllowed(chatId, threadTs) and web.chat.postMessage; both
+  // require chat_id+text. The other assertions below (missing, wrong type,
+  // unknown key) cover the three failure classes the task brief called out.
+  // -------------------------------------------------------------------------
+  describe('ReplyInput', () => {
+    test('accepts minimal valid input (required only)', () => {
+      const result = ReplyInput.safeParse({ chat_id: 'C123', text: 'hello' })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.chat_id).toBe('C123')
+        expect(result.data.text).toBe('hello')
+        expect(result.data.thread_ts).toBeUndefined()
+        expect(result.data.files).toBeUndefined()
+      }
+    })
+
+    test('accepts full input with optional thread_ts and files', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'hello',
+        thread_ts: '1234567890.123456',
+        files: ['/tmp/a.txt', '/tmp/b.txt'],
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.files).toEqual(['/tmp/a.txt', '/tmp/b.txt'])
+      }
+    })
+
+    test('rejects missing chat_id (defense-in-depth for assertOutboundAllowed)', () => {
+      const result = ReplyInput.safeParse({ text: 'hello' })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const issues = result.error.issues
+        expect(issues.some((i) => i.path.join('.') === 'chat_id')).toBe(true)
+      }
+    })
+
+    test('rejects missing text', () => {
+      const result = ReplyInput.safeParse({ chat_id: 'C123' })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'text')).toBe(true)
+      }
+    })
+
+    test('rejects empty chat_id (min(1))', () => {
+      const result = ReplyInput.safeParse({ chat_id: '', text: 'hello' })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects wrong-type text (number instead of string)', () => {
+      const result = ReplyInput.safeParse({ chat_id: 'C123', text: 42 })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const textIssue = result.error.issues.find((i) => i.path.join('.') === 'text')
+        expect(textIssue?.code).toBe('invalid_type')
+      }
+    })
+
+    test('rejects unknown field (.strict() contract)', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'hello',
+        evil: 'extra',
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        // Zod v4 reports unrecognized_keys at the object root.
+        expect(result.error.issues.some((i) => i.code === 'unrecognized_keys')).toBe(true)
+      }
+    })
+
+    test('rejects non-array files', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'hello',
+        files: '/tmp/a.txt',
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects non-string element in files array', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'hello',
+        files: ['/tmp/a.txt', 42],
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('error message never echoes argument values (token-safety)', () => {
+      // A malformed call could carry a token-shaped string as a value.
+      // Zod's default issue messages name paths + expected/received types,
+      // never the actual value. This test locks that property in so a
+      // future Zod upgrade or custom .message() call cannot regress it.
+      const secret = 'xoxb-SECRET-LEAK-CANARY-9f0e1d2c3b4a'
+      const result = ReplyInput.safeParse({ chat_id: 'C123', text: secret, evil: secret })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.message).not.toContain(secret)
+        expect(JSON.stringify(result.error.issues)).not.toContain(secret)
+      }
+    })
+  })
+
+  describe('ReactInput', () => {
+    test('accepts valid input', () => {
+      const result = ReactInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        emoji: 'thumbsup',
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects missing emoji (required field)', () => {
+      const result = ReactInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'emoji')).toBe(true)
+      }
+    })
+
+    test('rejects unknown field', () => {
+      const result = ReactInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        emoji: 'thumbsup',
+        bogus: true,
+      })
+      expect(result.success).toBe(false)
+    })
+  })
+
+  describe('EditMessageInput', () => {
+    test('accepts valid input', () => {
+      const result = EditMessageInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+        text: 'updated',
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects missing message_id (required field)', () => {
+      const result = EditMessageInput.safeParse({
+        chat_id: 'C123',
+        text: 'updated',
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'message_id')).toBe(true)
+      }
+    })
+  })
+
+  describe('FetchMessagesInput', () => {
+    test('accepts channel-only input', () => {
+      const result = FetchMessagesInput.safeParse({ channel: 'C123' })
+      expect(result.success).toBe(true)
+    })
+
+    test('accepts channel + limit + thread_ts', () => {
+      const result = FetchMessagesInput.safeParse({
+        channel: 'C123',
+        limit: 50,
+        thread_ts: '1234567890.123456',
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects missing channel (required field)', () => {
+      const result = FetchMessagesInput.safeParse({ limit: 10 })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'channel')).toBe(true)
+      }
+    })
+
+    test('rejects non-integer limit', () => {
+      const result = FetchMessagesInput.safeParse({ channel: 'C123', limit: 1.5 })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects non-positive limit', () => {
+      const result = FetchMessagesInput.safeParse({ channel: 'C123', limit: 0 })
+      expect(result.success).toBe(false)
+    })
+  })
+
+  describe('DownloadAttachmentInput', () => {
+    test('accepts valid input', () => {
+      const result = DownloadAttachmentInput.safeParse({
+        chat_id: 'C123',
+        message_id: '1234567890.123456',
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects missing chat_id (required field)', () => {
+      const result = DownloadAttachmentInput.safeParse({
+        message_id: '1234567890.123456',
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'chat_id')).toBe(true)
+      }
+    })
+  })
+
+  describe('ListSessionsInput', () => {
+    test('accepts empty object', () => {
+      const result = ListSessionsInput.safeParse({})
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects any extra field (.strict() on empty object)', () => {
+      const result = ListSessionsInput.safeParse({ foo: 'bar' })
+      expect(result.success).toBe(false)
+    })
   })
 })
