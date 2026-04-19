@@ -123,9 +123,10 @@ are data flow.
 
 ### Session boundary
 
-**Where:** `server.ts` runtime + per-thread files under `~/.claude/channels/slack/sessions/`.
+**Where:** `supervisor.ts` (runtime) + `lib.ts` (primitives) + per-thread files
+under `~/.claude/channels/slack/sessions/<channel>/<thread>.json`.
 **Spec:** `000-docs/session-state-machine.md` (bead ccsc-1gk), implemented by
-Epic 32-A (ccsc-z78) and Epic 32-B.
+Epic 32-A (ccsc-z78) and Epic 32-B (ccsc-xa3).
 
 A session is the unit of *conversation state* — scoped to a Slack thread, not a
 Slack channel. The boundary exists so that two parallel threads in the same
@@ -135,9 +136,47 @@ channel cannot see each other's context. The session boundary:
   guard (CWE-22).
 - Uses an atomic writer (`tmp + chmod 0o600 + rename`) so partial writes never
   surface a half-written session to a concurrent read.
-- Has an Armstrong-style supervisor contract: the lifecycle is `activate →
-  quiesce → deactivate`, and crash recovery is reload-from-disk, not in-memory
-  reconstitution.
+- Has an **Armstrong-style supervisor** contract (`SessionSupervisor` in
+  `supervisor.ts`): the lifecycle is a strict five-state FSM —
+  `Nonexistent → Activating → Active → Quiescing → Deactivating → Nonexistent`,
+  with a `Quarantined` terminal for save/load failures. There is no
+  `Active → Nonexistent` shortcut; every teardown drains through Quiescing so
+  the final save lands.
+- **Crash recovery is reload-from-disk, not in-memory reconstitution.** The
+  supervisor owns a `Map<SessionKey, SessionHandle>`; the map is ephemeral.
+  The source of truth is always the on-disk file.
+
+#### Thread isolation (ccsc-xa3.15)
+
+Two sessions in the same channel but different threads must not share outbound
+authority. The outbound gate keys on `(channel, thread_ts)` via
+`deliveredThreadKey()`; the permission-pairing relay keys on
+`(thread_ts, requestId)` via `permissionPairingKey()`. A tool call dispatched
+in thread A cannot post into thread B, and an approval clicked in thread A
+cannot satisfy a request issued from thread B — each layer enforces the
+invariant independently so a failure in one does not silently grant the other.
+
+#### Idle reaper (ccsc-xa3.14)
+
+The supervisor exposes a `reapIdle()` method. One pass finds every `Active`
+handle whose `session.lastActiveAt` is older than `SLACK_SESSION_IDLE_MS`
+(default **4 hours**) AND has no in-flight tool calls, then drives it through
+`quiesce() → deactivate()`. Handles with in-flight work are skipped — the
+reaper never pre-empts; in-flight work drains naturally and becomes reap-
+eligible on a later tick. Per-session errors are logged as `session.reap_error`
+and do not stop the tick, so one quarantined handle cannot starve the rest
+of the population.
+
+The reaper is a reapable unit, not a timer: `server.ts` chooses tick
+frequency. Tests drive it deterministically via an injected `clock`.
+
+#### Quarantine
+
+A `saveSession()` or `loadSession()` failure puts the handle into the terminal
+`Quarantined` state. The supervisor does not auto-retry; a future bead
+(Epic 32-B reaper hardening) will file a beads issue with
+`(channel, thread, error, timestamp)` for the SO to clear by hand. Quarantined
+handles are never reaped, never auto-deactivated, never reloaded.
 
 ### Policy evaluator
 
