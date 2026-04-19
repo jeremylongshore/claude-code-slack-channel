@@ -5221,16 +5221,23 @@ describe('SessionSupervisor quarantine (S6)', () => {
 
   test('quarantine rejection message carries prior error substring', async () => {
     const sup = await activateThenFailDeactivate()
-    let msg = ''
+    let caught: unknown
     try {
       await sup.activate(KEY_A, OWNER)
     } catch (err) {
-      msg = err instanceof Error ? err.message : String(err)
+      caught = err
     }
-    // The message must mention "quarantined" and include something from
-    // the underlying filesystem error (EACCES or "permission denied").
-    expect(msg).toMatch(/quarantined/i)
-    expect(msg.length).toBeGreaterThan('SessionSupervisor.activate: key is quarantined: '.length)
+    // The outer Error must mention "quarantined" and chain the original
+    // filesystem failure via Error.cause so the stack trace survives.
+    expect(caught).toBeInstanceOf(Error)
+    const err = caught as Error
+    expect(err.message).toMatch(/quarantined/i)
+    expect(err.cause).toBeInstanceOf(Error)
+    const cause = err.cause as Error
+    // The cause message should carry the underlying filesystem error
+    // (EACCES or "permission denied") that originally tripped the quarantine.
+    expect(cause.message.length).toBeGreaterThan(0)
+    expect(cause.message).toMatch(/EACCES|permission denied|ENOENT|EPERM/i)
   })
 
   test('a different key is unaffected by another key\'s quarantine', async () => {

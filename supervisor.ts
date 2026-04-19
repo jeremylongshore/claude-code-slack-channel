@@ -446,7 +446,8 @@ export function createSessionSupervisor(
       if (priorErr !== undefined) {
         return Promise.reject(
           new Error(
-            `SessionSupervisor.activate: key is quarantined: ${priorErr.message}`,
+            `SessionSupervisor.activate: key is quarantined`,
+            { cause: priorErr },
           ),
         )
       }
