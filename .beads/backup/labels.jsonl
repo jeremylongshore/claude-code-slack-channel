@@ -70,6 +70,8 @@
 {"issue_id":"ccsc-5pi.8","label":"release:v0.4.1"}
 {"issue_id":"ccsc-5pi.9","label":"issue:#30"}
 {"issue_id":"ccsc-5pi.9","label":"release:v0.4.1"}
+{"issue_id":"ccsc-6j2","label":"release:v0.5.1"}
+{"issue_id":"ccsc-80a","label":"release:v0.5.1"}
 {"issue_id":"ccsc-a9z","label":"hardening"}
 {"issue_id":"ccsc-a9z","label":"security"}
 {"issue_id":"ccsc-d3w","label":"issue:#29"}
@@ -150,6 +152,7 @@
 {"issue_id":"ccsc-me6.8","label":"release:v0.5.0"}
 {"issue_id":"ccsc-me6.9","label":"issue:#29"}
 {"issue_id":"ccsc-me6.9","label":"release:v0.5.0"}
+{"issue_id":"ccsc-nes","label":"release:v0.5.1"}
 {"issue_id":"ccsc-nlr","label":"phase:p0-prereq"}
 {"issue_id":"ccsc-nlr","label":"release:v0.5.0"}
 {"issue_id":"ccsc-npd","label":"phase:p0-prereq"}
