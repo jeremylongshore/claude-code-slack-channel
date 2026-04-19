@@ -273,8 +273,14 @@ export const DEFAULT_IDLE_MS = 4 * 60 * 60 * 1000
 
 /** Parse `SLACK_SESSION_IDLE_MS` from an env record and return a valid
  *  idle threshold in ms. Falls back to `DEFAULT_IDLE_MS` when the var
- *  is unset, empty, non-numeric, negative, or non-finite. Pure; no
- *  process.env access — caller passes the env map. */
+ *  is unset, empty, non-numeric, negative, or non-finite.
+ *
+ *  Pure *relative to the `env` argument*: parsing the record is
+ *  deterministic and side-effect-free. The default parameter value
+ *  reads `process.env` as an ergonomic fallback so the call site in
+ *  server.ts boot can write `resolveIdleMs()` without repeating the
+ *  env lookup. Tests pass an explicit record to keep the function
+ *  deterministic at the test boundary. */
 export function resolveIdleMs(
   env: Record<string, string | undefined> = process.env,
 ): number {
