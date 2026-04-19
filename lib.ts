@@ -10,6 +10,7 @@
 
 import { resolve, sep, basename, join } from 'path'
 import { realpathSync, mkdirSync } from 'fs'
+import { writeFile, chmod, rename, unlink } from 'fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -206,6 +207,56 @@ export function sessionPath(root: string, key: SessionKey): string {
   }
 
   return join(resolvedChannelDir, `${key.thread}.json`)
+}
+
+/** Atomic writer for session files.
+ *
+ *  Contract (000-docs/session-state-machine.md §83-97):
+ *
+ *  1. Serialize `session` to JSON.
+ *  2. Write to `<path>.tmp.<pid>` with `{ mode: 0o600, flag: 'wx' }`.
+ *     The `wx` flag fails if the tmp file already exists — prevents a
+ *     stale tmp file (from a crashed process) from silently being
+ *     overwritten and then renamed into place.
+ *  3. `chmod 0o600` explicitly — `writeFile({mode})` is subject to the
+ *     process umask, so the actual mode is `mode & ~umask`. An explicit
+ *     chmod makes the on-disk permissions deterministic regardless of
+ *     how the user's umask is configured.
+ *  4. `rename(tmp, path)` — atomic on POSIX. No reader ever observes a
+ *     partial session file.
+ *  5. On error at any step, best-effort `unlink(tmp)` and re-throw.
+ *
+ *  **Concurrency assumption.** The session supervisor (Epic 32-B) holds a
+ *  per-SessionKey mutex across the full save. Two concurrent calls to
+ *  `saveSession` for the same `path` from the same process would collide
+ *  on `<path>.tmp.<pid>` and violate the atomicity invariant. Two
+ *  processes sharing a state dir is explicitly undefined behavior
+ *  (state dir is single-writer).
+ *
+ *  The caller is responsible for obtaining `path` from `sessionPath()`
+ *  — that function establishes the realpath-containment guarantee that
+ *  this writer relies on.
+ */
+export async function saveSession(path: string, session: Session): Promise<void> {
+  const json = JSON.stringify(session, null, 2)
+  const tmp = `${path}.tmp.${process.pid}`
+
+  try {
+    await writeFile(tmp, json, { mode: 0o600, flag: 'wx' })
+    await chmod(tmp, 0o600)
+    await rename(tmp, path)
+  } catch (err) {
+    // Best-effort cleanup. Swallow secondary errors — the original is
+    // what the caller needs to see. If unlink fails because the tmp
+    // file was never created, that's fine; if it fails for another
+    // reason, the filesystem-integrity surface is a broader concern.
+    try {
+      await unlink(tmp)
+    } catch {
+      /* no-op */
+    }
+    throw err
+  }
 }
 
 // ---------------------------------------------------------------------------
