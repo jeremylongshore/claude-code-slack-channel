@@ -43,6 +43,7 @@ import {
   existsSync,
   readdirSync,
 } from 'fs'
+import { writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join, sep } from 'path'
 
@@ -1599,7 +1600,7 @@ describe('loadSession', () => {
       ownerId: 42, // wrong type
       data: {},
     }
-    writeFileSync(p, JSON.stringify(corrupt), { mode: 0o600 })
+    await writeFile(p, JSON.stringify(corrupt), { mode: 0o600 })
 
     await expect(loadSession(tmpRoot, p)).rejects.toThrow()
   })
@@ -1614,7 +1615,7 @@ describe('loadSession', () => {
       ownerId: 'U_OWNER',
       data: {},
     }
-    writeFileSync(p, JSON.stringify(missing), { mode: 0o600 })
+    await writeFile(p, JSON.stringify(missing), { mode: 0o600 })
 
     await expect(loadSession(tmpRoot, p)).rejects.toThrow()
   })
@@ -1633,7 +1634,7 @@ describe('loadSession', () => {
       data: {},
       injected: 'evil_payload', // unknown key
     }
-    writeFileSync(p, JSON.stringify(extraKey), { mode: 0o600 })
+    await writeFile(p, JSON.stringify(extraKey), { mode: 0o600 })
 
     await expect(loadSession(tmpRoot, p)).rejects.toThrow()
   })
@@ -1641,7 +1642,7 @@ describe('loadSession', () => {
   test('S4: non-JSON bytes throw before Zod validation (JSON.parse fires first)', async () => {
     // Confirms JSON.parse still throws on garbage input — Zod never sees it.
     const p = sessionPath(tmpRoot, { channel: 'C_S4_JSON', thread: 'T1.0' })
-    writeFileSync(p, '\x00\x01\x02 not json }{', { mode: 0o600 })
+    await writeFile(p, '\x00\x01\x02 not json }{', { mode: 0o600 })
 
     await expect(loadSession(tmpRoot, p)).rejects.toThrow()
   })
