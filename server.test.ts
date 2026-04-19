@@ -598,84 +598,116 @@ describe('parseSendableRoots', () => {
 // ---------------------------------------------------------------------------
 
 describe('assertOutboundAllowed', () => {
-  test('allows opted-in channels', () => {
+  test('allows opted-in channels regardless of thread', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
     const access = makeAccess({
       channels: { C_OPT: { requireMention: false, allowFrom: [] } },
     })
-    expect(() => assertOutboundAllowed('C_OPT', access, new Set())).not.toThrow()
+    // Channel opt-in subsumes thread-level checks: an opted-in
+    // channel authorizes any thread in that channel.
+    expect(() =>
+      assertOutboundAllowed('C_OPT', 'T1', access, new Set()),
+    ).not.toThrow()
+    expect(() =>
+      assertOutboundAllowed('C_OPT', undefined, access, new Set()),
+    ).not.toThrow()
+    // Spot-check that the helper shape matches what the server uses
+    // for the delivered-threads Set.
+    expect(deliveredThreadKey('C_OPT', 'T1')).toBe('C_OPT\0T1')
+    expect(deliveredThreadKey('C_OPT', undefined)).toBe('C_OPT\0')
   })
 
-  test('allows delivered channels', () => {
+  test('allows delivered (channel, thread) pairs', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
     const access = makeAccess()
-    const delivered = new Set(['D_DELIVERED'])
-    expect(() => assertOutboundAllowed('D_DELIVERED', access, delivered)).not.toThrow()
+    const delivered = new Set([deliveredThreadKey('D_DELIVERED', 'T1')])
+    expect(() =>
+      assertOutboundAllowed('D_DELIVERED', 'T1', access, delivered),
+    ).not.toThrow()
+  })
+
+  test('allows delivered top-level (undefined thread) posts', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess()
+    const delivered = new Set([deliveredThreadKey('C_TOP', undefined)])
+    expect(() =>
+      assertOutboundAllowed('C_TOP', undefined, access, delivered),
+    ).not.toThrow()
   })
 
   test('blocks unknown channels', () => {
     const access = makeAccess()
-    expect(() => assertOutboundAllowed('C_RANDO', access, new Set())).toThrow('Outbound gate')
+    expect(() =>
+      assertOutboundAllowed('C_RANDO', 'T1', access, new Set()),
+    ).toThrow('Outbound gate')
   })
 
-  test('blocks channels not in either list', () => {
+  test('blocks channels not in either list', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
     const access = makeAccess({
       channels: { C_OTHER: { requireMention: false, allowFrom: [] } },
     })
-    const delivered = new Set(['D_DIFFERENT'])
-    expect(() => assertOutboundAllowed('C_ATTACKER', access, delivered)).toThrow('Outbound gate')
+    const delivered = new Set([deliveredThreadKey('D_DIFFERENT', 'T1')])
+    expect(() =>
+      assertOutboundAllowed('C_ATTACKER', 'T1', access, delivered),
+    ).toThrow('Outbound gate')
+  })
+
+  test('blocks thread B when only thread A delivered in the same channel (ccsc-xa3.6)', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess()
+    // Thread T_A delivered inbound; T_B never did. Both live in the
+    // same (non-opted-in) channel. An outbound to T_B must throw —
+    // closes the cross-thread leak documented by the xa3.5 fixture.
+    const delivered = new Set([deliveredThreadKey('C_SHARED', 'T_A')])
+    expect(() =>
+      assertOutboundAllowed('C_SHARED', 'T_A', access, delivered),
+    ).not.toThrow()
+    expect(() =>
+      assertOutboundAllowed('C_SHARED', 'T_B', access, delivered),
+    ).toThrow(/thread T_B/)
+  })
+
+  test('blocks top-level post when only a thread has delivered', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess()
+    const delivered = new Set([deliveredThreadKey('C_SHARED', 'T1')])
+    // Top-level slot is distinct from any thread slot. Delivering
+    // on T1 does not authorize a top-level post.
+    expect(() =>
+      assertOutboundAllowed('C_SHARED', undefined, access, delivered),
+    ).toThrow(/top-level/)
   })
 })
 
 // ---------------------------------------------------------------------------
-// Thread isolation — outbound gate (ccsc-xa3.5 failing fixture)
+// Thread isolation — outbound gate (ccsc-xa3.5 landed → ccsc-xa3.6 fixed)
 // ---------------------------------------------------------------------------
 //
-// Documents the cross-thread leak that the current channel-only
-// `assertOutboundAllowed` signature does not prevent. Two sessions in
-// the same channel, different threads — a tool call dispatched in
-// thread A can craft a completion targeted at thread B and the
-// outbound gate will let it through because the gate only knows
-// channels, not threads.
-//
-// The ideal, documented in session-state-machine.md §207 ("per-thread
-// session isolation"), is that an outbound whose thread_ts was never
-// delivered to must be refused. Reaching that ideal requires:
-//
-//   - ccsc-xa3.6 — widen `assertOutboundAllowed` from (chatId, access,
-//     deliveredChannels) to a (channel, thread_ts, access,
-//     deliveredThreads) tuple so the guard can see threads.
-//   - ccsc-xa3.7 — widen the permission-pairing key from `requestId`
-//     to `(thread_ts, requestId)` so approvals in one thread cannot
-//     authorize a reply in another.
-//
-// This fixture is `test.failing` — bun runs it, expects it to fail,
-// and flags regression if it ever passes. When xa3.6 lands the fixture
-// flips to a regular `test` with the new signature. Keeping it red
-// today is the TDD signal the bead asked for.
+// Originally a `test.failing` fixture (ccsc-xa3.5) documenting the
+// cross-thread leak in the channel-only `assertOutboundAllowed`
+// signature. ccsc-xa3.6 widened the guard to a (channel, thread_ts,
+// access, deliveredThreads) tuple, so the invariant is now enforced
+// and this flips to a regular `test`.
 
-describe('thread isolation — outbound gate (ccsc-xa3.5)', () => {
-  test.failing(
-    'replies to an undelivered thread must be refused even when the channel did deliver',
-    () => {
-      const access = makeAccess()
-      // Simulate the reality xa3.5 is describing: channel C_SHARED had
-      // inbound delivery on thread T_A. Nothing has ever delivered on
-      // T_B — it's simply another thread a human could reply to in the
-      // same channel. A tool call originating in T_A must not be able
-      // to post into T_B.
-      const deliveredChannels = new Set(['C_SHARED'])
+describe('thread isolation — outbound gate (ccsc-xa3.5 → xa3.6)', () => {
+  test('replies to an undelivered thread are refused even when a sibling thread delivered', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess()
+    // Thread T_A delivered inbound on channel C_SHARED. T_B never
+    // did. A tool call in T_A must not be able to post into T_B.
+    const deliveredThreads = new Set([deliveredThreadKey('C_SHARED', 'T_A')])
 
-      // Ideal behavior: the outbound guard throws because T_B has no
-      // delivered history. Current signature has no thread parameter,
-      // so the call returns void — this assertion fails today, which
-      // is exactly the failing fixture this bead asks for. When xa3.6
-      // widens the signature, this test gets rewritten to pass the
-      // (channel, thread_ts) pair, `test.failing` drops to `test`, and
-      // the invariant becomes enforced.
-      expect(() => {
-        assertOutboundAllowed('C_SHARED', access, deliveredChannels)
-      }).toThrow(/thread/)
-    },
-  )
+    // T_A: allowed.
+    expect(() =>
+      assertOutboundAllowed('C_SHARED', 'T_A', access, deliveredThreads),
+    ).not.toThrow()
+
+    // T_B: blocked.
+    expect(() =>
+      assertOutboundAllowed('C_SHARED', 'T_B', access, deliveredThreads),
+    ).toThrow(/thread T_B/)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -735,35 +767,40 @@ describe('outbound gate coverage for read/edit/react/download', () => {
   test('blocks react on unknown channel', () => {
     const access = makeAccess()
     expect(() =>
-      assertOutboundAllowed('C_RANDOM', access, new Set()),
+      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
     ).toThrow('Outbound gate')
   })
 
   test('blocks edit_message on unknown channel', () => {
     const access = makeAccess()
     expect(() =>
-      assertOutboundAllowed('C_RANDOM', access, new Set()),
+      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
     ).toThrow('Outbound gate')
   })
 
   test('blocks fetch_messages on unknown channel', () => {
     const access = makeAccess()
     expect(() =>
-      assertOutboundAllowed('C_RANDOM', access, new Set()),
+      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
     ).toThrow('Outbound gate')
   })
 
   test('blocks download_attachment on unknown channel', () => {
     const access = makeAccess()
     expect(() =>
-      assertOutboundAllowed('C_RANDOM', access, new Set()),
+      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
     ).toThrow('Outbound gate')
   })
 
-  test('allows these calls on a delivered DM channel', () => {
+  test('allows these calls on a delivered (channel, thread) pair', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
     const access = makeAccess()
-    const delivered = new Set(['D_ALICE'])
-    expect(() => assertOutboundAllowed('D_ALICE', access, delivered)).not.toThrow()
+    const delivered = new Set([deliveredThreadKey('D_ALICE', undefined)])
+    // DMs deliver at the top level (no thread_ts) by default; gate
+    // allows top-level outbound when top-level delivered.
+    expect(() =>
+      assertOutboundAllowed('D_ALICE', undefined, access, delivered),
+    ).not.toThrow()
   })
 })
 

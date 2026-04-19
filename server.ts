@@ -35,6 +35,7 @@ import {
   parseSendableRoots,
   validateSendableRoots,
   assertOutboundAllowed as libAssertOutboundAllowed,
+  deliveredThreadKey as libDeliveredThreadKey,
   isSlackFileUrl,
   chunkText,
   sanitizeFilename,
@@ -205,8 +206,11 @@ function assertSendable(filePath: string): void {
 // Security — outbound gate
 // ---------------------------------------------------------------------------
 
-// Track channels that passed inbound gate (session-lifetime cache)
-const deliveredChannels = new Set<string>()
+// Track (channel, thread) pairs that passed inbound gate — session-
+// lifetime cache, keyed via `deliveredThreadKey(channel, thread_ts)`.
+// Replaces the pre-xa3.6 channel-only set so the outbound gate can
+// enforce thread-level isolation per session-state-machine.md §207.
+const deliveredThreads = new Set<string>()
 
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
@@ -216,8 +220,11 @@ const seenEvents = new Map<string, number>()
 let lastActiveChannel = ''
 let lastActiveThread: string | undefined
 
-function assertOutboundAllowed(chatId: string): void {
-  libAssertOutboundAllowed(chatId, getAccess(), deliveredChannels)
+function assertOutboundAllowed(
+  chatId: string,
+  threadTs: string | undefined,
+): void {
+  libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +419,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const threadTs: string | undefined = args.thread_ts
       const files: string[] | undefined = args.files
 
-      assertOutboundAllowed(chatId)
+      assertOutboundAllowed(chatId, threadTs)
 
       const access = getAccess()
       const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
@@ -459,7 +466,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // react
     // -----------------------------------------------------------------------
     case 'react': {
-      assertOutboundAllowed(args.chat_id)
+      // react operates on a specific message ts; the "thread" it
+      // engages with is whatever thread that message lives in.
+      // Callers that know the parent thread pass `thread_ts`; when
+      // omitted, fall back to channel-level opt-in or top-level
+      // delivery by passing undefined.
+      assertOutboundAllowed(args.chat_id, args.thread_ts)
       await web.reactions.add({
         channel: args.chat_id,
         timestamp: args.message_id,
@@ -474,7 +486,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // edit_message
     // -----------------------------------------------------------------------
     case 'edit_message': {
-      assertOutboundAllowed(args.chat_id)
+      // Editing a message engages with the thread that message lives
+      // in. Callers that know the thread pass `thread_ts`; otherwise
+      // the gate falls back to channel-level opt-in or top-level.
+      assertOutboundAllowed(args.chat_id, args.thread_ts)
       await web.chat.update({
         channel: args.chat_id,
         ts: args.message_id,
@@ -490,9 +505,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // -----------------------------------------------------------------------
     case 'fetch_messages': {
       const channel: string = args.channel
-      assertOutboundAllowed(channel)
-      const limit = Math.min(args.limit || 20, 100)
       const threadTs: string | undefined = args.thread_ts
+      assertOutboundAllowed(channel, threadTs)
+      const limit = Math.min(args.limit || 20, 100)
 
       let messages: any[]
       if (threadTs) {
@@ -540,7 +555,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       const channel: string = args.chat_id
       const messageTs: string = args.message_id
 
-      assertOutboundAllowed(channel)
+      // Download engages with the thread the target message lives
+      // in. Callers that know the thread pass `thread_ts`; the gate
+      // falls back to channel-level opt-in or top-level otherwise.
+      assertOutboundAllowed(channel, args.thread_ts)
 
       // Fetch the specific message to get file info
       const res = await web.conversations.replies({
@@ -649,7 +667,11 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   const targetChannel = lastActiveChannel || Object.keys(access.channels || {})[0]
   if (!targetChannel) return
 
-  assertOutboundAllowed(targetChannel)
+  // Permission prompts post into the last active (channel, thread) pair
+  // so approvals surface in the same thread the tool call originated
+  // from. Falls back to top-level only when we're using an opted-in
+  // channel with no active thread (lastActiveThread === undefined).
+  assertOutboundAllowed(targetChannel, lastActiveThread)
 
   pruneStalePermissions()
   pendingPermissions.set(params.request_id, {
@@ -891,13 +913,16 @@ async function handleMessage(event: unknown): Promise<void> {
         })
       }
 
-      // Track this channel as delivered (for outbound gate)
+      // Track this (channel, thread) pair as delivered (for outbound
+      // gate). A thread-level key so replies cannot leak across
+      // threads in the same channel (ccsc-xa3.6).
       const channelId = ev['channel'] as string
-      deliveredChannels.add(channelId)
+      const incomingThreadTs = ev['thread_ts'] as string | undefined
+      deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
 
       // Track last active channel for permission relay
       lastActiveChannel = channelId
-      lastActiveThread = ev['thread_ts'] as string | undefined
+      lastActiveThread = incomingThreadTs
 
       // Check for permission reply before normal delivery
       const msgText = ((ev['text'] as string) || '').trim()

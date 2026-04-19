@@ -636,18 +636,46 @@ export function assertSendable(
 // ---------------------------------------------------------------------------
 
 /**
- * Throws if `chatId` is neither an opted-in channel nor a previously-delivered
- * channel (DM that passed the inbound gate this session).
+ * Composite key for the delivered-threads set. `\0` is not a legal
+ * character in Slack channel or thread_ts values, so it is a safe
+ * separator that won't collide with real IDs. `undefined` thread_ts
+ * (top-level channel post) collapses to the empty string slot — it
+ * is its OWN delivery slot, distinct from any threaded reply.
+ */
+export function deliveredThreadKey(
+  channel: string,
+  threadTs: string | undefined,
+): string {
+  return `${channel}\0${threadTs ?? ''}`
+}
+
+/**
+ * Throws if `(chatId, threadTs)` names a (channel, thread) pair that
+ * has not previously delivered inbound AND `chatId` is not an
+ * opted-in channel.
+ *
+ * Channel-level opt-in (`access.channels[chatId]`) is an operator-
+ * scoped bypass: if an operator has explicitly trusted a channel
+ * then any thread in that channel is reply-eligible. Thread-level
+ * delivery is the granular path: once a thread has delivered
+ * inbound it becomes reply-eligible, independent of its siblings.
+ *
+ * Security rationale (ccsc-xa3.5 + ccsc-xa3.6): two sessions in the
+ * same channel but different threads must not share outbound
+ * authority. A tool call dispatched in thread A cannot post into
+ * thread B unless B has independently delivered. This closes the
+ * cross-thread leak documented by the xa3.5 failing fixture.
  */
 export function assertOutboundAllowed(
   chatId: string,
+  threadTs: string | undefined,
   access: Access,
-  deliveredChannels: ReadonlySet<string>,
+  deliveredThreads: ReadonlySet<string>,
 ): void {
   if (access.channels[chatId]) return
-  if (deliveredChannels.has(chatId)) return
+  if (deliveredThreads.has(deliveredThreadKey(chatId, threadTs))) return
   throw new Error(
-    `Outbound gate: channel ${chatId} is not in the allowlist or opted-in channels.`,
+    `Outbound gate: (channel ${chatId}, thread ${threadTs ?? '<top-level>'}) is not in the allowlist or delivered-threads set.`,
   )
 }
 
