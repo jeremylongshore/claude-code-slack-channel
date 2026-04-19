@@ -775,6 +775,17 @@ export function assertSendable(
     throw new Error('Blocked: file does not exist or is not accessible')
   }
 
+  // Resolve the inbox once — used by both the state-dir denylist (to carve
+  // the inbox out of the state-root block) and the allowlist-roots check
+  // below.
+  const inboxReal = (() => {
+    try {
+      return realpathSync(resolve(inboxDir))
+    } catch {
+      return resolve(inboxDir)
+    }
+  })()
+
   // (1) State-dir denylist (S1). Production callers thread STATE_DIR through
   // from `server.ts`. This check runs BEFORE the allowlist so a state-dir
   // path that also happens to live under SLACK_SENDABLE_ROOTS is still
@@ -789,28 +800,13 @@ export function assertSendable(
         return resolve(stateRoot)
       }
     })()
-    const inboxRealForStateCheck = (() => {
-      try {
-        return realpathSync(resolve(inboxDir))
-      } catch {
-        return resolve(inboxDir)
-      }
-    })()
     if (
       isUnderRoot(real, stateRootReal) &&
-      !isUnderRoot(real, inboxRealForStateCheck)
+      !isUnderRoot(real, inboxReal)
     ) {
       throw new Error('Blocked: file path is under the state directory')
     }
   }
-
-  const inboxReal = (() => {
-    try {
-      return realpathSync(resolve(inboxDir))
-    } catch {
-      return resolve(inboxDir)
-    }
-  })()
 
   const roots: string[] = [inboxReal, ...allowlistRoots.map((r) => {
     try { return realpathSync(resolve(r)) } catch { return resolve(r) }
