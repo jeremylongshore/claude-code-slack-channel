@@ -1570,6 +1570,188 @@ describe('loadSession', () => {
 })
 
 // ---------------------------------------------------------------------------
+// listSessions — ccsc-xa3.9 introspection tool
+// ---------------------------------------------------------------------------
+
+describe('listSessions', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  const writeSessionFile = (
+    channel: string,
+    thread: string,
+    overrides: Partial<Session> = {},
+  ): void => {
+    const dir = join(tmpRoot, 'sessions', channel)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const full: Session = {
+      v: 1,
+      key: { channel, thread },
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_000_000,
+      ownerId: 'U_OWNER',
+      data: { turns: [] },
+      ...overrides,
+    }
+    writeFileSync(join(dir, `${thread}.json`), JSON.stringify(full), {
+      mode: 0o600,
+    })
+  }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'list-sessions-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('empty: returns [] when sessions/ does not exist', async () => {
+    const { listSessions } = await import('./lib.ts')
+    expect(listSessions(tmpRoot)).toEqual([])
+  })
+
+  test('single session: returns one summary with metadata and NO body', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C1', 'T1.0', {
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_500_000,
+      ownerId: 'U_ALICE',
+      data: { turns: [{ role: 'user', content: 'secret-ish content' }] },
+    })
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(1)
+    const row = out[0]!
+    expect(row.channel).toBe('C1')
+    expect(row.thread).toBe('T1.0')
+    expect(row.createdAt).toBe(1_700_000_000_000)
+    expect(row.lastActiveAt).toBe(1_700_000_500_000)
+    expect(row.ownerId).toBe('U_ALICE')
+    // Body field MUST NOT be surfaced — the sensitive-data invariant.
+    expect(Object.keys(row)).not.toContain('data')
+    expect((row as unknown as Record<string, unknown>)['data']).toBeUndefined()
+  })
+
+  test('sorts by lastActiveAt descending', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C1', 'T_OLD', { lastActiveAt: 1_700_000_000_000 })
+    writeSessionFile('C1', 'T_NEW', { lastActiveAt: 1_700_001_000_000 })
+    writeSessionFile('C1', 'T_MID', { lastActiveAt: 1_700_000_500_000 })
+
+    const out = listSessions(tmpRoot)
+    expect(out.map((r) => r.thread)).toEqual(['T_NEW', 'T_MID', 'T_OLD'])
+  })
+
+  test('handles multiple channels and multiple threads each', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C_A', 'T1', { lastActiveAt: 10 })
+    writeSessionFile('C_A', 'T2', { lastActiveAt: 20 })
+    writeSessionFile('C_B', 'T1', { lastActiveAt: 15 })
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(3)
+    expect(out[0]).toMatchObject({ channel: 'C_A', thread: 'T2' })
+    expect(out[1]).toMatchObject({ channel: 'C_B', thread: 'T1' })
+    expect(out[2]).toMatchObject({ channel: 'C_A', thread: 'T1' })
+  })
+
+  test('skips unparseable files without crashing the enumeration', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C1', 'T_GOOD', { lastActiveAt: 100 })
+    mkdirSync(join(tmpRoot, 'sessions', 'C_BAD'), {
+      recursive: true,
+      mode: 0o700,
+    })
+    writeFileSync(join(tmpRoot, 'sessions', 'C_BAD', 'T.json'), '{not json')
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(1)
+    expect(out[0]!.thread).toBe('T_GOOD')
+  })
+
+  test('skips files missing load-bearing fields', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C1', 'T_OK', { lastActiveAt: 100 })
+    mkdirSync(join(tmpRoot, 'sessions', 'C_PART'), {
+      recursive: true,
+      mode: 0o700,
+    })
+    writeFileSync(
+      join(tmpRoot, 'sessions', 'C_PART', 'T.json'),
+      JSON.stringify({ v: 1, key: { channel: 'C_PART', thread: 'T' } }),
+    )
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(1)
+    expect(out[0]!.channel).toBe('C1')
+  })
+
+  test('skips hidden files and non-JSON entries', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C1', 'T_OK', { lastActiveAt: 100 })
+    const chanDir = join(tmpRoot, 'sessions', 'C1')
+    writeFileSync(join(chanDir, '.hidden.json'), '{}')
+    writeFileSync(join(chanDir, 'README.txt'), 'not a session')
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(1)
+  })
+
+  test('skips the .migrated marker and other top-level dotfiles', async () => {
+    const { listSessions } = await import('./lib.ts')
+    writeSessionFile('C1', 'T_OK', { lastActiveAt: 100 })
+    writeFileSync(join(tmpRoot, 'sessions', '.migrated'), '')
+    writeFileSync(join(tmpRoot, 'sessions', '.DS_Store'), '')
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(1)
+  })
+
+  test('caps at LIST_SESSIONS_MAX rows', async () => {
+    const { listSessions, LIST_SESSIONS_MAX } = await import('./lib.ts')
+    const target = LIST_SESSIONS_MAX + 5
+    mkdirSync(join(tmpRoot, 'sessions', 'C_BULK'), {
+      recursive: true,
+      mode: 0o700,
+    })
+    for (let i = 0; i < target; i++) {
+      const thread = `T${i.toString().padStart(5, '0')}`
+      writeFileSync(
+        join(tmpRoot, 'sessions', 'C_BULK', `${thread}.json`),
+        JSON.stringify({
+          v: 1,
+          key: { channel: 'C_BULK', thread },
+          createdAt: 1_000_000 + i,
+          lastActiveAt: 1_000_000 + i,
+          ownerId: 'U_X',
+          data: {},
+        }),
+      )
+    }
+
+    const out = listSessions(tmpRoot)
+    expect(out).toHaveLength(LIST_SESSIONS_MAX)
+  })
+
+  test('realpath guard: sessions/ symlinked outside state root throws', async () => {
+    const { listSessions } = await import('./lib.ts')
+    const outside = mkdtempSync(join(tmpdir(), 'list-sessions-out-'))
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { symlinkSync } = require('fs') as typeof import('fs')
+      symlinkSync(outside, join(tmpRoot, 'sessions'), 'dir')
+
+      expect(() => listSessions(tmpRoot)).toThrow(
+        /resolves outside state root/,
+      )
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // migrateFlatSessions — 000-docs/session-state-machine.md §71-81
 //
 // One-shot boot-time migration from flat pre-0.5.0 layout
