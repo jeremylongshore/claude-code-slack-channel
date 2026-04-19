@@ -9,7 +9,7 @@
  */
 
 import { resolve, sep, basename, join } from 'path'
-import { realpathSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs'
+import { realpathSync, mkdirSync, readdirSync, readFileSync, statSync, existsSync } from 'fs'
 import { writeFile, chmod, rename, unlink, readFile } from 'fs/promises'
 
 // ---------------------------------------------------------------------------
@@ -297,6 +297,192 @@ export async function loadSession(root: string, path: string): Promise<Session> 
   }
   const raw = await readFile(resolvedFile, 'utf8')
   return JSON.parse(raw) as Session
+}
+
+/** Minimal introspection record per session file. Intentionally NOT
+ *  the full `Session` shape — `data` may carry user messages, tool
+ *  outputs, or other content that could contain secrets, and
+ *  `list_sessions` is meant to give the operator a thread inventory
+ *  without exposing body state. */
+export interface SessionSummary {
+  channel: string
+  thread: string
+  /** Epoch-ms when the session was first created. */
+  createdAt: number
+  /** Epoch-ms of the most recent persisted activity. Operators use
+   *  this to find idle threads worth reaping. */
+  lastActiveAt: number
+  /** Slack user ID recorded as the session owner. Already operator-
+   *  visible via Slack itself, so surfacing it here is not a leak
+   *  but it IS a PII-adjacent identifier — do not project it further
+   *  without review. */
+  ownerId: string
+}
+
+/** Hard upper bound on rows returned by `listSessions()`. Prevents a
+ *  pathological state dir from producing an unbounded MCP tool
+ *  response. An operator with more than this many live threads is
+ *  outside the intended single-developer use case and can narrow via
+ *  external tooling. */
+export const LIST_SESSIONS_MAX = 1000
+
+/** Enumerate every session file under `stateRoot/sessions/` and
+ *  return a summary per (channel, thread) pair. Pure read; never
+ *  mutates, never creates, never deletes.
+ *
+ *  Contract (ccsc-xa3.9):
+ *    - Returns `SessionSummary[]` with NO body (`data` field) — the
+ *      operator sees lifecycle metadata only.
+ *    - Sorted by `lastActiveAt` descending so the most recently
+ *      active thread is row 0. Stable for ties (insertion order).
+ *    - Hard-capped at `LIST_SESSIONS_MAX` rows. Truncation is
+ *      silent at this layer; the MCP tool wrapper is responsible
+ *      for telling the operator they hit the cap.
+ *    - Tolerant to a missing `sessions/` dir — returns `[]` for a
+ *      fresh install.
+ *    - Tolerant to unparseable or malformed files — logs to
+ *      `process.stderr` and skips. A single corrupt thread does
+ *      not take down the enumeration.
+ *    - Realpath guards every file and channel dir against the state
+ *      root so a symlink inside `sessions/` cannot surface a file
+ *      from elsewhere on disk.
+ */
+/** Read and validate one thread file, returning its summary or null
+ *  if the file is missing, unparseable, outside the state root, or
+ *  missing load-bearing fields. Log-and-skip on parse error so a
+ *  single corrupt file can't poison the enumeration. */
+function readThreadSummary(
+  channel: string,
+  entry: string,
+  resolvedChannelDir: string,
+  resolvedRoot: string,
+): SessionSummary | null {
+  if (!entry.endsWith('.json')) return null
+  if (entry.startsWith('.')) return null
+
+  const threadFile = join(resolvedChannelDir, entry)
+  let resolvedThreadFile: string
+  try {
+    resolvedThreadFile = realpathSync.native(threadFile)
+  } catch {
+    return null
+  }
+  if (!isUnderRoot(resolvedThreadFile, resolvedRoot)) return null
+
+  let raw: string
+  try {
+    raw = readFileSync(resolvedThreadFile, 'utf8')
+  } catch {
+    return null
+  }
+
+  let parsed: Partial<Session>
+  try {
+    parsed = JSON.parse(raw) as Partial<Session>
+  } catch (err) {
+    process.stderr.write(
+      `[listSessions] skipping unparseable file ${threadFile}: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    )
+    return null
+  }
+
+  if (
+    typeof parsed.createdAt !== 'number' ||
+    typeof parsed.lastActiveAt !== 'number' ||
+    typeof parsed.ownerId !== 'string'
+  ) {
+    return null
+  }
+
+  return {
+    channel,
+    thread: entry.slice(0, -'.json'.length),
+    createdAt: parsed.createdAt,
+    lastActiveAt: parsed.lastActiveAt,
+    ownerId: parsed.ownerId,
+  }
+}
+
+/** Enumerate all thread files under one channel directory, appending
+ *  valid summaries to `out`. Returns when `out` hits the cap so the
+ *  outer loop stops too. */
+function collectChannelSummaries(
+  channel: string,
+  resolvedSessionsDir: string,
+  resolvedRoot: string,
+  out: SessionSummary[],
+): void {
+  const channelDir = join(resolvedSessionsDir, channel)
+  let chanStat: ReturnType<typeof statSync>
+  try {
+    chanStat = statSync(channelDir)
+  } catch {
+    return
+  }
+  if (!chanStat.isDirectory()) return
+
+  let resolvedChannelDir: string
+  try {
+    resolvedChannelDir = realpathSync.native(channelDir)
+  } catch {
+    return
+  }
+  if (!isUnderRoot(resolvedChannelDir, resolvedRoot)) return
+
+  let threadEntries: string[]
+  try {
+    threadEntries = readdirSync(resolvedChannelDir)
+  } catch {
+    return
+  }
+
+  for (const entry of threadEntries) {
+    const summary = readThreadSummary(
+      channel,
+      entry,
+      resolvedChannelDir,
+      resolvedRoot,
+    )
+    if (summary === null) continue
+    out.push(summary)
+    if (out.length >= LIST_SESSIONS_MAX) return
+  }
+}
+
+export function listSessions(stateRoot: string): SessionSummary[] {
+  const resolvedRoot = realpathSync.native(resolve(stateRoot))
+  const sessionsDir = join(resolvedRoot, 'sessions')
+  if (!existsSync(sessionsDir)) return []
+
+  const resolvedSessionsDir = realpathSync.native(sessionsDir)
+  if (!isUnderRoot(resolvedSessionsDir, resolvedRoot)) {
+    // Symlink pointing outside the root. Fail closed — an operator
+    // has mis-configured the state tree; do not enumerate an
+    // attacker-chosen directory.
+    throw new Error(
+      `listSessions: sessions/ resolves outside state root: ${JSON.stringify(sessionsDir)}`,
+    )
+  }
+
+  const out: SessionSummary[] = []
+
+  for (const channel of readdirSync(resolvedSessionsDir)) {
+    // Skip the migration sentinel and any other top-level dotfile
+    // (pre-0.5.0 flat files should have been migrated by now; if one
+    // lingers, it's ignored — the list is best-effort introspection).
+    if (channel.startsWith('.')) continue
+    collectChannelSummaries(channel, resolvedSessionsDir, resolvedRoot, out)
+    if (out.length >= LIST_SESSIONS_MAX) break
+  }
+
+  // Stable sort by lastActiveAt desc: most recently active first.
+  // Array.prototype.sort is stable in V8/Node 12+, so equal
+  // lastActiveAt values keep their enumeration order.
+  out.sort((a, b) => b.lastActiveAt - a.lastActiveAt)
+
+  return out
 }
 
 /** Filename used as the thread-slot for migrated pre-0.5.0 session files.

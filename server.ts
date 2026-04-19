@@ -37,6 +37,8 @@ import {
   assertOutboundAllowed as libAssertOutboundAllowed,
   deliveredThreadKey as libDeliveredThreadKey,
   permissionPairingKey as permKey,
+  listSessions as libListSessions,
+  LIST_SESSIONS_MAX,
   isSlackFileUrl,
   chunkText,
   sanitizeFilename,
@@ -399,6 +401,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id'],
       },
     },
+    {
+      name: 'list_sessions',
+      description:
+        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {},
+      },
+    },
   ],
 }))
 
@@ -606,6 +617,37 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: paths.length
               ? `Downloaded ${paths.length} file(s):\n${paths.join('\n')}`
               : 'Failed to download any files.',
+          },
+        ],
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // list_sessions — introspection (ccsc-xa3.9)
+    // -----------------------------------------------------------------------
+    case 'list_sessions': {
+      // Pure read from the state dir. Returns lifecycle metadata
+      // only — session bodies (data field) are deliberately excluded
+      // so the operator gets an inventory without exposing
+      // conversation content that could carry secrets. See
+      // lib.listSessions for the full contract and
+      // LIST_SESSIONS_MAX for the hard-cap behavior.
+      const summaries = libListSessions(STATE_DIR)
+      const truncated = summaries.length >= LIST_SESSIONS_MAX
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                count: summaries.length,
+                max: LIST_SESSIONS_MAX,
+                truncated,
+                sessions: summaries,
+              },
+              null,
+              2,
+            ),
           },
         ],
       }
