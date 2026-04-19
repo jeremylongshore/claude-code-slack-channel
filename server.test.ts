@@ -711,6 +711,77 @@ describe('thread isolation — outbound gate (ccsc-xa3.5 → xa3.6)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// permissionPairingKey — ccsc-xa3.7
+// ---------------------------------------------------------------------------
+//
+// The pending-permissions map in server.ts is keyed on the composite
+// (thread_ts, request_id) pair so an approval posted in thread A
+// cannot satisfy a request that was issued from thread B. These tests
+// pin the key shape and collision behavior.
+
+describe('permissionPairingKey', () => {
+  test('returns distinct keys for different threads with the same requestId', async () => {
+    const { permissionPairingKey } = await import('./lib.ts')
+    const a = permissionPairingKey('T_A', 'abcde')
+    const b = permissionPairingKey('T_B', 'abcde')
+    expect(a).not.toBe(b)
+  })
+
+  test('returns the same key for equal (thread, requestId) pairs', async () => {
+    const { permissionPairingKey } = await import('./lib.ts')
+    expect(permissionPairingKey('T1.0', 'qrstu')).toBe(
+      permissionPairingKey('T1.0', 'qrstu'),
+    )
+  })
+
+  test('distinguishes undefined thread (top-level) from any threaded slot', async () => {
+    const { permissionPairingKey } = await import('./lib.ts')
+    const topLevel = permissionPairingKey(undefined, 'abcde')
+    const threaded = permissionPairingKey('T1.0', 'abcde')
+    const emptyThread = permissionPairingKey('', 'abcde')
+    expect(topLevel).not.toBe(threaded)
+    // An empty-string thread_ts should canonicalize to the same slot
+    // as undefined (both represent "no thread") — this prevents a
+    // crafted empty string from slipping into a different slot than
+    // a genuinely top-level message.
+    expect(topLevel).toBe(emptyThread)
+  })
+
+  test('separator prevents collisions that a naive concat would hit', async () => {
+    const { permissionPairingKey } = await import('./lib.ts')
+    // A naive `${thread}${requestId}` would collide these two: the
+    // first is thread="abc" + req="de", the second is thread="ab" +
+    // req="cde". Both stringify to "abcde". With the \0 separator
+    // each gets a distinct key.
+    const a = permissionPairingKey('abc', 'de')
+    const b = permissionPairingKey('ab', 'cde')
+    expect(a).not.toBe(b)
+  })
+
+  test('Map round-trip: set then get on the same (thread, requestId) retrieves, cross-thread does not', async () => {
+    const { permissionPairingKey } = await import('./lib.ts')
+    // Simulates the server.ts pendingPermissions.set/get flow
+    // (ccsc-xa3.7) with a minimal mock shape.
+    const map = new Map<string, { tool_name: string }>()
+    const issuedThread = 'T_ISSUE'
+    const requestId = 'mnopq'
+
+    map.set(permissionPairingKey(issuedThread, requestId), {
+      tool_name: 'bash',
+    })
+
+    // Same thread → retrieves the entry.
+    expect(map.get(permissionPairingKey(issuedThread, requestId))).toEqual({
+      tool_name: 'bash',
+    })
+    // Different thread, same requestId → cannot reach the entry.
+    expect(map.get(permissionPairingKey('T_OTHER', requestId))).toBeUndefined()
+    // Top-level slot, same requestId → cannot reach the entry.
+    expect(map.get(permissionPairingKey(undefined, requestId))).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // isSlackFileUrl() — gate for download_attachment
 // ---------------------------------------------------------------------------
 
