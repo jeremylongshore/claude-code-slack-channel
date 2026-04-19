@@ -207,6 +207,22 @@ export interface SessionSupervisor {
    *  to resume, and it will rebuild state from disk. */
   shutdown(): Promise<void>
 
+  /** Clear the quarantine flag for `key`, allowing a future `activate()`
+   *  to succeed. This is the explicit operator-action path specified in
+   *  session-state-machine.md §129 ("only a human (SO) clears this").
+   *
+   *  Contract:
+   *    - If `key` is not quarantined this is a no-op; no error is thrown
+   *      because the operator may have already cleared it.
+   *    - After this call, a subsequent `activate()` will attempt to load
+   *      the session file from disk as normal. If the file is still
+   *      corrupted, the load will fail and the key will be quarantined
+   *      again.
+   *    - Does not perform any I/O; it only removes the in-memory
+   *      quarantine entry. The audit journal event for this action lands
+   *      in Epic 32-B. */
+  clearQuarantine(key: SessionKey): void
+
   /** One pass of the idle reaper. Finds every `active` handle whose
    *  `session.lastActiveAt` is older than `idleMs` and has no in-flight
    *  work, then drives it through quiesce → deactivate.
@@ -329,6 +345,14 @@ export function createSessionSupervisor(
   // valued SessionKey literals would not collide.
   const live = new Map<string, ConcreteHandle>()
 
+  // Quarantined keys: maps keyId → the Error that caused the quarantine.
+  // Preserving the original failure reason allows activate() to surface
+  // the first-failure context when it rejects. Quarantined is a sticky
+  // terminal state per session-state-machine.md §129 — only an explicit
+  // clearQuarantine() call removes an entry. A key in this map MUST NOT
+  // also be in `live`; the two maps are disjoint by invariant.
+  const quarantined = new Map<string, Error>()
+
   // Single-flight: concurrent activate() calls for the same key share
   // one load/create promise. Cleared after the promise settles so a
   // post-deactivate re-activation is not served a stale entry.
@@ -355,11 +379,14 @@ export function createSessionSupervisor(
     } catch (err) {
       if (!isNotFound(err)) {
         // Real read failure: permissions, I/O, corrupt JSON, realpath
-        // escape. Caller treats this as a Quarantined transition; the
-        // quarantine bookkeeping (bead-filing, live-map entry with
-        // `state: 'quarantined'`) lands in ccsc-xa3.14. For now, surface
-        // the error and do not cache a handle. See session-state-
-        // machine.md §259-267 for the target failure-mode matrix.
+        // escape. Per session-state-machine.md §259-267 this is a
+        // Quarantined transition — record in the quarantined map so
+        // subsequent activate() calls reject rather than re-attempting
+        // a load that is likely still broken. Bead-filing lands in
+        // ccsc-xa3.8; the map entry is the in-process forensic trail.
+        const errObj = err instanceof Error ? err : new Error(String(err))
+        const id = keyId(key)
+        quarantined.set(id, errObj)
         log('session.activate_error', {
           channel: key.channel,
           thread: key.thread,
@@ -409,6 +436,20 @@ export function createSessionSupervisor(
       initialOwnerId?: string,
     ): Promise<SessionHandle> {
       const id = keyId(key)
+
+      // Quarantined keys are a sticky terminal state per session-state-
+      // machine.md §129. Reject immediately with the original failure
+      // reason so the caller surfaces the first-failure context rather
+      // than silently re-loading a potentially-corrupted file from disk.
+      // Only a human (SO) calling clearQuarantine() unblocks this key.
+      const priorErr = quarantined.get(id)
+      if (priorErr !== undefined) {
+        return Promise.reject(
+          new Error(
+            `SessionSupervisor.activate: key is quarantined: ${priorErr.message}`,
+          ),
+        )
+      }
 
       // Cached handle wins: subsequent activate() on a live key returns
       // the same handle without re-reading the file (session-state-
@@ -505,11 +546,15 @@ export function createSessionSupervisor(
         // A write failure at the deactivation boundary is not something
         // we can recover from on this handle — the on-disk copy may or
         // may not be the last-known-good. Transition to quarantine so
-        // the next activate() reloads from disk AND surfaces the
-        // failure to the SO. Bead-filing for quarantine lands with the
-        // reaper work (ccsc-xa3.8); for now the state change alone is
-        // the forensic trail.
+        // that the NEXT activate() rejects instead of silently re-
+        // loading a potentially-corrupted file. Recording the error in
+        // the quarantined map BEFORE removing from live ensures the
+        // signal is never lost between the two maps. Bead-filing for
+        // quarantine lands with the reaper work (ccsc-xa3.8); for now
+        // the quarantined map entry is the forensic trail.
         handle.markQuarantined()
+        quarantined.set(id, err instanceof Error ? err : new Error(String(err)))
+        live.delete(id)
         log('session.deactivate_error', {
           channel: key.channel,
           thread: key.thread,
@@ -524,6 +569,13 @@ export function createSessionSupervisor(
         channel: key.channel,
         thread: key.thread,
       })
+    },
+
+    clearQuarantine(key: SessionKey): void {
+      const id = keyId(key)
+      // No-op if not quarantined — idempotent so repeat operator calls
+      // (e.g. a script that bulk-clears) do not error.
+      quarantined.delete(id)
     },
 
     shutdown(): Promise<void> {

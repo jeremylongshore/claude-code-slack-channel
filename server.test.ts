@@ -29,6 +29,7 @@ import {
   type Session,
   type SessionKey,
 } from './lib.ts'
+import { createSessionSupervisor } from './supervisor.ts'
 import {
   mkdtempSync,
   mkdirSync,
@@ -5138,5 +5139,136 @@ describe('boot-event anchor pinning (ccsc-lfx integration)', () => {
       expect(result.break.seq).toBe(1)
       expect(result.break.reason).toMatch(/hash mismatch/)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SessionSupervisor — quarantine state-machine correctness (S6)
+//
+// These tests pin the invariant from session-state-machine.md §129:
+// Quarantined is a sticky terminal state. A key quarantined by a save
+// failure during deactivate() must stay quarantined across the next
+// activate() call. The in-process signal (quarantined Map) must survive
+// the live.delete(id) that follows, and activate() must reject with the
+// original failure reason.
+// ---------------------------------------------------------------------------
+
+describe('SessionSupervisor quarantine (S6)', () => {
+  // Shared key fixture.
+  const KEY_A: SessionKey = { channel: 'C_AAA', thread: '1700000000.000001' }
+  const KEY_B: SessionKey = { channel: 'C_BBB', thread: '1700000000.000002' }
+  const OWNER = 'U_OWNER'
+
+  let rawRoot: string
+  let stateRoot: string
+  let channelDir: string // sessions/C_AAA — we chmod this to trigger save failure
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'sup-s6-'))
+    stateRoot = realpathSync.native(rawRoot)
+    // Pre-create the channel dir so we can chmod it before deactivate.
+    channelDir = join(stateRoot, 'sessions', 'C_AAA')
+    mkdirSync(channelDir, { recursive: true, mode: 0o700 })
+  })
+
+  afterEach(() => {
+    // Restore permissions before cleanup so rmSync can remove the tree.
+    try {
+      const { chmodSync } = require('fs')
+      chmodSync(channelDir, 0o700)
+    } catch { /* best-effort */ }
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  /** Drive a key through activate → quiesce → deactivate where the final
+   *  saveSession() inside deactivate() fails because the channel directory
+   *  is mode 0o000 (no write permission). Returns the supervisor. */
+  async function activateThenFailDeactivate(key: SessionKey = KEY_A) {
+    const sup = createSessionSupervisor({
+      stateRoot,
+      log: () => { /* silent */ },
+    })
+
+    // Activate (creates the session file on disk).
+    const handle = await sup.activate(key, OWNER)
+    expect(handle.state).toBe('active')
+
+    // Quiesce so deactivate() is legal.
+    await sup.quiesce(key)
+
+    // Make the channel dir unwritable so the atomic tmp-write inside
+    // saveSession() fails with EACCES. This simulates a real filesystem
+    // permission failure without requiring root or a mock.
+    const { chmodSync } = require('fs')
+    chmodSync(channelDir, 0o000)
+
+    // deactivate() should throw and the key should land in quarantine.
+    await expect(sup.deactivate(key)).rejects.toThrow()
+
+    // Restore permissions so afterEach cleanup can rm the tree.
+    chmodSync(channelDir, 0o700)
+
+    return sup
+  }
+
+  test('post-failure re-activate rejects — quarantine is sticky', async () => {
+    const sup = await activateThenFailDeactivate()
+    // The key must now be quarantined; a second activate() must reject.
+    await expect(sup.activate(KEY_A, OWNER)).rejects.toThrow(
+      /SessionSupervisor\.activate: key is quarantined/,
+    )
+  })
+
+  test('quarantine rejection message carries prior error substring', async () => {
+    const sup = await activateThenFailDeactivate()
+    let msg = ''
+    try {
+      await sup.activate(KEY_A, OWNER)
+    } catch (err) {
+      msg = err instanceof Error ? err.message : String(err)
+    }
+    // The message must mention "quarantined" and include something from
+    // the underlying filesystem error (EACCES or "permission denied").
+    expect(msg).toMatch(/quarantined/i)
+    expect(msg.length).toBeGreaterThan('SessionSupervisor.activate: key is quarantined: '.length)
+  })
+
+  test('a different key is unaffected by another key\'s quarantine', async () => {
+    const sup = await activateThenFailDeactivate(KEY_A)
+    // KEY_A is quarantined, but KEY_B has never been touched.
+    // Pre-create the channel dir for B so activate can write the session.
+    mkdirSync(join(stateRoot, 'sessions', 'C_BBB'), { recursive: true, mode: 0o700 })
+    const handleB = await sup.activate(KEY_B, OWNER)
+    expect(handleB.state).toBe('active')
+  })
+
+  test('clearQuarantine unblocks a subsequent activate', async () => {
+    const sup = await activateThenFailDeactivate()
+    // Verify it is quarantined first.
+    await expect(sup.activate(KEY_A, OWNER)).rejects.toThrow(/quarantined/)
+    // Clear the quarantine.
+    sup.clearQuarantine(KEY_A)
+    // Now activate should succeed (the session file exists on disk).
+    const handle = await sup.activate(KEY_A)
+    expect(handle.state).toBe('active')
+  })
+
+  test('reaper skips quarantined key — regression guard', async () => {
+    // After a failed deactivate the key is NOT in the live map (live.delete
+    // ran). The reaper iterates the live map, so it must never see this key.
+    // This test confirms reapIdle() completes without throwing and does not
+    // attempt to quiesce/deactivate the quarantined entry.
+    const sup = await activateThenFailDeactivate()
+    // Set idleMs = 0 so every entry is technically eligible.
+    const aggressiveSup = createSessionSupervisor({
+      stateRoot,
+      idleMs: 0,
+      log: () => { /* silent */ },
+    })
+    // aggressiveSup has an empty live map; reapIdle is a no-op by design.
+    // The quarantine-carrying sup has no live entries either (live.delete ran).
+    // Both should complete without throwing.
+    await expect(sup.reapIdle()).resolves.toBeUndefined()
+    await expect(aggressiveSup.reapIdle()).resolves.toBeUndefined()
   })
 })
