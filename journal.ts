@@ -399,10 +399,18 @@ export class JournalWriter {
       nextSeq = 1
     }
 
-    // Mode 0o600 on creation; 'a' flag sets O_APPEND|O_WRONLY|O_CREAT.
-    // POSIX guarantees O_APPEND writes land atomically at EOF even with
-    // concurrent writers — we still serialize via the queue for the
-    // hash chain, not for write safety.
+    // Mode 0o600 on creation; 'a' flag sets O_APPEND|O_WRONLY|O_CREAT
+    // per audit-journal-architecture.md §155-160. POSIX guarantees
+    // O_APPEND writes land atomically at EOF even with concurrent
+    // writers — the kernel seeks to EOF and writes in one step. We
+    // still serialize via the queue for the hash chain, not for
+    // write-safety.
+    //
+    // FileHandle (fs.open) rather than fs.createWriteStream because
+    // we need explicit `fh.sync()` after every write for durability;
+    // streams buffer and make that awkward. One event = one write =
+    // one fsync for this bead (ccsc-5pi.7). A higher-volume operator
+    // can relax to batch fsync in a future bead.
     const fh = await fsOpen(opts.path, 'a', 0o600)
     ACTIVE_PATHS.add(opts.path)
 
@@ -487,6 +495,14 @@ export class JournalWriter {
     const line = JSON.stringify(event) + '\n'
     try {
       await this.fh.write(line)
+      // fsync after every successful write (ccsc-5pi.7). Durability
+      // discipline for an audit journal: a crash between `write()`
+      // buffering the line and the kernel flushing it would leave
+      // the chain apparently intact in memory but missing tail
+      // events on disk. For a per-developer journal the per-write
+      // fsync cost is imperceptible; for a higher-volume operator a
+      // sibling bead can relax this to batch fsync.
+      await this.fh.sync()
     } catch (err) {
       this.broken = err instanceof Error ? err : new Error(String(err))
       throw this.broken
@@ -515,7 +531,10 @@ export class JournalWriter {
     return this.nextSeq
   }
 
-  /** Flush and release the file descriptor. Idempotent: calling
+  /** Release the file descriptor. No separate flush is required:
+   *  every successful `writeEvent()` has already `fh.sync()`'d the
+   *  line to stable storage per ccsc-5pi.7, so there is no
+   *  buffered-but-unsynced tail to lose. Idempotent — calling
    *  `close()` on an already-closed writer is a no-op. After close,
    *  `writeEvent()` rejects. */
   async close(): Promise<void> {
