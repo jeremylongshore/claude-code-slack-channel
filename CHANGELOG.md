@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-channel `allowBotIds` for opt-in cross-bot message delivery (#33) — @CaseyMargell. Default-safe: absent or empty `allowBotIds` preserves the prior "all bot messages dropped" behavior for every existing install. Self-echo detection uses a triple-check against `bot_id`, `bot_profile.app_id`, and `user === botUserId` to cover Slack payload variants (including `as_user=false` posts and multi-workspace installs). Permission-reply-shaped peer-bot messages (`y abcde`, `no xyzwq`) are dropped at the gate. Peer bots still cannot approve permission prompts — that path is gated on the top-level `allowFrom`. See [ACCESS.md](ACCESS.md) for schema and security tradeoffs.
+- System prompt now warns Claude that peer-bot messages carry the same prompt-injection risk as human messages and may be coordinated by an attacker who controls the peer bot's session (#33).
+- Audit log line on every delivered bot message (`[slack] bot message delivered`) — diagnostics for multi-agent flows (#33).
+
+### Changed
+- Gemini PR review workflow switched from `pull_request` to `pull_request_target` so fork PRs receive AI review (#34). Workflow is read-only by design: checks out the PR head SHA but never executes any code from it, and the run-gemini-cli action is restricted to read-only shell tools.
+- `PERMISSION_REPLY_RE` moved from `server.ts` to `lib.ts` so the gate can drop permission-reply-shaped peer-bot text. No behavior change for human permission replies (#33).
+
+### Fixed
+- Docs: corrected runtime dependency count in `CONTRIBUTING.md` (was "three", actually four including `zod`) and filled the `CODE_OF_CONDUCT.md` enforcement contact placeholder with `jeremy@intentsolutions.io` (#28).
+
 ## [0.3.1] - 2026-04-15
 
 ### Fixed

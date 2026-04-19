@@ -99,13 +99,33 @@ See [ACCESS.md](ACCESS.md) for the full schema.
 /slack-channel:access status                 # Show current config
 ```
 
+### Multi-agent coordination
+
+Channels can opt in to cross-bot message delivery by listing trusted bot user IDs in `allowBotIds`. Useful when multiple Claude Code instances (or other bots you operate) need to coordinate in a shared channel — e.g., an ops-monitor agent and an engineering agent in `#incidents`. Default is no cross-bot delivery: every bot message is dropped at the gate. See [ACCESS.md](ACCESS.md) for the full schema and security tradeoffs.
+
+Example `access.json` entry:
+
+```json
+{
+  "channels": {
+    "C_INCIDENTS": {
+      "requireMention": false,
+      "allowFrom": ["U_OPS_BOT", "U_ENG_BOT", "U_HUMAN"],
+      "allowBotIds": ["U_OPS_BOT", "U_ENG_BOT"]
+    }
+  }
+}
+```
+
+Self-echoes from this bot are always filtered regardless of `allowBotIds`. Peer bots cannot approve permission prompts — the permission relay gates on the top-level `allowFrom`, not the channel policy.
+
 ## Security
 
 - **Sender gating**: Every inbound message hits a gate. Ungated messages are silently dropped before reaching Claude.
 - **Outbound gate**: Replies only work to channels that passed the inbound gate.
 - **File exfiltration guard**: Cannot send `.env`, `access.json`, or other state files through the reply tool.
 - **Prompt injection defense**: System instructions explicitly tell Claude to refuse pairing/access requests from Slack messages.
-- **Bot filtering**: All `bot_id` messages are dropped (prevents bot-to-bot loops).
+- **Bot filtering**: `bot_id` messages are dropped by default. Channels that host multiple cooperating agents can opt in to specific peers via `allowBotIds`; self-echoes are always filtered via `bot_id` / `bot_profile.app_id` / `user` triple-check.
 - **Link unfurling disabled**: All outbound messages set `unfurl_links: false, unfurl_media: false`.
 - **Token security**: `.env` is `chmod 0o600`, never logged, never in tool results.
 - **Static mode**: Set `SLACK_ACCESS_MODE=static` to freeze access at boot (no runtime mutation).

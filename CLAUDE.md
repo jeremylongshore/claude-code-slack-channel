@@ -50,10 +50,10 @@ CI runs typecheck + tests on every push to main and every PR (`.github/workflows
 
 This is a prompt injection vector. Five defense layers:
 
-1. **Inbound gate** (`gate()`) — drops ungated messages before MCP notification
+1. **Inbound gate** (`gate()`) — drops ungated messages before MCP notification. Bot messages dropped by default; per-channel `allowBotIds` opts specific peer bots in. Self-echo detection matches on `bot_id` / `bot_profile.app_id` / `user === botUserId` to cover payload variants. `PERMISSION_REPLY_RE` is checked at the gate so peer bots cannot inject permission-reply text.
 2. **Outbound gate** (`assertOutboundAllowed()`) — replies only to delivered channels
 3. **File exfiltration guard** (`assertSendable()`) — blocks sending state dir files
-4. **System prompt hardening** — instructions tell Claude to refuse pairing/access from messages
+4. **System prompt hardening** — instructions tell Claude to refuse pairing/access from messages. Peer-bot messages are flagged as carrying the same prompt-injection risk as human messages.
 5. **Token security** — `.env` chmod 0o600, atomic writes, never logged
 
 Any change to `gate()`, `assertSendable()`, or `assertOutboundAllowed()` is security-critical.
