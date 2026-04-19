@@ -11,7 +11,8 @@ The Slack channel uses `~/.claude/channels/slack/access.json` to control who can
   "channels": {
     "C12345678": {
       "requireMention": true,
-      "allowFrom": ["U12345678"]
+      "allowFrom": ["U12345678"],
+      "allowBotIds": []
     }
   },
   "pending": {
@@ -66,6 +67,30 @@ Map of channel IDs to policies. Only channels listed here are monitored.
 
 - `requireMention`: If true, only messages that @mention the bot are delivered
 - `allowFrom`: If non-empty, only these user IDs are delivered from this channel
+- `allowBotIds`: Opt-in list of bot user IDs allowed to deliver messages in this channel. Absent or empty (default) = all bot messages dropped. See "Multi-agent coordination" below.
+
+### Multi-agent coordination (`allowBotIds`)
+
+By default, every message with a `bot_id` is dropped at the gate to prevent bot-loop amplification and unintended interactions with third-party integrations (Zapier, PagerDuty, GitHub, etc.). Channels that need to host multiple cooperating agents — for example, an ops-monitor bot and an engineering bot coordinating in an `#incidents` channel — opt in by listing specific bot user IDs in `allowBotIds`.
+
+```json
+"channels": {
+  "C_INCIDENTS": {
+    "requireMention": false,
+    "allowFrom": ["U_OPS_BOT", "U_ENG_BOT", "U_HUMAN"],
+    "allowBotIds": ["U_OPS_BOT", "U_ENG_BOT"]
+  }
+}
+```
+
+Only bot user IDs explicitly listed in `allowBotIds` can deliver bot messages. Every other bot is dropped. Additional invariants enforced at the gate:
+
+- **Self-echo** from this bot is always filtered — even if its own user ID appears in `allowBotIds`. Filtering matches on `bot_id`, `bot_profile.app_id`, or `user === botUserId` to cover payload variants (including `as_user=false` posts and multi-workspace installs).
+- **Permission-reply-shaped messages** from peer bots (`y abcde`, `no xyzwq`) are dropped at the gate before reaching the permission relay. Peer bots cannot approve tool calls regardless of `allowBotIds` membership — the permission relay additionally requires the approver to be in the top-level `allowFrom`.
+- **`requireMention` and `allowFrom`** still apply. `allowBotIds` only gets a peer-bot message past the default `bot_id` drop; the usual channel gating runs afterward.
+- **DMs** are unaffected. `allowBotIds` is channel-scoped; bot messages in DM channels are always dropped.
+
+> **Security note:** Only add bot user IDs you operate or trust. A peer bot's messages reach Claude with the same effective trust as human messages, and a compromised peer bot can attempt prompt injection. The system prompt treats peer-bot content as untrusted, but that's a last-line defense — the first line is you being deliberate about what's in `allowBotIds`. Cross-bot delivery requires explicit opt-in precisely so operators have to think about this tradeoff before enabling it.
 
 ### `pending`
 Active pairing codes. Auto-pruned on every gate check.
