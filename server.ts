@@ -506,8 +506,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'fetch_messages': {
       const channel: string = args.channel
       const threadTs: string | undefined = args.thread_ts
-      assertOutboundAllowed(channel, threadTs)
       const limit = Math.min(args.limit || 20, 100)
+      assertOutboundAllowed(channel, threadTs)
 
       let messages: any[]
       if (threadTs) {
