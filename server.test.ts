@@ -5659,12 +5659,18 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
     await handle.update((s) => ({ ...s, data: { count: 0 } }))
 
     // Fire three concurrent increments without awaiting individually.
-    const p1 = handle.update((s) => ({ ...s, data: { count: (s.data['count'] as number) + 1 } }))
-    const p2 = handle.update((s) => ({ ...s, data: { count: (s.data['count'] as number) + 1 } }))
-    const p3 = handle.update((s) => ({ ...s, data: { count: (s.data['count'] as number) + 1 } }))
+    // Use a safe increment helper that avoids the `as number` cast and
+    // defaults gracefully if the field is absent (per Gemini review).
+    const increment = (s: Session): Session => {
+      const current = typeof s.data['count'] === 'number' ? s.data['count'] : 0
+      return { ...s, data: { ...s.data, count: current + 1 } }
+    }
+    const p1 = handle.update(increment)
+    const p2 = handle.update(increment)
+    const p3 = handle.update(increment)
     await Promise.all([p1, p2, p3])
 
-    expect((handle.session.data['count'] as number)).toBe(3)
+    expect(handle.session.data['count']).toBe(3)
 
     // Disk must also reflect the final value.
     const path = sessionPath(stateRoot, KEY)

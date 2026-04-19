@@ -871,9 +871,13 @@ class ConcreteHandle implements SessionHandle {
       )
     }
     if (enqueueTimeState !== 'active') {
-      // Covers 'quiescing', 'deactivating', and 'activating'.
+      // Covers 'quiescing', 'deactivating', and 'activating'. Include the
+      // actual state so callers can distinguish the cases without inspecting
+      // `handle.state` separately.
       return Promise.reject(
-        new Error(`SessionHandle.update: handle quiescing`),
+        new Error(
+          `SessionHandle.update: handle is not active (state: ${enqueueTimeState})`,
+        ),
       )
     }
 
@@ -897,7 +901,7 @@ class ConcreteHandle implements SessionHandle {
         return
       }
       if (this._state !== 'active') {
-        reject(new Error(`SessionHandle.update: handle quiescing`))
+        reject(new Error(`SessionHandle.update: handle is not active (state: ${this._state})`))
         return
       }
 
