@@ -3513,3 +3513,241 @@ describe('JournalWriter redaction integration', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Truncation — ccsc-5pi.5
+// ---------------------------------------------------------------------------
+
+describe('truncate', () => {
+  test('returns short strings unchanged', async () => {
+    const { truncate } = await import('./journal.ts')
+    expect(truncate('hello', 100)).toBe('hello')
+  })
+
+  test('truncates long strings with an inline [... truncated N chars] marker', async () => {
+    const { truncate } = await import('./journal.ts')
+    const long = 'a'.repeat(3000)
+    const out = truncate(long, 100) as string
+    expect(out.startsWith('a'.repeat(100))).toBe(true)
+    expect(out.endsWith('[... truncated 2900 chars]')).toBe(true)
+    // The truncated output is itself bounded — the marker adds a
+    // fixed-size suffix so the record stays usefully small.
+    expect(out.length).toBeLessThan(200)
+  })
+
+  test('recurses into arrays and truncates oversize elements', async () => {
+    const { truncate } = await import('./journal.ts')
+    const arr = ['short', 'x'.repeat(100), 42]
+    const out = truncate(arr, 20) as unknown[]
+    expect(out[0]).toBe('short')
+    expect(out[1]).toMatch(/^x{20}\[\.\.\. truncated 80 chars\]$/)
+    expect(out[2]).toBe(42)
+  })
+
+  test('adds <key>.len sibling when an object field is truncated', async () => {
+    const { truncate } = await import('./journal.ts')
+    const obj = { body: 'x'.repeat(5000), note: 'short' }
+    const out = truncate(obj, 200) as Record<string, unknown>
+    expect(typeof out.body).toBe('string')
+    expect((out.body as string).endsWith('[... truncated 4800 chars]')).toBe(true)
+    expect(out['body.len']).toBe(5000)
+    // Untruncated siblings do not get a .len entry.
+    expect(out.note).toBe('short')
+    expect('note.len' in out).toBe(false)
+  })
+
+  test('recurses deep into nested objects', async () => {
+    const { truncate } = await import('./journal.ts')
+    const obj = {
+      envelope: {
+        headers: { 'content-type': 'text/plain' },
+        body: 'y'.repeat(300),
+      },
+    }
+    const out = truncate(obj, 100) as {
+      envelope: {
+        headers: Record<string, unknown>
+        body: string
+        'body.len': number
+      }
+    }
+    expect(out.envelope.body.endsWith('[... truncated 200 chars]')).toBe(true)
+    expect(out.envelope['body.len']).toBe(300)
+    expect(out.envelope.headers).toEqual({ 'content-type': 'text/plain' })
+  })
+
+  test('returns same reference when nothing was truncated (allocation optimization)', async () => {
+    const { truncate } = await import('./journal.ts')
+    const obj = { a: 'short', b: [1, 2, 'also short'] }
+    expect(truncate(obj, 100)).toBe(obj)
+  })
+
+  test('pure: does not mutate its argument', async () => {
+    const { truncate } = await import('./journal.ts')
+    const obj = { body: 'z'.repeat(5000) }
+    const snapshot = JSON.stringify(obj)
+    truncate(obj, 100)
+    expect(JSON.stringify(obj)).toBe(snapshot)
+  })
+
+  test('non-string primitives pass through', async () => {
+    const { truncate } = await import('./journal.ts')
+    expect(truncate(null, 10)).toBeNull()
+    expect(truncate(42, 10)).toBe(42)
+    expect(truncate(true, 10)).toBe(true)
+  })
+
+  test('default limit is 2048', async () => {
+    const { truncate, TRUNCATION_LIMIT_DEFAULT } = await import('./journal.ts')
+    expect(TRUNCATION_LIMIT_DEFAULT).toBe(2048)
+    // A string just under the default passes through unchanged; one
+    // just over gets truncated.
+    expect(truncate('a'.repeat(2048))).toBe('a'.repeat(2048))
+    const out = truncate('a'.repeat(2049)) as string
+    expect(out).toMatch(/\[\.\.\. truncated 1 chars\]$/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// JournalWriter ↔ truncation integration
+// ---------------------------------------------------------------------------
+
+describe('JournalWriter truncation integration', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logPath: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'journal-trunc-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logPath = join(tmpRoot, 'audit.log')
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  const stableAnchor = 'a'.repeat(64)
+
+  test('truncates oversize input.* fields and adds .len sibling', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      const big = 'x'.repeat(5000)
+      const ev = await w.writeEvent({
+        kind: 'policy.deny',
+        input: { body: big, note: 'ok' },
+      })
+      const input = ev.input as Record<string, unknown>
+      expect(typeof input.body).toBe('string')
+      expect((input.body as string).length).toBeLessThan(2100)
+      expect((input.body as string).endsWith('[... truncated 2952 chars]')).toBe(true)
+      expect(input['body.len']).toBe(5000)
+      expect(input.note).toBe('ok')
+      // On-disk form agrees — the writer wrote the bounded version.
+      const disk = readFileSync(logPath, 'utf8')
+      expect(disk).not.toContain(big)
+      expect(disk).toContain('[... truncated 2952 chars]')
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('truncates oversize reason inline (no sibling — top-level schema is strict)', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      const bigReason = 'r'.repeat(3000)
+      const ev = await w.writeEvent({
+        kind: 'gate.inbound.drop',
+        reason: bigReason,
+      })
+      expect((ev.reason as string).endsWith('[... truncated 952 chars]')).toBe(
+        true,
+      )
+      // The top-level JournalEvent is .strict(); a `reason.len` sibling
+      // would be rejected. The inline marker carries the length
+      // signal instead.
+      expect('reason.len' in ev).toBe(false)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('redaction then truncation: a half-truncated token never lands', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      // Construct a payload that starts with normal content, hits the
+      // truncation boundary, and then contains a token after the
+      // boundary. Without redact-first-then-truncate, the writer
+      // could cut a token mid-string and leave partial secret bytes
+      // on disk. Doc §206 calls this out explicitly.
+      const prefix = 'x'.repeat(2040)
+      const token = 'sk-ant' + '-' + 'a'.repeat(30)
+      const big = prefix + token // crosses the 2048 boundary mid-token
+      const ev = await w.writeEvent({
+        kind: 'policy.deny',
+        input: { body: big },
+      })
+      const bodyOut = (ev.input as { body: string }).body
+      // No partial `sk-` fragment should remain — the token was
+      // redacted BEFORE the truncate step so the whole thing is gone.
+      expect(bodyOut).not.toContain('sk-')
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('hash is computed over the truncated form (verifier can re-derive)', async () => {
+    const { JournalWriter, canonicalJson, sha256Hex } = await import(
+      './journal.ts'
+    )
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => new Date('2026-04-19T12:34:56.789Z'),
+    })
+    try {
+      const ev = await w.writeEvent({
+        kind: 'policy.deny',
+        input: { body: 'y'.repeat(5000) },
+      })
+      const { hash: _h, ...rest } = ev
+      void _h
+      expect(sha256Hex(stableAnchor + canonicalJson(rest))).toBe(ev.hash)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('does not truncate non-eligible fields (toolName, ruleId, correlationId)', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      // Oversize values in non-eligible fields are passed through
+      // unchanged — matching the redaction policy. A caller who
+      // stuffs 5 KiB into correlationId gets the record written as-is
+      // (and the schema may reject it, which is the loud signal).
+      const longId = 'c'.repeat(3000)
+      const ev = await w.writeEvent({
+        kind: 'session.activate',
+        correlationId: longId,
+      })
+      expect(ev.correlationId).toBe(longId)
+    } finally {
+      await w.close()
+    }
+  })
+})
