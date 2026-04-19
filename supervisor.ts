@@ -514,9 +514,14 @@ class ConcreteHandle implements SessionHandle {
       if (this.quiescePromise === null) {
         // Defensive: state is quiescing but no promise was recorded.
         // That's a programmer error (markActive / beginQuiesce sequence
-        // violated). Fail loudly rather than silently synthesize.
+        // violated). Fail loudly rather than silently synthesize. The
+        // key is included so the journal sink can correlate the bug
+        // back to the offending session without grepping the running
+        // process.
         return Promise.reject(
-          new Error('beginQuiesce: quiescing state without drain promise'),
+          new Error(
+            `beginQuiesce: quiescing state without drain promise for ${JSON.stringify(this.key)}`,
+          ),
         )
       }
       return this.quiescePromise
