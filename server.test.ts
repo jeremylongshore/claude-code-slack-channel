@@ -4331,3 +4331,157 @@ describe('verifyJournal', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// TRUSTED_ANCHOR recorded in the first system.boot event body (ccsc-lfx)
+// ---------------------------------------------------------------------------
+//
+// Doc §76-85: the per-chain random anchor is pinned as the first
+// event's prevHash AND recorded in that event's body so a verifier
+// can recover it from the file alone.
+
+describe('createBootAnchor', () => {
+  test('returns a 64-char lowercase hex string', async () => {
+    const { createBootAnchor } = await import('./journal.ts')
+    const a = createBootAnchor()
+    expect(a).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  test('two successive calls yield different anchors', async () => {
+    const { createBootAnchor } = await import('./journal.ts')
+    const a = createBootAnchor()
+    const b = createBootAnchor()
+    expect(a).not.toBe(b)
+  })
+
+  test('anchor passes the JournalEvent.prevHash Sha256Hex shape', async () => {
+    const { createBootAnchor, JournalEvent } = await import('./journal.ts')
+    const anchor = createBootAnchor()
+    // Synthesize a plausible first-event object and run it through the
+    // strict schema to confirm the anchor is an acceptable prevHash.
+    const event = {
+      v: 1,
+      ts: '2026-04-19T12:00:00.000Z',
+      seq: 1,
+      kind: 'system.boot',
+      actor: 'system',
+      prevHash: anchor,
+      hash: '0'.repeat(64),
+    }
+    expect(() => JournalEvent.parse(event)).not.toThrow()
+  })
+})
+
+describe('boot-event anchor pinning (ccsc-lfx integration)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logPath: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'journal-anchor-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logPath = join(tmpRoot, 'audit.log')
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('fresh chain: anchor used as prevHash AND appears in body', async () => {
+    const { JournalWriter, createBootAnchor } = await import('./journal.ts')
+    const trustedAnchor = createBootAnchor()
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: trustedAnchor,
+    })
+    try {
+      const ev = await w.writeEvent({
+        kind: 'system.boot',
+        actor: 'system',
+        reason: 'fresh-chain bootstrap',
+        input: { trustedAnchor },
+      })
+      // prevHash pins the anchor.
+      expect(ev.prevHash).toBe(trustedAnchor)
+      // Body records the anchor so a verifier can recover it.
+      expect(ev.input).toEqual({ trustedAnchor })
+    } finally {
+      await w.close()
+    }
+
+    // Re-read the line from disk — both pin and record must survive
+    // serialization.
+    const disk = readFileSync(logPath, 'utf8')
+    const parsed = JSON.parse(disk.trim())
+    expect(parsed.prevHash).toBe(trustedAnchor)
+    expect(parsed.input.trustedAnchor).toBe(trustedAnchor)
+  })
+
+  test('verifyJournal accepts a chain whose first event records its anchor', async () => {
+    const { JournalWriter, createBootAnchor, verifyJournal } = await import(
+      './journal.ts'
+    )
+    const trustedAnchor = createBootAnchor()
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: trustedAnchor,
+    })
+    try {
+      await w.writeEvent({
+        kind: 'system.boot',
+        actor: 'system',
+        reason: 'fresh-chain bootstrap',
+        input: { trustedAnchor },
+      })
+      await w.writeEvent({
+        kind: 'gate.inbound.deliver',
+        actor: 'system',
+        outcome: 'allow',
+        reason: 'first real event',
+      })
+    } finally {
+      await w.close()
+    }
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(2)
+  })
+
+  test('tampering with the anchor-in-body breaks first-event hash', async () => {
+    const { JournalWriter, createBootAnchor, verifyJournal } = await import(
+      './journal.ts'
+    )
+    const trustedAnchor = createBootAnchor()
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: trustedAnchor,
+    })
+    try {
+      await w.writeEvent({
+        kind: 'system.boot',
+        actor: 'system',
+        input: { trustedAnchor },
+      })
+    } finally {
+      await w.close()
+    }
+
+    // Edit the trustedAnchor value inside input without touching
+    // prevHash or hash. The event's hash was computed over the
+    // original body, so the verifier's recomputation must mismatch.
+    const raw = readFileSync(logPath, 'utf8')
+    const tampered = raw.replace(
+      `"trustedAnchor":"${trustedAnchor}"`,
+      `"trustedAnchor":"${'0'.repeat(64)}"`,
+    )
+    expect(tampered).not.toBe(raw)
+    writeFileSync(logPath, tampered, 'utf8')
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.seq).toBe(1)
+      expect(result.break.reason).toMatch(/hash mismatch/)
+    }
+  })
+})

@@ -611,6 +611,22 @@ export function sha256Hex(input: string | Uint8Array): string {
   return createHash('sha256').update(input).digest('hex')
 }
 
+/** Generate a fresh per-chain `TRUSTED_ANCHOR` per audit-journal-
+ *  architecture.md §76-85. The returned string is a 64-char lowercase
+ *  hex digest of 32 random bytes — matches `Sha256Hex` so it can be
+ *  passed directly as `initialPrevHash` to `JournalWriter.open()`
+ *  AND recorded in the first `system.boot` event's body.
+ *
+ *  Callers must do both: pass it to the writer (so the first event's
+ *  `prevHash` pins it) and include it in the event body (so a reader
+ *  can recover the anchor from the file alone). The chain then
+ *  commits to the anchor in two places, meaning an attacker who
+ *  edits the anchor in either location breaks the first event's hash
+ *  verification. */
+export function createBootAnchor(): string {
+  return sha256Hex(randomBytes(32))
+}
+
 /** Narrow `value` to a plain object shape. Rejects arrays, null, and
  *  primitives. Used by `canonicalJson`, `redact`, and `truncate` so
  *  the `value as Record<string, unknown>` casts that previously
