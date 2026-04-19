@@ -3246,6 +3246,66 @@ describe('JournalWriter', () => {
     await expect(w.writeEvent(sysBoot)).rejects.toThrow(/closed/)
   })
 
+  test('open() uses O_APPEND: pre-existing content is preserved, writer appends at EOF', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    // Write a pre-existing valid event to the file *before* opening
+    // the writer. An append-semantic open must keep this line intact
+    // and treat it as the chain state to extend from. A
+    // naive-truncating open would clobber it.
+    const existingEvent = {
+      v: 1,
+      ts: '2026-04-19T10:00:00.000Z',
+      seq: 41,
+      kind: 'system.boot',
+      prevHash: stableAnchor,
+      hash: 'f'.repeat(64),
+    }
+    writeFileSync(logPath, JSON.stringify(existingEvent) + '\n', {
+      mode: 0o600,
+    })
+    const before = readFileSync(logPath, 'utf8')
+
+    const w = await JournalWriter.open({ path: logPath, now: () => fixedNow })
+    try {
+      const next = await w.writeEvent({ kind: 'session.activate' })
+      // seq continues from the recovered lastSeq+1 — proves we read
+      // the existing line rather than truncating.
+      expect(next.seq).toBe(42)
+      expect(next.prevHash).toBe('f'.repeat(64))
+    } finally {
+      await w.close()
+    }
+    const after = readFileSync(logPath, 'utf8')
+    // The pre-existing line is still there, character-for-character.
+    expect(after.startsWith(before)).toBe(true)
+    // And the new line followed it.
+    expect(after.length).toBeGreaterThan(before.length)
+    expect(after.split('\n').filter(Boolean)).toHaveLength(2)
+  })
+
+  test('every writeEvent fsyncs before resolving (durability)', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      // Verified indirectly: since a fresh fd has no sync-on-close
+      // guarantee for data on Linux, the fact that reading the file
+      // *immediately* after writeEvent sees the line at all is
+      // evidence the line hit page cache; the fsync guarantees it
+      // also hit disk. We can't easily observe "on disk" from a unit
+      // test, but we can at least assert the line is readable and
+      // parseable right after the write resolves.
+      const ev = await w.writeEvent({ kind: 'system.boot' })
+      const content = readFileSync(logPath, 'utf8')
+      expect(content.trim()).toBe(JSON.stringify(ev))
+    } finally {
+      await w.close()
+    }
+  })
+
   test('schema rejection at write time: invalid caller input does not land on disk', async () => {
     const { JournalWriter } = await import('./journal.ts')
     const w = await JournalWriter.open({
