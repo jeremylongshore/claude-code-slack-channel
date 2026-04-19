@@ -229,3 +229,264 @@ export function canonicalizeRequestPath(raw: string, cwd: string = process.cwd()
 export function pathMatchesPrefix(resolvedPath: string, resolvedPrefix: string): boolean {
   return resolvedPath === resolvedPrefix || resolvedPath.startsWith(resolvedPrefix + sep)
 }
+
+// ---------------------------------------------------------------------------
+// evaluate() — first-applicable combining (XACML) per policy-evaluation-flow.md
+// ---------------------------------------------------------------------------
+
+/** Surface of a tool call as the evaluator sees it.
+ *
+ *  Path-bearing tools put the caller-supplied path in `input.path`;
+ *  evaluate() canonicalizes it when a rule constrains `pathPrefix`.
+ *  `actor` is the direct caller — human approvers arrive as later turns,
+ *  never as the `actor` on the original call. */
+export interface ToolCall {
+  tool: string
+  input: Record<string, unknown>
+  sessionKey: { channel: string; thread: string }
+  actor: 'session_owner' | 'claude_process'
+}
+
+/** Key into the approvals map: `${ruleId}:${channel}:${thread}`. Scoped
+ *  to (rule, session) per policy-evaluation-flow.md §285-287 so a
+ *  different session in the same channel never inherits the approval. */
+export type ApprovalKey = string
+
+/** Build the approval-map key for a (rule, sessionKey) pair. */
+export function approvalKey(
+  ruleId: string,
+  sessionKey: { channel: string; thread: string },
+): ApprovalKey {
+  return `${ruleId}:${sessionKey.channel}:${sessionKey.thread}`
+}
+
+/** Set of tools for which an unmatched call defaults to deny-by-omission
+ *  (rather than the blanket allow for everything else). Mutation of
+ *  external state goes here; read-only tools do not — see
+ *  policy-evaluation-flow.md §107-117. */
+export const DEFAULT_REQUIRE_AUTHORED_POLICY: ReadonlySet<string> = new Set(['upload_file'])
+
+export interface EvaluateOptions {
+  /** (rule, session) → approval window. An entry with `ttlExpires > now`
+   *  flips a `require_approval` rule into an `allow` decision. Written
+   *  by the permission-reply handler, not by `evaluate()`. */
+  approvals?: ReadonlyMap<ApprovalKey, { ttlExpires: number }>
+  /** Tools that require an authored rule; unmatched calls return deny. */
+  requireAuthoredPolicy?: ReadonlySet<string>
+}
+
+/** Pure evaluator. Walks `rules` in authored order and returns on the
+ *  first match (XACML first-applicable, see policy-evaluation-flow.md
+ *  §89-93). Side-effect-free: journal emission, approval recording,
+ *  and Slack posts happen outside, after evaluate() returns.
+ *
+ *  Path matching canonicalizes both sides via `realpath` on every call
+ *  (see canonicalizeRequestPath + canonicalizeRulePathPrefix). If
+ *  either path does not exist, the `pathPrefix` constraint is treated
+ *  as "not matching" — fail-closed: a rule can't match a path that
+ *  doesn't resolve.
+ *
+ *  Returns the default decision when no rule matches:
+ *    - `deny` (rule = 'default') if `call.tool` is in requireAuthoredPolicy
+ *    - `allow` (rule undefined) otherwise
+ */
+export function evaluate(
+  call: ToolCall,
+  rules: readonly PolicyRule[],
+  now: number,
+  opts: EvaluateOptions = {},
+): PolicyDecision {
+  const approvals = opts.approvals ?? new Map<ApprovalKey, { ttlExpires: number }>()
+  const requireAuthored = opts.requireAuthoredPolicy ?? DEFAULT_REQUIRE_AUTHORED_POLICY
+
+  for (const rule of rules) {
+    if (!matchApplies(rule.match, call)) continue
+
+    switch (rule.effect) {
+      case 'auto_approve':
+        return { kind: 'allow', rule: rule.id }
+      case 'deny':
+        return { kind: 'deny', rule: rule.id, reason: rule.reason }
+      case 'require_approval': {
+        const approval = approvals.get(approvalKey(rule.id, call.sessionKey))
+        if (approval && approval.ttlExpires > now) {
+          return { kind: 'allow', rule: rule.id }
+        }
+        return {
+          kind: 'require',
+          rule: rule.id,
+          approver: 'human_approver',
+          ttlMs: rule.ttlMs,
+        }
+      }
+    }
+  }
+
+  // No rule matched — default branch.
+  if (requireAuthored.has(call.tool)) {
+    return {
+      kind: 'deny',
+      rule: 'default',
+      reason: `no policy authored for tool '${call.tool}'`,
+    }
+  }
+  return { kind: 'allow' }
+}
+
+/** Does `match` apply to `call`? Every undefined field is a wildcard. */
+function matchApplies(match: MatchSpec, call: ToolCall): boolean {
+  if (match.tool !== undefined && match.tool !== call.tool) return false
+  if (match.channel !== undefined && match.channel !== call.sessionKey.channel) return false
+  if (match.actor !== undefined && match.actor !== call.actor) return false
+
+  if (match.pathPrefix !== undefined) {
+    const raw = call.input['path']
+    if (typeof raw !== 'string') return false
+    try {
+      const resolvedPrefix = canonicalizeRulePathPrefix(match.pathPrefix)
+      const resolvedInput = canonicalizeRequestPath(raw)
+      if (!pathMatchesPrefix(resolvedInput, resolvedPrefix)) return false
+    } catch {
+      // Either side failed to resolve: treat as non-match. Fail-closed.
+      return false
+    }
+  }
+
+  if (match.argEquals !== undefined) {
+    for (const [k, v] of Object.entries(match.argEquals)) {
+      if (!jsonEqual(call.input[k], v)) return false
+    }
+  }
+
+  return true
+}
+
+/** Structural equality via JSON round-trip. Good enough for validated
+ *  MCP input (plain JSON, no functions/cycles/dates); if perf becomes
+ *  an issue, swap in a real deep-eq. Returns false on non-serializable
+ *  inputs rather than throwing. */
+function jsonEqual(a: unknown, b: unknown): boolean {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// detectShadowing() — load-time linter per policy-evaluation-flow.md §199-230
+// ---------------------------------------------------------------------------
+
+export interface ShadowWarning {
+  /** The rule that never gets reached. */
+  later: string
+  /** The earlier rule that swallows every call the later rule would match. */
+  earlier: string
+  message: string
+}
+
+/** Static subset-check over MatchSpec fields. A later rule is shadowed
+ *  when an earlier rule's match is less-specific-or-equal on every
+ *  field. Warn-not-block: the warnings go to stderr at load time so the
+ *  operator can reorder or narrow. Never fail-closed — an operator who
+ *  intentionally wrote an unreachable rule (e.g., as a placeholder
+ *  during a refactor) shouldn't be forced to delete it just to boot.
+ */
+export function detectShadowing(rules: readonly PolicyRule[]): ShadowWarning[] {
+  const warnings: ShadowWarning[] = []
+  for (let j = 1; j < rules.length; j++) {
+    const later = rules[j]!
+    for (let i = 0; i < j; i++) {
+      const earlier = rules[i]!
+      if (matchSubsetOrEqual(earlier.match, later.match)) {
+        warnings.push({
+          later: later.id,
+          earlier: earlier.id,
+          message: `rule '${later.id}' is shadowed by earlier rule '${earlier.id}' — every call the later rule would match is already caught by the earlier one`,
+        })
+        break // first shadow is sufficient; don't double-report
+      }
+    }
+  }
+  return warnings
+}
+
+/** Is `outer.match` less-specific-or-equal to `inner.match` on every
+ *  field? Used by both shadow detection and monotonicity — if yes,
+ *  `outer` matches a superset of what `inner` matches. */
+function matchSubsetOrEqual(outer: MatchSpec, inner: MatchSpec): boolean {
+  if (outer.tool !== undefined && outer.tool !== inner.tool) return false
+  if (outer.channel !== undefined && outer.channel !== inner.channel) return false
+  if (outer.actor !== undefined && outer.actor !== inner.actor) return false
+
+  if (outer.pathPrefix !== undefined) {
+    if (inner.pathPrefix === undefined) return false
+    // Lexical prefix check (both would be canonicalized in practice).
+    if (
+      inner.pathPrefix !== outer.pathPrefix &&
+      !inner.pathPrefix.startsWith(outer.pathPrefix + sep)
+    ) {
+      return false
+    }
+  }
+
+  if (outer.argEquals !== undefined) {
+    if (inner.argEquals === undefined) return false
+    for (const [k, v] of Object.entries(outer.argEquals)) {
+      if (!jsonEqual(inner.argEquals[k], v)) return false
+    }
+  }
+
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// checkMonotonicity() — hot-reload invariant per policy-evaluation-flow.md §234-244
+// ---------------------------------------------------------------------------
+
+export interface MonotonicityViolation {
+  /** The newly-added auto_approve rule that would weaken policy. */
+  newRule: string
+  /** The existing deny rule whose match the new rule supersets. */
+  existingDeny: string
+  message: string
+}
+
+/** Detects whether adopting `next` as the active policy set would
+ *  weaken policy compared to `prev`. A violation is:
+ *
+ *    A newly-added rule R with effect 'auto_approve' whose `match` is
+ *    a subset of an existing 'deny' rule's match — i.e., the deny
+ *    would have covered R's calls, so adding R silently opens a hole.
+ *
+ *  Caller's responsibility: if this returns a non-empty array, refuse
+ *  to adopt `next` and keep `prev` active. The server logs the
+ *  violation, surfaces a beads issue, and requires operator action
+ *  (doc §237-249). Removed rules don't trigger — removing a deny
+ *  obviously weakens policy, and the operator signed off by removing.
+ */
+export function checkMonotonicity(
+  prev: readonly PolicyRule[],
+  next: readonly PolicyRule[],
+): MonotonicityViolation[] {
+  const violations: MonotonicityViolation[] = []
+  const prevIds = new Set(prev.map((r) => r.id))
+  const prevDenies = prev.filter((r): r is Extract<PolicyRule, { effect: 'deny' }> => r.effect === 'deny')
+
+  for (const newRule of next) {
+    if (prevIds.has(newRule.id)) continue // unchanged or modified, not added
+    if (newRule.effect !== 'auto_approve') continue
+
+    for (const existingDeny of prevDenies) {
+      if (matchSubsetOrEqual(existingDeny.match, newRule.match)) {
+        violations.push({
+          newRule: newRule.id,
+          existingDeny: existingDeny.id,
+          message: `new auto_approve rule '${newRule.id}' weakens existing deny '${existingDeny.id}' — reload refused`,
+        })
+      }
+    }
+  }
+
+  return violations
+}

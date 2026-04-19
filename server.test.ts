@@ -2033,3 +2033,406 @@ describe('path canonicalization for match.pathPrefix (29-A.4)', () => {
     expect(pathMatchesPrefix(resolvedInput, resolvedPrefix)).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// evaluate() + detectShadowing() + checkMonotonicity() — ccsc-v1b.3/.5/.6/.7
+//
+// Full matrix covering first-applicable combining, every effect branch,
+// approval-turns-into-allow flow, match field interactions, path traversal
+// rejection, default branches, shadow detection, and hot-reload
+// monotonicity. Design doc: 000-docs/policy-evaluation-flow.md.
+// ---------------------------------------------------------------------------
+
+describe('evaluate() — policy engine (29-A.3)', () => {
+  const baseCall = (overrides: Partial<import('./policy.ts').ToolCall> = {}): import('./policy.ts').ToolCall => ({
+    tool: 'reply',
+    input: {},
+    sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+    actor: 'claude_process',
+    ...overrides,
+  })
+
+  const rule = (partial: Partial<import('./policy.ts').PolicyRule> & { id: string; effect: string }): import('./policy.ts').PolicyRule =>
+    ({
+      match: { tool: 'reply' },
+      priority: 100,
+      ...partial,
+    } as import('./policy.ts').PolicyRule)
+
+  // ── Single-rule branches ───────────────────────────────────────────────
+
+  test('auto_approve rule → allow with rule id', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [rule({ id: 'r1', effect: 'auto_approve' })]
+    const decision = evaluate(baseCall(), rules, 0)
+    expect(decision).toEqual({ kind: 'allow', rule: 'r1' })
+  })
+
+  test('deny rule → deny with reason + rule id', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [rule({ id: 'r1', effect: 'deny', reason: 'nope' } as never)]
+    const decision = evaluate(baseCall(), rules, 0)
+    expect(decision).toEqual({ kind: 'deny', rule: 'r1', reason: 'nope' })
+  })
+
+  test('require_approval rule → require with ttlMs', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000 } as never)]
+    const decision = evaluate(baseCall(), rules, 0)
+    expect(decision).toEqual({
+      kind: 'require',
+      rule: 'r1',
+      approver: 'human_approver',
+      ttlMs: 60_000,
+    })
+  })
+
+  // ── Approval flow ──────────────────────────────────────────────────────
+
+  test('fresh approval turns require_approval into allow', async () => {
+    const { evaluate, approvalKey } = await import('./policy.ts')
+    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000 } as never)]
+    const approvals = new Map([
+      [approvalKey('r1', { channel: 'C_CHAN', thread: 'T1.0' }), { ttlExpires: 5_000 }],
+    ])
+    const decision = evaluate(baseCall(), rules, 1_000, { approvals })
+    expect(decision).toEqual({ kind: 'allow', rule: 'r1' })
+  })
+
+  test('expired approval does NOT turn require into allow', async () => {
+    const { evaluate, approvalKey } = await import('./policy.ts')
+    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000 } as never)]
+    const approvals = new Map([
+      [approvalKey('r1', { channel: 'C_CHAN', thread: 'T1.0' }), { ttlExpires: 500 }],
+    ])
+    const decision = evaluate(baseCall(), rules, 1_000, { approvals })
+    expect(decision.kind).toBe('require')
+  })
+
+  test('approval scoped to (rule, sessionKey) — different thread does NOT inherit', async () => {
+    const { evaluate, approvalKey } = await import('./policy.ts')
+    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000 } as never)]
+    // Approval is for thread T1.0; caller is on T2.0.
+    const approvals = new Map([
+      [approvalKey('r1', { channel: 'C_CHAN', thread: 'T1.0' }), { ttlExpires: 5_000 }],
+    ])
+    const decision = evaluate(
+      baseCall({ sessionKey: { channel: 'C_CHAN', thread: 'T2.0' } }),
+      rules,
+      1_000,
+      { approvals },
+    )
+    expect(decision.kind).toBe('require')
+  })
+
+  // ── First-applicable combining ────────────────────────────────────────
+
+  test('first matching rule wins (first-applicable XACML)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({ id: 'deny-first', effect: 'deny', reason: 'no' } as never),
+      rule({ id: 'allow-second', effect: 'auto_approve' }),
+    ]
+    const decision = evaluate(baseCall(), rules, 0)
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.rule).toBe('deny-first')
+  })
+
+  test('non-matching rule is skipped; next rule evaluated', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({ id: 'wrong-tool', effect: 'deny', reason: 'x', match: { tool: 'upload_file' } } as never),
+      rule({ id: 'right-tool', effect: 'auto_approve', match: { tool: 'reply' } }),
+    ]
+    const decision = evaluate(baseCall(), rules, 0)
+    expect(decision.kind).toBe('allow')
+    if (decision.kind === 'allow') expect(decision.rule).toBe('right-tool')
+  })
+
+  // ── Match field semantics ─────────────────────────────────────────────
+
+  test('channel field mismatch → rule skipped', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({ id: 'r1', effect: 'auto_approve', match: { channel: 'C_OTHER' } }),
+    ]
+    const decision = evaluate(baseCall(), rules, 0)
+    // Default: reply is not in requireAuthoredPolicy → allow default.
+    expect(decision.kind).toBe('allow')
+    if (decision.kind === 'allow') expect(decision.rule).toBeUndefined()
+  })
+
+  test('actor field mismatch → rule skipped', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({ id: 'r1', effect: 'auto_approve', match: { actor: 'session_owner' } }),
+    ]
+    const decision = evaluate(baseCall({ actor: 'claude_process' }), rules, 0)
+    expect((decision as { kind: string }).kind).toBe('allow')
+  })
+
+  test('argEquals match with exact value', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({
+        id: 'r1',
+        effect: 'deny',
+        reason: 'no',
+        match: { tool: 'upload_file', argEquals: { mimeType: 'text/plain' } },
+      } as never),
+    ]
+    const decision = evaluate(
+      baseCall({ tool: 'upload_file', input: { mimeType: 'text/plain' } }),
+      rules,
+      0,
+    )
+    expect(decision.kind).toBe('deny')
+  })
+
+  test('argEquals mismatch → rule skipped', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({
+        id: 'r1',
+        effect: 'deny',
+        reason: 'no',
+        match: { tool: 'upload_file', argEquals: { mimeType: 'text/plain' } },
+      } as never),
+    ]
+    const decision = evaluate(
+      baseCall({ tool: 'upload_file', input: { mimeType: 'application/pdf' } }),
+      rules,
+      0,
+    )
+    // Default for upload_file: deny (in requireAuthoredPolicy).
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.rule).toBe('default')
+  })
+
+  // ── Path-prefix matching (realpath-based) ─────────────────────────────
+
+  test('path-prefix match with realpath canonicalization', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const root = mkdtempSync(join(tmpdir(), 'eval-path-'))
+    try {
+      const safeDir = join(root, 'safe')
+      mkdirSync(safeDir, { recursive: true })
+      const doc = join(safeDir, 'doc.txt')
+      writeFileSync(doc, 'x')
+
+      const rules = [
+        rule({
+          id: 'r1',
+          effect: 'auto_approve',
+          match: { tool: 'upload_file', pathPrefix: safeDir },
+        }),
+      ]
+      const decision = evaluate(
+        baseCall({ tool: 'upload_file', input: { path: doc } }),
+        rules,
+        0,
+      )
+      expect(decision.kind).toBe('allow')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('CWE-22: path traversal via ../ does not match a narrower pathPrefix', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const root = mkdtempSync(join(tmpdir(), 'eval-traversal-'))
+    try {
+      const safeDir = join(root, 'safe')
+      const secretsDir = join(root, 'secrets')
+      mkdirSync(safeDir, { recursive: true })
+      mkdirSync(secretsDir, { recursive: true })
+      const secret = join(secretsDir, 'key')
+      writeFileSync(secret, 'sensitive')
+
+      const rules = [
+        rule({
+          id: 'allow-safe',
+          effect: 'auto_approve',
+          match: { tool: 'upload_file', pathPrefix: safeDir },
+        }),
+      ]
+      const decision = evaluate(
+        baseCall({
+          tool: 'upload_file',
+          input: { path: join(safeDir, '..', 'secrets', 'key') },
+        }),
+        rules,
+        0,
+      )
+      // Traversal resolves outside safeDir → rule doesn't match → default
+      // branch (upload_file is in requireAuthoredPolicy) → deny.
+      expect(decision.kind).toBe('deny')
+      if (decision.kind === 'deny') expect(decision.rule).toBe('default')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('pathPrefix rule with nonexistent input path → rule skipped (fail-closed)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const root = mkdtempSync(join(tmpdir(), 'eval-nopath-'))
+    try {
+      const rules = [
+        rule({
+          id: 'r1',
+          effect: 'auto_approve',
+          match: { tool: 'upload_file', pathPrefix: root },
+        }),
+      ]
+      const decision = evaluate(
+        baseCall({ tool: 'upload_file', input: { path: join(root, 'ghost.txt') } }),
+        rules,
+        0,
+      )
+      // upload_file default: deny.
+      expect(decision.kind).toBe('deny')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  // ── Default branches (no rule matches) ────────────────────────────────
+
+  test('default allow for tools not in requireAuthoredPolicy', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const decision = evaluate(baseCall({ tool: 'reply' }), [], 0)
+    expect(decision).toEqual({ kind: 'allow' })
+  })
+
+  test('default deny for tools in requireAuthoredPolicy (default set includes upload_file)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const decision = evaluate(baseCall({ tool: 'upload_file' }), [], 0)
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') {
+      expect(decision.rule).toBe('default')
+      expect(decision.reason).toMatch(/no policy authored/)
+    }
+  })
+
+  test('custom requireAuthoredPolicy set overrides the default', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const decision = evaluate(baseCall({ tool: 'delete_message' }), [], 0, {
+      requireAuthoredPolicy: new Set(['delete_message']),
+    })
+    expect(decision.kind).toBe('deny')
+  })
+})
+
+describe('detectShadowing() — load-time linter (29-A.5)', () => {
+  const rule = (id: string, effect: string, match: Record<string, unknown> = {}, extras: Record<string, unknown> = {}): import('./policy.ts').PolicyRule =>
+    ({ id, effect, match, priority: 100, ...extras } as import('./policy.ts').PolicyRule)
+
+  test('broad auto_approve shadows narrower deny placed after it', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      rule('allow-all-uploads', 'auto_approve', { tool: 'upload_file' }),
+      rule('deny-env-upload', 'deny', { tool: 'upload_file', pathPrefix: '/etc' }, {
+        reason: 'blocks env',
+      }),
+    ]
+    const warnings = detectShadowing(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.later).toBe('deny-env-upload')
+    expect(warnings[0]!.earlier).toBe('allow-all-uploads')
+  })
+
+  test('no shadow when fields differ (different tool)', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      rule('r1', 'auto_approve', { tool: 'reply' }),
+      rule('r2', 'deny', { tool: 'upload_file' }, { reason: 'x' }),
+    ]
+    expect(detectShadowing(rules)).toEqual([])
+  })
+
+  test('no shadow when later rule is more-specific-different-value (different channel)', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      rule('r1', 'auto_approve', { channel: 'C_ONE' }),
+      rule('r2', 'deny', { channel: 'C_TWO' }, { reason: 'x' }),
+    ]
+    expect(detectShadowing(rules)).toEqual([])
+  })
+
+  test('shadow when earlier has fewer constraints and later has a superset of them', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      rule('broad', 'auto_approve', { tool: 'reply' }),
+      rule('narrow', 'deny', { tool: 'reply', channel: 'C_A' }, { reason: 'x' }),
+    ]
+    expect(detectShadowing(rules)).toHaveLength(1)
+  })
+
+  test('reports only the first shadowing earlier rule per later rule', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      rule('a', 'auto_approve', { tool: 'reply' }),
+      rule('b', 'auto_approve', { tool: 'reply' }), // also shadows c
+      rule('c', 'deny', { tool: 'reply' }, { reason: 'x' }),
+    ]
+    const warnings = detectShadowing(rules)
+    // "c" is shadowed, but only reported once (against "a").
+    expect(warnings.filter((w) => w.later === 'c')).toHaveLength(1)
+  })
+})
+
+describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
+  const rule = (id: string, effect: string, match: Record<string, unknown> = {}, extras: Record<string, unknown> = {}): import('./policy.ts').PolicyRule =>
+    ({ id, effect, match, priority: 100, ...extras } as import('./policy.ts').PolicyRule)
+
+  test('new auto_approve covered by existing deny → violation', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [rule('deny-all', 'deny', { tool: 'upload_file' }, { reason: 'x' })]
+    const next = [
+      rule('deny-all', 'deny', { tool: 'upload_file' }, { reason: 'x' }),
+      rule('allow-pdf', 'auto_approve', { tool: 'upload_file', argEquals: { mime: 'pdf' } }),
+    ]
+    const violations = checkMonotonicity(prev, next)
+    expect(violations).toHaveLength(1)
+    expect(violations[0]!.newRule).toBe('allow-pdf')
+    expect(violations[0]!.existingDeny).toBe('deny-all')
+  })
+
+  test('new deny rule does not trigger violation (doesn\'t weaken)', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [rule('r1', 'auto_approve', { tool: 'reply' })]
+    const next = [
+      rule('r1', 'auto_approve', { tool: 'reply' }),
+      rule('new-deny', 'deny', { tool: 'upload_file' }, { reason: 'x' }),
+    ]
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('modified rule (same id) does not count as "new" — no violation', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    // r1 changed effect, but same id — doc says removed/modified rules
+    // are not checked (operator signed off by editing).
+    const prev = [rule('deny-x', 'deny', { tool: 'upload_file' }, { reason: 'x' })]
+    const next = [rule('deny-x', 'auto_approve', { tool: 'upload_file' })]
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('adding auto_approve orthogonal to any existing deny → no violation', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [rule('deny-uploads', 'deny', { tool: 'upload_file' }, { reason: 'x' })]
+    const next = [
+      rule('deny-uploads', 'deny', { tool: 'upload_file' }, { reason: 'x' }),
+      rule('allow-replies', 'auto_approve', { tool: 'reply' }), // different tool
+    ]
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('empty prev + new auto_approves → no violations (nothing existing to weaken)', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const next = [
+      rule('r1', 'auto_approve', { tool: 'reply' }),
+      rule('r2', 'auto_approve', { tool: 'upload_file' }),
+    ]
+    expect(checkMonotonicity([], next)).toEqual([])
+  })
+})
