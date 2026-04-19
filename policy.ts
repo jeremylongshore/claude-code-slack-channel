@@ -67,8 +67,10 @@ const RuleBase = {
    *  messages. Two rules with the same id is a load-time error. */
   id: z.string().min(1).max(120),
 
-  /** Authored order of evaluation; lower first. Equal priorities tie-break
-   *  by the rule's position in the array the loader saw. */
+  /** Tie-breaker within effect when two rules would otherwise be
+   *  equivalent. Primary ordering is authored array position (first-
+   *  applicable, see 000-docs/policy-evaluation-flow.md §Combining).
+   *  Lower `priority` wins the tie. */
   priority: z.number().int().default(100),
 
   match: MatchSpec,

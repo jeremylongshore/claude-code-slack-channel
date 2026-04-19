@@ -8,3 +8,7 @@ bun.lockb
 .dolt/
 *.db
 .beads-credential-key
+
+# Claude Code local settings (per-machine / per-user)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
