@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-04-19
+
+### Added
+- **Thread-scoped session storage** (#45, #48, #51–54). Sessions now live at `~/.claude/channels/slack/sessions/<channel>/<thread>.json` instead of one file per channel. Two parallel threads in the same Slack channel no longer share state; each has its own mutex and rolling context. Migration from the v0.4.x flat layout runs once at boot — existing conversations surface as a `default` thread without context loss. Directories are `0o700`, files remain `0o600`. See [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md).
+- **Node.js / tsx as alternative MCP runtime** (#65) — @gog5-ops. Fixes a Bun event-loop bug where Socket Mode `message` events stop firing once `StdioServerTransport` attaches its own `data` listener to stdin. `.mcp.json` now launches via `./node_modules/.bin/tsx server.ts` by default; `tsx` added as a runtime dependency. The test suite still runs under `bun:test` (unaffected).
+- **Declarative policy engine** (#47, #57, #58) — internal; not yet wired into the request pipeline. `PolicyRule` Zod schema with three effects (`auto_approve` / `deny` / `require_approval`), `evaluate()` decision procedure following XACML first-applicable ordering, shadow-rule detection for load-time linting, and monotonicity checks to prevent hot reloads from widening auto-approve coverage over existing denies. Enforcement ships in a subsequent v0.5.x once the session supervisor is complete. See [`000-docs/policy-evaluation-flow.md`](000-docs/policy-evaluation-flow.md) and [`ACCESS.md`](ACCESS.md).
+- **Session supervisor skeleton** (#60, #62, #66) — internal; not yet wired. `SessionSupervisor` actor (Armstrong-style) with `activate(key, initialOwnerId?)` and `quiesce(key)` methods, in-flight tool-call tracking via AbortControllers, and structured `session.activate` / `session.quiesce` log lines for the future journal sink. `deactivate()` / idle reaper / `update()` land in a subsequent v0.5.x. See [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md).
+- **Design-in-public contracts** (#38–44, #59) — `ARCHITECTURE.md` with a four-principal model (user, Claude process, peer bots, Slack platform), `000-docs/THREAT-MODEL.md` with trust boundaries and T1–T10 threats, and frozen design docs for the session state machine, policy evaluation, audit journal, and bot-manifest protocol. Every subsequent PR in these areas is reviewable against the doc; drift is a review block.
+- **`.gemini/commands/gemini-review.toml`** — project-specific review prompt grounded in the threat model, gate invariants, policy purity, and supervisor mutex rules. See the [Changed] section below for the workflow fix.
+
+### Changed
+- **Gemini PR review workflow actually runs reviews now** (#61, #64). The prior config allowlisted `pull_request_read` / `add_comment_to_pending_review` / `pull_request_review_write` but never declared an `mcpServers.github` block to provide them, so Gemini ran silently with a default `"You are a helpful assistant."` prompt and posted nothing. Ported the working pattern from sibling repos: slash-command prompt (`/gemini-review`) resolves to the TOML above, `mcpServers.github` runs the official `ghcr.io/github/github-mcp-server` container, and required env (`GITHUB_TOKEN`, `ISSUE_*`, `PULL_REQUEST_NUMBER`, `REPOSITORY`) is wired. If you rebase off this repo, cherry-pick `.github/workflows/gemini-review.yml` and `.gemini/commands/gemini-review.toml`.
+- **Boot-time fail-fast on unparseable `SENDABLE_ROOTS`** (#56) — misconfig surfaces at startup instead of at first outbound upload, matching the posture of `.env` token loading.
+
+### Fixed
+- **`CLAUDE.md` drift** — `lib.ts` line count (460 → ~915) and `policy.ts` description updated to reflect the merged evaluator / shadow linter / monotonicity check (Epic 29-A).
+
+### Security
+- **`gate()` permission-reply hardening** — `PERMISSION_REPLY_RE` checked at the gate so peer bots (whose `allowBotIds` opt-in landed in v0.4.0) cannot inject permission-approval text. Self-echo detection triple-checks `bot_id` / `bot_profile.app_id` / `user === botUserId` to cover Slack payload variants.
+
+### Known caveats
+- `SessionHandle.update()` remains a staged stub that rejects with a "not yet implemented" bead pointer. The next v0.5.x lands it together with the `deactivate` and policy-wiring work, at which point the supervisor is callable from `server.ts`.
+
 ## [0.4.0] - 2026-04-18
 
 ### Added
