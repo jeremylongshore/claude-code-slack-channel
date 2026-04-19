@@ -98,8 +98,8 @@ export type SessionSchemaVersion = 1
  *  session-state-machine supervisor can migrate shapes without rewriting
  *  every field.
  *
- *  This type is the *file* shape; the in-memory SessionHandle (32-A.5)
- *  wraps it with mutex and lifecycle metadata.
+ *  This type is the *file* shape; the in-memory SessionHandle (32-B.1,
+ *  supervisor.ts) wraps it with mutex and lifecycle metadata.
  */
 export interface Session {
   /** Schema version of this session file. */
