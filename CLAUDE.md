@@ -87,7 +87,7 @@ This is a prompt injection vector. Five defense layers:
 
 1. **Inbound gate** (`gate()`) — drops ungated messages before MCP notification. Bot messages dropped by default; per-channel `allowBotIds` opts specific peer bots in. Self-echo detection matches on `bot_id` / `bot_profile.app_id` / `user === botUserId` to cover payload variants. `PERMISSION_REPLY_RE` is checked at the gate so peer bots cannot inject permission-reply text.
 2. **Outbound gate** (`assertOutboundAllowed()`) — replies only to delivered channels
-3. **File exfiltration guard** (`assertSendable()`) — blocks sending state dir files
+3. **File exfiltration guard** (`assertSendable()`) — blocks sending state dir files (`.env`, `access.json`, `sessions/`, future `audit.log`). State-dir layout and per-thread session files are specified in [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md) (Epic 32-A).
 4. **System prompt hardening** — instructions tell Claude to refuse pairing/access from messages. Peer-bot messages are flagged as carrying the same prompt-injection risk as human messages.
 5. **Token security** — `.env` chmod 0o600, atomic writes, never logged
 
@@ -95,10 +95,11 @@ Any change to `gate()`, `assertSendable()`, or `assertOutboundAllowed()` is secu
 
 ## State
 
-All state lives in `~/.claude/channels/slack/`:
+All state lives in `~/.claude/channels/slack/` (files `0o600`, directories `0o700`, single-writer):
 - `.env` — tokens (0o600)
 - `access.json` — allowlist + pairing codes (0o600, atomic writes)
 - `inbox/` — downloaded attachments
+- `sessions/<channel>/<thread>.json` — per-thread conversation state (v0.5.0+). Migrated flat pre-0.5.0 files surface as the `default` thread. See [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md) for the layout spec, lifecycle state machine, and supervisor contract; operator-facing docs in [`ACCESS.md`](ACCESS.md#state-directory-layout).
 
 ## Conventions
 
