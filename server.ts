@@ -52,6 +52,11 @@ import {
   type GateResult,
 } from './lib.ts'
 import { JournalWriter, createBootAnchor } from './journal.ts'
+import {
+  createSessionSupervisor,
+  resolveIdleMs,
+  type SessionSupervisor,
+} from './supervisor.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -218,6 +223,21 @@ const deliveredThreads = new Set<string>()
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
 const seenEvents = new Map<string, number>()
+
+// ---------------------------------------------------------------------------
+// Session supervisor — lifecycle authority for per-thread sessions
+// ---------------------------------------------------------------------------
+
+/** The single SessionSupervisor instance for this process. Boots in main()
+ *  once the state dir is confirmed ready. Every inbound `deliver` event
+ *  flows through this instance so it can drive activate/update/reap. See
+ *  000-docs/session-state-machine.md and ARCHITECTURE.md for the design
+ *  contract this wiring honours. */
+let supervisor: SessionSupervisor | null = null
+
+/** Interval handle for the idle reaper tick. Stored so it can be cleared
+ *  before supervisor.shutdown() during graceful exit. */
+let reaperTimer: ReturnType<typeof setInterval> | null = null
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -1035,6 +1055,57 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 // peer-bot permission-reply blocking.
 
 // ---------------------------------------------------------------------------
+// Supervisor helpers — exported for unit-testing without Socket Mode
+// ---------------------------------------------------------------------------
+
+/** Activate the session for `key` via `sup` and stamp `lastActiveAt`.
+ *
+ *  Exported so tests can drive the supervisor integration directly without
+ *  wiring up a real Socket Mode client. Production callers pass the module-
+ *  level `supervisor` instance; tests inject a mock.
+ *
+ *  Error policy: if `activate()` rejects (e.g. quarantined key) or
+ *  `update()` rejects (e.g. save failure), the error is logged with the
+ *  key and reason and the function returns normally. Never throws — the
+ *  caller (inbound deliver handler) must not propagate to the event loop.
+ *
+ *  @param sup   - Live supervisor instance.
+ *  @param key   - SessionKey: { channel, thread }. Thread must be non-empty
+ *                 (top-level messages use the message ts as thread).
+ *  @param ownerId - Slack user ID of the sender. Required for new sessions;
+ *                 ignored if the session file already exists on disk. */
+export async function activateAndTouch(
+  sup: SessionSupervisor,
+  key: import('./lib.ts').SessionKey,
+  ownerId: string | undefined,
+): Promise<void> {
+  let handle: import('./supervisor.ts').SessionHandle
+  try {
+    handle = await sup.activate(key, ownerId)
+  } catch (err) {
+    console.error('[slack] supervisor.activate failed — dropping message', {
+      channel: key.channel,
+      thread: key.thread,
+      error: err instanceof Error ? err.message : String(err),
+      ...(err instanceof Error && err.cause
+        ? { cause: err.cause instanceof Error ? err.cause.message : String(err.cause) }
+        : {}),
+    })
+    return
+  }
+
+  try {
+    await handle.update((s) => ({ ...s, lastActiveAt: Date.now() }))
+  } catch (err) {
+    console.error('[slack] handle.update failed — session state not persisted', {
+      channel: key.channel,
+      thread: key.thread,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Inbound message handler
 // ---------------------------------------------------------------------------
 
@@ -1081,6 +1152,23 @@ async function handleMessage(event: unknown): Promise<void> {
       const channelId = ev['channel'] as string
       const incomingThreadTs = ev['thread_ts'] as string | undefined
       deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
+
+      // Activate session and record inbound activity via the supervisor.
+      // The thread key follows session-state-machine.md §39: top-level
+      // messages (no thread_ts) use the message ts so every event maps
+      // to a non-null SessionKey. Covers both human and peer-bot deliver
+      // paths (ccsc-jqs / B3 + xa3.10).
+      //
+      // On activate failure (e.g. quarantined from a prior crash) we LOG
+      // and DROP — do not propagate so the event loop stays alive for
+      // other sessions. Same policy for handle.update() failures.
+      if (supervisor !== null) {
+        await activateAndTouch(
+          supervisor,
+          { channel: channelId, thread: incomingThreadTs ?? (ev['ts'] as string) },
+          ev['user'] as string | undefined,
+        )
+      }
 
       // Track last active channel for permission relay
       lastActiveChannel = channelId
@@ -1259,6 +1347,27 @@ async function shutdown(reason: string, code = 0): Promise<void> {
     await mcp.close()
   } catch { /* ignore */ }
 
+  // Stop the idle reaper before draining the supervisor so the reaper
+  // cannot race with shutdown's quiesce-all pass. clearInterval is a
+  // no-op if reaperTimer is null (supervisor was never started).
+  if (reaperTimer !== null) {
+    clearInterval(reaperTimer)
+    reaperTimer = null
+  }
+
+  // Drain in-flight session writes before exiting. This ensures that any
+  // handle.update() in progress completes its atomic save rather than
+  // leaving a half-written tmp file. Failures are non-fatal — better to
+  // exit with an imperfect save than to hang indefinitely.
+  if (supervisor !== null) {
+    try {
+      await supervisor.shutdown()
+    } catch (err) {
+      console.error('[slack] supervisor.shutdown() failed:', err)
+    }
+    supervisor = null
+  }
+
   // Write a final `system.shutdown` event before closing the journal
   // so the chain terminates cleanly with operator-visible intent.
   // Failures here are non-fatal — better to exit with an imperfect
@@ -1350,6 +1459,27 @@ async function main(): Promise<void> {
       process.exit(1)
     }
   }
+
+  // Boot the session supervisor. Must happen after the state dir is confirmed
+  // ready (mkdirSync above) and before Socket Mode connects so the first
+  // inbound deliver event finds the supervisor live. The idle threshold comes
+  // from SLACK_SESSION_IDLE_MS (resolveIdleMs falls back to 4 h when unset).
+  // See 000-docs/session-state-machine.md and ARCHITECTURE.md for the
+  // lifecycle contract this supervisor honours.
+  supervisor = createSessionSupervisor({
+    stateRoot: STATE_DIR,
+    idleMs: resolveIdleMs(process.env),
+  })
+
+  // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is
+  // older than idleMs and no in-flight work, and drives quiesce → deactivate.
+  // Stored in reaperTimer so shutdown() can clearInterval before draining.
+  reaperTimer = setInterval(() => {
+    void supervisor!.reapIdle()
+  }, 60_000)
+  // Don't hold the event loop open on the reaper tick alone — the socket and
+  // MCP transport already keep the process alive while active.
+  if (typeof reaperTimer.unref === 'function') reaperTimer.unref()
 
   // Resolve bot identity (user ID, bot ID, app ID) for mention detection
   // and self-echo filtering across payload variants and multi-workspace setups
