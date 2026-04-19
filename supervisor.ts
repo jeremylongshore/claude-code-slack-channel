@@ -381,11 +381,25 @@ export function createSessionSupervisor(
       return promise
     },
 
-    quiesce(_key: SessionKey): Promise<void> {
-      // ccsc-xa3.3.
-      return Promise.reject(
-        new Error('SessionSupervisor.quiesce: not yet implemented (ccsc-xa3.3)'),
-      )
+    quiesce(key: SessionKey): Promise<void> {
+      const id = keyId(key)
+      const handle = live.get(id)
+      if (handle === undefined) {
+        // Nothing to drain. Per session-state-machine.md §124 a
+        // quiesce() on a Nonexistent key is a no-op — there is no
+        // handle to transition and no work to flush. Do not emit a
+        // log line for the empty case; it adds no information and
+        // would confuse the journal sink's per-session correlation.
+        return Promise.resolve()
+      }
+
+      log('session.quiesce', {
+        channel: key.channel,
+        thread: key.thread,
+        inflight: handle.inFlight.size,
+      })
+
+      return handle.beginQuiesce()
     },
 
     deactivate(_key: SessionKey): Promise<void> {
@@ -415,13 +429,16 @@ export function createSessionSupervisor(
 /** In-process implementation of SessionHandle.
  *
  *  Not exported: callers consume the `SessionHandle` interface. Keeping
- *  the class private lets later beads (update(), quiesce()) grow its
+ *  the class private lets later beads (update(), deactivate()) grow its
  *  internals without widening the public surface.
  *
- *  This bead (ccsc-xa3.2) provides just enough handle shape to return
- *  from activate(): identity, state, snapshot, and the in-flight
- *  tool-call map required by the bead description. The `update()` body
- *  and quiesce-aware state transitions are staged in sibling beads. */
+ *  Current scope:
+ *    - ccsc-xa3.2 — identity, state, snapshot, in-flight map allocation,
+ *      markActive() transition.
+ *    - ccsc-xa3.3 — beginQuiesce()/beginWork()/endWork() drain mechanics
+ *      and the active → quiescing transition.
+ *    - update() body and Quiescing → Deactivating / cancellation edges
+ *      land in later beads. */
 class ConcreteHandle implements SessionHandle {
   readonly key: SessionKey
   session: Session
@@ -433,17 +450,27 @@ class ConcreteHandle implements SessionHandle {
   private _state: SessionState = 'activating'
 
   /** Per-request AbortControllers for tool calls dispatched against
-   *  this session. Populated by server.ts when it issues a tool call;
-   *  consumed by quiesce/shutdown to abort in-flight work before
-   *  persisting the final snapshot. Allocated here to satisfy the
-   *  activate-time contract in ccsc-xa3.2; the wiring into the tool-
-   *  call path is ccsc-xa3.15. */
+   *  this session. Populated by `beginWork()` (called from server.ts's
+   *  tool-call path in ccsc-xa3.15); cleared by `endWork()` when the
+   *  call settles. Quiesce waits for this map to drain; shutdown will
+   *  abort every entry before deactivating (ccsc-xa3.14). */
   readonly inFlight: Map<string, AbortController> = new Map()
 
   /** Resolved path this session's file lives at. Kept on the handle so
-   *  later beads' `update()` and quiesce paths do not re-run
+   *  later beads' `update()` and deactivate paths do not re-run
    *  `sessionPath()` (which would re-mkdir the parent). */
   readonly path: string
+
+  /** In-flight drain promise allocated by `beginQuiesce()`. Null when
+   *  the handle is Active (nothing to drain). Callers of quiesce share
+   *  this promise so concurrent quiesce() requests do not allocate
+   *  multiple drains. */
+  private quiescePromise: Promise<void> | null = null
+
+  /** Resolver for `quiescePromise`. Called by `endWork()` when the
+   *  last in-flight entry drains, or directly by `beginQuiesce()` when
+   *  the map is already empty at quiesce time. */
+  private resolveQuiesce: (() => void) | null = null
 
   constructor(key: SessionKey, session: Session, path: string) {
     this.key = key
@@ -464,10 +491,105 @@ class ConcreteHandle implements SessionHandle {
     this._state = 'active'
   }
 
+  /** Begin a graceful drain. Transitions state `active` → `quiescing`
+   *  and returns a promise that resolves when the in-flight map reaches
+   *  zero entries. Contract:
+   *
+   *    - Idempotent when already quiescing: returns the existing drain
+   *      promise so two concurrent callers share one drain.
+   *    - Idempotent no-op when the in-flight map is already empty:
+   *      resolves on the next microtask to preserve the promise
+   *      ordering callers expect.
+   *    - Rejects if called from any state other than `active` or
+   *      `quiescing` — the FSM has no edge there.
+   *
+   *  Called by `SessionSupervisor.quiesce()`. Not a SessionHandle
+   *  interface method; consumers use the supervisor's quiesce() entry
+   *  point which emits the `session.quiesce` log line. */
+  beginQuiesce(): Promise<void> {
+    if (this._state === 'quiescing') {
+      // Join the already-running drain (session-state-machine.md §266
+      // documents quiesce() as idempotent — a second call receives the
+      // first's promise).
+      if (this.quiescePromise === null) {
+        // Defensive: state is quiescing but no promise was recorded.
+        // That's a programmer error (markActive / beginQuiesce sequence
+        // violated). Fail loudly rather than silently synthesize.
+        return Promise.reject(
+          new Error('beginQuiesce: quiescing state without drain promise'),
+        )
+      }
+      return this.quiescePromise
+    }
+
+    if (this._state !== 'active') {
+      return Promise.reject(
+        new Error(
+          `beginQuiesce: cannot quiesce from state ${JSON.stringify(this._state)}`,
+        ),
+      )
+    }
+
+    this._state = 'quiescing'
+
+    this.quiescePromise = new Promise<void>((resolve) => {
+      this.resolveQuiesce = resolve
+    })
+
+    // If nothing is in flight at quiesce time, resolve on the next
+    // microtask. Queueing (rather than resolving inline) keeps the
+    // promise-returns-before-handler semantic consistent with the
+    // drain-via-endWork() path, so callers cannot accidentally depend
+    // on synchronous resolution.
+    if (this.inFlight.size === 0) {
+      queueMicrotask(() => {
+        this.resolveQuiesce?.()
+      })
+    }
+
+    return this.quiescePromise
+  }
+
+  /** Register an AbortController for an in-flight tool call and return
+   *  it to the caller. The caller's responsibility is to invoke
+   *  `endWork(requestId)` when the call settles. On shutdown (ccsc-
+   *  xa3.14) the supervisor will call `.abort()` on every entry still
+   *  in the map.
+   *
+   *  Not used in this bead — xa3.15 wires it into the tool-call path.
+   *  Published here so `beginQuiesce()` has a real drain contract to
+   *  honour and tests can exercise the drain path. */
+  beginWork(requestId: string): AbortController {
+    if (this.inFlight.has(requestId)) {
+      throw new Error(
+        `beginWork: requestId already in flight: ${JSON.stringify(requestId)}`,
+      )
+    }
+    const ctrl = new AbortController()
+    this.inFlight.set(requestId, ctrl)
+    return ctrl
+  }
+
+  /** Mark a tool call complete. Removes the controller from the in-
+   *  flight map and, if the handle is quiescing and the map is now
+   *  empty, resolves the drain promise. Safe to call with an unknown
+   *  requestId — treated as a no-op so crash-recovery bookkeeping
+   *  that double-ends is not a fatal error. */
+  endWork(requestId: string): void {
+    const had = this.inFlight.delete(requestId)
+    if (!had) return
+
+    if (this._state === 'quiescing' && this.inFlight.size === 0) {
+      this.resolveQuiesce?.()
+    }
+  }
+
   update(_fn: (prev: Session) => Session): Promise<void> {
     // Staged for a later bead. update() is documented in the interface
     // so later code can rely on the shape, but the mutex + atomic-write
-    // plumbing lands with the first real consumer (29-B or 32-B.3).
+    // plumbing lands with the first real consumer (29-B or a follow-up
+    // 32-B bead). The interface's "rejects when state !== 'active'"
+    // clause lands with the real impl — for now we reject uniformly.
     return Promise.reject(
       new Error('SessionHandle.update: not yet implemented (later 32-B bead)'),
     )

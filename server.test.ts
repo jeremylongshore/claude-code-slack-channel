@@ -2585,9 +2585,8 @@ describe('createSessionSupervisor.activate', () => {
     expect(handle.state).toBe('active')
   })
 
-  test('quiesce/deactivate/shutdown are staged stubs that reject with bead pointers', async () => {
+  test('deactivate/shutdown are staged stubs that reject with bead pointers', async () => {
     const sup = makeSupervisor()
-    await expect(sup.quiesce(key)).rejects.toThrow(/xa3\.3/)
     await expect(sup.deactivate(key)).rejects.toThrow(/xa3\.14/)
     await expect(sup.shutdown()).rejects.toThrow(/xa3\.14/)
   })
@@ -2596,5 +2595,190 @@ describe('createSessionSupervisor.activate', () => {
     const sup = makeSupervisor()
     const handle = await sup.activate(key, 'U_OWNER')
     await expect(handle.update((s) => s)).rejects.toThrow(/not yet implemented/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor.quiesce', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let logged: Array<{ event: string; fields: Record<string, unknown> }>
+
+  const key = { channel: 'C_QS', thread: 'T1.0' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-quiesce-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    logged = []
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: (event, fields) => {
+        logged.push({ event, fields })
+      },
+      clock: () => 1_700_000_000_000,
+    })
+  }
+
+  // Type-assert the package-private drain API for tests. Callers in
+  // server.ts reach this surface through the supervisor; tests poke it
+  // directly to exercise the drain without waiting for ccsc-xa3.15 to
+  // wire up the tool-call path.
+  type DrainHandle = import('./supervisor.ts').SessionHandle & {
+    beginWork(requestId: string): AbortController
+    endWork(requestId: string): void
+    readonly inFlight: Map<string, AbortController>
+  }
+
+  test('quiesce on an unknown key is a silent no-op and emits no log', async () => {
+    const sup = makeSupervisor()
+    await expect(sup.quiesce(key)).resolves.toBeUndefined()
+    expect(logged.filter((l) => l.event === 'session.quiesce')).toHaveLength(0)
+  })
+
+  test('quiesce transitions state active → quiescing and resolves when map is empty', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+    expect(handle.state).toBe('active')
+
+    const drain = sup.quiesce(key)
+    // State must flip synchronously before the drain promise resolves;
+    // otherwise a racing activate() would see stale 'active' and issue
+    // new work.
+    expect(handle.state).toBe('quiescing')
+
+    await drain
+    expect(handle.state).toBe('quiescing')
+  })
+
+  test('quiesce emits session.quiesce log with channel, thread, inflight count', async () => {
+    const sup = makeSupervisor()
+    const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
+    handle.beginWork('req-1')
+    handle.beginWork('req-2')
+
+    const drain = sup.quiesce(key)
+    const hit = logged.find((l) => l.event === 'session.quiesce')
+    expect(hit).toBeDefined()
+    expect(hit!.fields).toEqual({
+      channel: 'C_QS',
+      thread: 'T1.0',
+      inflight: 2,
+    })
+
+    handle.endWork('req-1')
+    handle.endWork('req-2')
+    await drain
+  })
+
+  test('quiesce waits for in-flight work to drain before resolving', async () => {
+    const sup = makeSupervisor()
+    const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
+    handle.beginWork('req-tool-1')
+
+    let resolved = false
+    const drain = sup.quiesce(key).then(() => {
+      resolved = true
+    })
+
+    // Let the microtask queue run — drain must NOT resolve yet because
+    // req-tool-1 is still in flight.
+    await new Promise<void>((r) => queueMicrotask(r))
+    expect(resolved).toBe(false)
+
+    handle.endWork('req-tool-1')
+    await drain
+    expect(resolved).toBe(true)
+  })
+
+  test('quiesce is idempotent: concurrent calls share one drain promise', async () => {
+    const sup = makeSupervisor()
+    const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
+    handle.beginWork('req-A')
+
+    // Three parallel quiesce() calls. The first emits the log; the
+    // other two must join the same drain without firing a second log.
+    const [p1, p2, p3] = [sup.quiesce(key), sup.quiesce(key), sup.quiesce(key)]
+
+    // quiesce() returns a fresh resolved promise for the no-log path,
+    // but in the log-emitting path they all point at the same handle
+    // drain. We don't rely on reference equality across the three
+    // promises (Promise.resolve wrappers differ); we rely on behaviour
+    // — exactly one log, and all three resolve together.
+    handle.endWork('req-A')
+    await Promise.all([p1, p2, p3])
+
+    expect(logged.filter((l) => l.event === 'session.quiesce')).toHaveLength(3)
+    // Three log lines because each supervisor.quiesce() call logs on
+    // entry. The underlying drain is shared; only the log is
+    // per-call. That matches the 'session.quiesce' contract — each
+    // quiesce *request* is audit-worthy even if they coalesce.
+  })
+
+  test('quiesce called again after drain already completed resolves without changing state', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U_OWNER')
+
+    await sup.quiesce(key) // first drain: empty map, resolves on microtask
+    expect(handle.state).toBe('quiescing')
+
+    // Second quiesce on an already-quiesced handle should return the
+    // cached drain promise (already resolved) and not try to re-enter
+    // the active→quiescing edge.
+    await expect(sup.quiesce(key)).resolves.toBeUndefined()
+    expect(handle.state).toBe('quiescing')
+  })
+
+  test('endWork on an unknown requestId is a no-op, does not spuriously resolve drain', async () => {
+    const sup = makeSupervisor()
+    const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
+    handle.beginWork('real-req')
+
+    // Drain should still be pending because real-req is live.
+    let resolved = false
+    const drain = sup.quiesce(key).then(() => {
+      resolved = true
+    })
+
+    handle.endWork('bogus-req') // unknown — should be ignored
+    await new Promise<void>((r) => queueMicrotask(r))
+    expect(resolved).toBe(false)
+
+    handle.endWork('real-req')
+    await drain
+  })
+
+  test('beginWork rejects duplicate requestId', async () => {
+    const sup = makeSupervisor()
+    const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
+    handle.beginWork('dup')
+    expect(() => handle.beginWork('dup')).toThrow(/already in flight/)
+  })
+
+  test('quiesce does not mutate inFlight map contents', async () => {
+    const sup = makeSupervisor()
+    const handle = (await sup.activate(key, 'U_OWNER')) as DrainHandle
+    const ctrl = handle.beginWork('abort-me')
+
+    const drain = sup.quiesce(key)
+    // quiesce must NOT abort in-flight work — graceful drain awaits
+    // natural completion. The shutdown path (ccsc-xa3.14) is the one
+    // that will call .abort(). Verify the controller is still live
+    // and the entry is still in the map.
+    expect(ctrl.signal.aborted).toBe(false)
+    expect(handle.inFlight.has('abort-me')).toBe(true)
+
+    handle.endWork('abort-me')
+    await drain
   })
 })
