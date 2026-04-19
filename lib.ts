@@ -11,6 +11,7 @@
 import { resolve, sep, basename, join } from 'path'
 import { realpathSync, mkdirSync, readdirSync, readFileSync, statSync, existsSync } from 'fs'
 import { writeFile, chmod, rename, unlink, readFile } from 'fs/promises'
+import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -123,6 +124,32 @@ export interface Session {
    *  32-A tests treat this field as an arbitrary object. */
   data: Record<string, unknown>
 }
+
+/** Zod schema mirroring the `Session` interface.
+ *
+ *  Used by `loadSession` to validate untrusted on-disk content before it
+ *  reaches the supervisor. `.strict()` means unknown top-level keys are
+ *  rejected — the writer controls this file; anything unexpected is
+ *  grounds for a Quarantined transition.
+ *
+ *  Export allows tests to build valid fixtures via `SessionSchema.parse()`
+ *  and gives `saveSession` a cheap sanity-check path in a future PR.
+ */
+export const SessionSchema = z
+  .object({
+    v: z.literal(1),
+    key: z
+      .object({
+        channel: z.string(),
+        thread: z.string(),
+      })
+      .strict(),
+    createdAt: z.number(),
+    lastActiveAt: z.number(),
+    ownerId: z.string(),
+    data: z.record(z.unknown()),
+  })
+  .strict()
 
 /** Component validator for session path segments.
  *
@@ -275,10 +302,10 @@ export async function saveSession(path: string, session: Session): Promise<void>
  *  - JSON.parse errors propagate unchanged. No silent recovery;
  *    malformed session files are loud failures.
  *
- *  This function does NOT schema-validate the parsed object against the
- *  `Session` shape. The writer (saveSession) is trusted to produce valid
- *  content; runtime schema validation is a separate concern (a Zod
- *  schema for Session would live with the type).
+ *  Schema-validates via `SessionSchema` (Zod, `.strict()`); malformed or
+ *  tampered files surface as a `ZodError` and cause the supervisor to
+ *  Quarantine the key. Unknown top-level fields are rejected — the writer
+ *  controls this file; anything unexpected is treated as corruption.
  *
  *  **Fail-closed posture.** Any throw here should drop the event (the
  *  supervisor Quarantines the key); it must never degrade to a partial
@@ -296,7 +323,8 @@ export async function loadSession(root: string, path: string): Promise<Session> 
     )
   }
   const raw = await readFile(resolvedFile, 'utf8')
-  return JSON.parse(raw) as Session
+  const parsed = JSON.parse(raw)
+  return SessionSchema.parse(parsed)
 }
 
 /** Minimal introspection record per session file. Intentionally NOT

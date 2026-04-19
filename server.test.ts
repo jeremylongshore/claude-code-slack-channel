@@ -24,6 +24,7 @@ import {
   MAX_PENDING,
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
+  SessionSchema,
   type Access,
   type GateOptions,
   type Session,
@@ -1566,6 +1567,83 @@ describe('loadSession', () => {
     expect(loadedB.ownerId).toBe('U_B')
     expect(loadedA.key.thread).toBe('TA.0')
     expect(loadedB.key.thread).toBe('TB.0')
+  })
+
+  // -------------------------------------------------------------------------
+  // S4 trust-boundary tests: Zod schema validation in loadSession
+  // -------------------------------------------------------------------------
+
+  test('S4: valid session round-trips cleanly via saveSession + loadSession', async () => {
+    // Full round-trip through the real save/load path — confirms
+    // SessionSchema accepts the canonical shape written by saveSession.
+    const key = { channel: 'C_S4_RT', thread: '1700000000.000200' }
+    const p = sessionPath(tmpRoot, key)
+    const s = makeSession(key.channel, key.thread)
+
+    await saveSession(p, s)
+    const loaded = await loadSession(tmpRoot, p)
+
+    expect(loaded).toEqual(s)
+  })
+
+  test('S4: corrupt-type rejection — ownerId as number throws ZodError', async () => {
+    // ownerId: 42 (number) violates the string constraint. This is the
+    // attack described in the S4 plan: a tampered file with wrong types
+    // previously passed `as Session` and reached the supervisor silently.
+    const p = sessionPath(tmpRoot, { channel: 'C_S4_TYPE', thread: 'T1.0' })
+    const corrupt = {
+      v: 1,
+      key: { channel: 'C_S4_TYPE', thread: 'T1.0' },
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_001_000,
+      ownerId: 42, // wrong type
+      data: {},
+    }
+    writeFileSync(p, JSON.stringify(corrupt), { mode: 0o600 })
+
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('S4: missing required field (channel inside key) throws ZodError', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_S4_MISS', thread: 'T1.0' })
+    const missing = {
+      v: 1,
+      key: { thread: 'T1.0' }, // channel omitted
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_001_000,
+      ownerId: 'U_OWNER',
+      data: {},
+    }
+    writeFileSync(p, JSON.stringify(missing), { mode: 0o600 })
+
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('S4: unknown top-level key throws ZodError (strict mode enforced)', async () => {
+    // .strict() on SessionSchema means any field not in the type contract
+    // is an error — guards against schema-drift where a new field is added
+    // to the writer but forgotten in the schema.
+    const p = sessionPath(tmpRoot, { channel: 'C_S4_UNK', thread: 'T1.0' })
+    const extraKey = {
+      v: 1,
+      key: { channel: 'C_S4_UNK', thread: 'T1.0' },
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_001_000,
+      ownerId: 'U_OWNER',
+      data: {},
+      injected: 'evil_payload', // unknown key
+    }
+    writeFileSync(p, JSON.stringify(extraKey), { mode: 0o600 })
+
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('S4: non-JSON bytes throw before Zod validation (JSON.parse fires first)', async () => {
+    // Confirms JSON.parse still throws on garbage input — Zod never sees it.
+    const p = sessionPath(tmpRoot, { channel: 'C_S4_JSON', thread: 'T1.0' })
+    writeFileSync(p, '\x00\x01\x02 not json }{', { mode: 0o600 })
+
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
   })
 })
 
