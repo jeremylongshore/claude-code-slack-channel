@@ -635,7 +635,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 // from authorizing a different thread's tool call even when the
 // requestIds genuinely differ. The composite key closes that gap.
 const PERM_TTL_MS = 5 * 60 * 1000
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; threadTs: string | undefined; createdAt: number }>()
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; createdAt: number }>()
 
 function pruneStalePermissions(): void {
   const cutoff = Date.now() - PERM_TTL_MS
@@ -687,13 +687,12 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   // Pin the request to the thread it was issued from. The button /
   // text-reply resolvers must present the SAME thread_ts to look the
   // entry up — see ccsc-xa3.7 for the cross-thread authorization gap
-  // this closes.
-  const issuedThreadTs = lastActiveThread
-  pendingPermissions.set(permKey(issuedThreadTs, params.request_id), {
+  // this closes. The thread itself is encoded in the key; no need
+  // to store it on the value.
+  pendingPermissions.set(permKey(lastActiveThread, params.request_id), {
     tool_name: params.tool_name,
     description: params.description,
     input_preview: params.input_preview,
-    threadTs: issuedThreadTs,
     createdAt: Date.now(),
   })
 
