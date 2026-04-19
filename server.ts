@@ -25,6 +25,7 @@ import {
   chmodSync,
   existsSync,
   renameSync,
+  statSync,
 } from 'fs'
 import {
   defaultAccess,
@@ -46,7 +47,7 @@ import {
   type Access,
   type GateResult,
 } from './lib.ts'
-import { JournalWriter } from './journal.ts'
+import { JournalWriter, createBootAnchor } from './journal.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -1104,17 +1105,45 @@ async function main(): Promise<void> {
   if (auditResolution.path !== null) {
     const absPath = resolve(auditResolution.path)
     try {
-      journal = await JournalWriter.open({ path: absPath })
+      // TRUSTED_ANCHOR per audit-journal-architecture.md §76-85: on a
+      // fresh chain, generate a per-chain random value, pin it as the
+      // first event's prevHash AND record it in that event's body.
+      // Recording it in the body lets a verifier recover the anchor
+      // from the file alone; pinning it as prevHash makes any
+      // post-hoc edit to the recorded value break the first event's
+      // hash verification. On an existing chain the anchor is already
+      // frozen in line 1 — we don't know it, don't need to, and must
+      // not overwrite it. `initialPrevHash` is ignored by the writer
+      // when the file is non-empty, so passing the anchor is only
+      // meaningful on a fresh open; the body field is likewise
+      // skipped on an existing chain (the boot event we're about to
+      // write is just a `system.reload`-flavored restart marker).
+      // Empty-but-touch'd files are treated as fresh by the writer
+      // (it seeds from `initialPrevHash` when the file has zero
+      // newline-delimited events), so match that rule here.
+      const isFreshChain =
+        !existsSync(absPath) || statSync(absPath).size === 0
+      const trustedAnchor = isFreshChain ? createBootAnchor() : null
+      journal = await JournalWriter.open({
+        path: absPath,
+        ...(trustedAnchor !== null ? { initialPrevHash: trustedAnchor } : {}),
+      })
       console.error(
         `[slack] audit journal enabled at ${absPath} (source: ${auditResolution.source})`,
       )
       // First event after open is the boot marker — gives the
       // verifier a clean starting landmark and records the
-      // operational start of this process.
+      // operational start of this process. On a fresh chain it
+      // also carries the `trustedAnchor` payload; on a resumed
+      // chain the body is kept minimal (the anchor lives in line 1
+      // of the existing file).
       await journal.writeEvent({
         kind: 'system.boot',
         actor: 'system',
         reason: `started from ${auditResolution.source} configuration`,
+        ...(trustedAnchor !== null
+          ? { input: { trustedAnchor } }
+          : {}),
       })
     } catch (err) {
       console.error(
