@@ -626,6 +626,59 @@ describe('assertOutboundAllowed', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Thread isolation — outbound gate (ccsc-xa3.5 failing fixture)
+// ---------------------------------------------------------------------------
+//
+// Documents the cross-thread leak that the current channel-only
+// `assertOutboundAllowed` signature does not prevent. Two sessions in
+// the same channel, different threads — a tool call dispatched in
+// thread A can craft a completion targeted at thread B and the
+// outbound gate will let it through because the gate only knows
+// channels, not threads.
+//
+// The ideal, documented in session-state-machine.md §207 ("per-thread
+// session isolation"), is that an outbound whose thread_ts was never
+// delivered to must be refused. Reaching that ideal requires:
+//
+//   - ccsc-xa3.6 — widen `assertOutboundAllowed` from (chatId, access,
+//     deliveredChannels) to a (channel, thread_ts, access,
+//     deliveredThreads) tuple so the guard can see threads.
+//   - ccsc-xa3.7 — widen the permission-pairing key from `requestId`
+//     to `(thread_ts, requestId)` so approvals in one thread cannot
+//     authorize a reply in another.
+//
+// This fixture is `test.failing` — bun runs it, expects it to fail,
+// and flags regression if it ever passes. When xa3.6 lands the fixture
+// flips to a regular `test` with the new signature. Keeping it red
+// today is the TDD signal the bead asked for.
+
+describe('thread isolation — outbound gate (ccsc-xa3.5)', () => {
+  test.failing(
+    'replies to an undelivered thread must be refused even when the channel did deliver',
+    () => {
+      const access = makeAccess()
+      // Simulate the reality xa3.5 is describing: channel C_SHARED had
+      // inbound delivery on thread T_A. Nothing has ever delivered on
+      // T_B — it's simply another thread a human could reply to in the
+      // same channel. A tool call originating in T_A must not be able
+      // to post into T_B.
+      const deliveredChannels = new Set(['C_SHARED'])
+
+      // Ideal behavior: the outbound guard throws because T_B has no
+      // delivered history. Current signature has no thread parameter,
+      // so the call returns void — this assertion fails today, which
+      // is exactly the failing fixture this bead asks for. When xa3.6
+      // widens the signature, this test gets rewritten to pass the
+      // (channel, thread_ts) pair, `test.failing` drops to `test`, and
+      // the invariant becomes enforced.
+      expect(() => {
+        assertOutboundAllowed('C_SHARED', access, deliveredChannels)
+      }).toThrow(/thread/)
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
 // isSlackFileUrl() — gate for download_attachment
 // ---------------------------------------------------------------------------
 
