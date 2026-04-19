@@ -6177,7 +6177,7 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
     // the quarantine directly. The cleanest path: use a session path that
     // points to a non-JSON file to force a parse error on the first activate.
     //
-    // supervisors quarantine on load failure. Write a corrupt JSON file first
+    // The supervisor quarantines on load failure. Write a corrupt JSON file first
     // so the FIRST activate triggers the quarantine path.
     const sessPath = sessionPath(stateDir, key)
     mkdirSync(join(stateDir, 'sessions', key.channel), { recursive: true })
