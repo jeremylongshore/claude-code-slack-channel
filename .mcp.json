@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "slack": {
-      "command": "bun",
-      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]
+      "command": "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/tsx",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server.ts"]
     }
   }
 }

@@ -7,7 +7,6 @@
  *
  * SPDX-License-Identifier: MIT
  */
-
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -860,7 +859,6 @@ async function handleMessage(event: unknown): Promise<void> {
   if (isDuplicateEvent(ev, seenEvents, Date.now(), EVENT_DEDUP_TTL_MS)) return
 
   const result = await gate(event)
-
   switch (result.action) {
     case 'drop':
       return
