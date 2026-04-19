@@ -561,6 +561,103 @@ describe('assertSendable', () => {
 })
 
 // ---------------------------------------------------------------------------
+// assertSendable() — state-root denylist (S1)
+// ---------------------------------------------------------------------------
+//
+// CLAUDE.md + THREAT-MODEL.md declare that files under the state directory
+// (`.env`, `access.json`, `audit.log`, `sessions/`) must never be sendable,
+// even when an operator configures SLACK_SENDABLE_ROOTS to an ancestor of the
+// state dir. The `stateRoot` parameter realpath-resolves both sides so a
+// symlink from outside into the state dir still trips the guard.
+
+describe('assertSendable — state-root denylist', () => {
+  let root: string          // tmp root analogous to ~/.claude
+  let stateRoot: string     // tmp state dir (analogous to ~/.claude/channels/slack)
+  let inbox: string         // INBOX_DIR inside state dir
+  let sibling: string       // non-state directory used as allowlist entry
+
+  beforeAll(() => {
+    root = realpathSync.native(mkdtempSync(join(tmpdir(), 'slack-sendable-state-')))
+    stateRoot = join(root, 'state')
+    inbox = join(stateRoot, 'inbox')
+    sibling = join(root, 'other')
+
+    mkdirSync(inbox, { recursive: true })
+    mkdirSync(join(stateRoot, 'sessions', 'C123'), { recursive: true })
+    mkdirSync(sibling, { recursive: true })
+
+    writeFileSync(join(stateRoot, 'access.json'), '{}')
+    writeFileSync(join(stateRoot, 'audit.log'), 'hash-chain')
+    writeFileSync(join(stateRoot, 'sessions', 'C123', 'T456.json'), '{}')
+    writeFileSync(join(sibling, 'ok.txt'), 'fine')
+
+    // Symlink OUTSIDE state dir that points to a file INSIDE it. Used to
+    // verify the realpath flattening on the stateRoot side of the check.
+    try {
+      symlinkSync(
+        join(stateRoot, 'access.json'),
+        join(sibling, 'innocent.txt'),
+      )
+    } catch { /* some FSes don't support symlinks; test will skip */ }
+  })
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  test('blocks access.json when operator allowlists an ancestor of the state dir', () => {
+    // Operator misconfig: SLACK_SENDABLE_ROOTS includes the parent of the
+    // state dir. Without the stateRoot guard this would have succeeded.
+    expect(() =>
+      assertSendable(join(stateRoot, 'access.json'), inbox, [root], stateRoot),
+    ).toThrow('state directory')
+  })
+
+  test('blocks a file deep inside sessions/<channel>/<thread>.json', () => {
+    expect(() =>
+      assertSendable(
+        join(stateRoot, 'sessions', 'C123', 'T456.json'),
+        inbox,
+        [root],
+        stateRoot,
+      ),
+    ).toThrow('state directory')
+  })
+
+  test('blocks a symlink OUTSIDE the state dir that points INTO it', () => {
+    try {
+      require('fs').lstatSync(join(sibling, 'innocent.txt'))
+    } catch {
+      return
+    }
+    // The symlink sits in `sibling` (which is in the allowlist), but its
+    // realpath resolves inside the state dir. The guard must follow.
+    expect(() =>
+      assertSendable(
+        join(sibling, 'innocent.txt'),
+        inbox,
+        [root, sibling],
+        stateRoot,
+      ),
+    ).toThrow('state directory')
+  })
+
+  test('allows a sibling directory next to the state dir', () => {
+    expect(() =>
+      assertSendable(join(sibling, 'ok.txt'), inbox, [sibling], stateRoot),
+    ).not.toThrow()
+  })
+
+  test('legacy three-arg call (no stateRoot) preserves existing behavior', () => {
+    // Operator did NOT supply stateRoot. We keep the old allowlist semantics
+    // so existing callers / tests keep passing.
+    expect(() =>
+      assertSendable(join(sibling, 'ok.txt'), inbox, [sibling]),
+    ).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // parseSendableRoots()
 // ---------------------------------------------------------------------------
 

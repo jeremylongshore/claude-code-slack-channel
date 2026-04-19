@@ -202,7 +202,7 @@ function getAccess(): Access {
 // ---------------------------------------------------------------------------
 
 function assertSendable(filePath: string): void {
-  libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS)
+  libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS, STATE_DIR)
 }
 
 // ---------------------------------------------------------------------------
