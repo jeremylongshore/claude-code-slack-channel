@@ -264,6 +264,36 @@ export function pathMatchesPrefix(resolvedPath: string, resolvedPrefix: string):
 }
 
 // ---------------------------------------------------------------------------
+// 31-A.4 Invariant — manifest data NEVER passed to evaluate()
+//
+// Design: 000-docs/bot-manifest-protocol.md §91-109 ("The binding invariant").
+//
+// Peer-bot manifests are advertisements, not grants (Miller 2006). Policy
+// decisions MUST use only verified signals carried on ToolCall (tool,
+// sessionKey.channel, actor) — never content a peer advertised about itself.
+// A peer claiming "I am an approver" in its manifest does not make it one;
+// allowBotIds and access.json are the only sources of role truth.
+//
+// Enforcement here is structural + contractual:
+//
+//   1. policy.ts imports NO manifest-module path, direct or re-exported.
+//      Enforced by the "31-A.4 invariant" test in server.test.ts, which
+//      parses this file's import specifiers on every CI run. A violation
+//      is a merge block, not a warning.
+//
+//   2. When the (future, conditionally-shipped) manifest consumer lands in
+//      Epic 31-A, its output flows to Claude only as MCP tool-call text —
+//      the same trust surface as a chat message. It does NOT flow into
+//      ToolCall.input, PolicyRule[], or EvaluateOptions. Reviewers of any
+//      31-A PR must confirm this before merge.
+//
+//   3. access.json mutation from manifest reads is forbidden (see the
+//      manifest protocol doc §190-203). That rule is enforced in the
+//      manifest-consumer module itself, not here — policy.ts's job is
+//      to stay unreachable from manifest content, full stop.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
 // evaluate() — first-applicable combining (XACML) per policy-evaluation-flow.md
 // ---------------------------------------------------------------------------
 
