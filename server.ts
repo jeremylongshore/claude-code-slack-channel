@@ -1330,9 +1330,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     // ccsc-0qk.4); they layer on without changing this surface.
     // -----------------------------------------------------------------------
     case 'publish_manifest': {
-      const channel: string = args.channel
-      const callerUserId: string = args.caller_user_id
-      const manifest = args.manifest as import('./manifest.ts').ManifestV1
+      // Re-parse with the tool's own schema so TypeScript sees proper
+      // types for the rest of the handler instead of the dispatcher's
+      // `Record<string, any>`. The top-level safeParse at dispatch has
+      // already validated shape; this second parse is essentially a
+      // typed destructure and will not throw on reachable input.
+      const {
+        channel,
+        caller_user_id: callerUserId,
+        manifest,
+      } = PublishManifestInput.parse(args)
 
       // Gate 1: only allowlisted humans may publish.
       try {
@@ -1378,9 +1385,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
         const pins = await web.pins.list({ channel })
         for (const item of pins.items ?? []) {
-          const msg = (item as {
-            message?: { text?: string | null; bot_id?: string; user?: string; ts?: string }
-          }).message
+          // pins.list returns items of several kinds (message, file,
+          // file_comment); only message items carry a manifest. Narrow
+          // on `type` first so we don't optimistically cast file items
+          // into a message shape that Slack never promised.
+          const narrowed = item as { type?: string; message?: unknown }
+          if (narrowed.type !== 'message') continue
+          const msg = narrowed.message as
+            | { text?: string | null; bot_id?: string; user?: string; ts?: string }
+            | undefined
           if (!msg || !msg.ts) continue
           const text = msg.text ?? ''
           const isOurs =
@@ -1417,7 +1430,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         unfurl_links: false,
         unfurl_media: false,
       })
-      const ts = (postRes.ts as string) || ''
+      const ts = postRes.ts || ''
       if (!ts) {
         throw new Error('publish_manifest: chat.postMessage returned no ts')
       }
