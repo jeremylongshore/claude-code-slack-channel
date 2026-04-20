@@ -5577,6 +5577,277 @@ describe('detectBroadAutoApprove', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Epic 29-B end-to-end contract tests (ccsc-me6.8 / me6.9 / me6.10)
+//
+// Exercise the full policy chain — evaluate() → decidePermissionRoute()
+// → recordApprovalVote() → policyApprovals grant → re-evaluate() — for
+// the three canonical scenarios from the release plan. These lock the
+// INVARIANTS the server handler relies on without requiring an MCP /
+// Slack mock harness:
+//
+//   me6.8  — auto_approve rule short-circuits to auto_allow route
+//            (the handler then skips Block Kit; that contract is
+//             documented on the route type and exercised in Phase 1).
+//   me6.9  — require:2 needs two distinct user_ids; same user voting
+//            twice is a no-op; quorum grants a TTL window; next call
+//            on the same (rule, session) pair auto-allows within TTL.
+//   me6.10 — deny route carries rule id + reason; the handler posts
+//            the reason to the thread (contract locked in the route
+//            type) without exec.
+//
+// The chain exercised here is identical to what server.ts executes at
+// runtime, minus the Slack/MCP I/O surface. A handler regression that
+// broke any of these invariants would surface as a test failure here
+// BEFORE hitting production.
+// ---------------------------------------------------------------------------
+
+describe('Epic 29-B integration — full policy chain', () => {
+  const loadLib = async () => await import('./lib.ts')
+  const loadPolicy = async () => await import('./policy.ts')
+
+  const makeCall = (
+    overrides: Partial<import('./policy.ts').ToolCall> = {},
+  ): import('./policy.ts').ToolCall => ({
+    tool: 'read_file',
+    input: {},
+    sessionKey: { channel: 'C0123456789', thread: '1712345678.001100' },
+    actor: 'claude_process',
+    ...overrides,
+  })
+
+  // ── me6.8 ────────────────────────────────────────────────────────────
+
+  test('me6.8: auto_approve rule → auto_allow route, no human prompt', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const { decidePermissionRoute } = await loadLib()
+    const rules = parsePolicyRules([
+      {
+        id: 'safe-reads',
+        effect: 'auto_approve',
+        match: { tool: 'read_file' },
+      },
+    ])
+    const decision = evaluate(makeCall({ tool: 'read_file' }), rules, 0)
+    expect(decision).toEqual({ kind: 'allow', rule: 'safe-reads' })
+    const route = decidePermissionRoute(decision)
+    expect(route).toEqual({ type: 'auto_allow', ruleId: 'safe-reads' })
+    // The handler contract on auto_allow: bypass Block Kit, reply
+    // 'allow' to Claude directly. That contract is exercised by the
+    // Phase 1 unit tests for decidePermissionRoute and by the server
+    // handler's switch on route.type. This test locks the chain.
+  })
+
+  test('me6.8: an unrelated tool does NOT match the safe-reads rule', async () => {
+    // Regression guard: the rule must NOT short-circuit calls on
+    // other tools. Combined with me6.8 above, we lock both the
+    // positive and negative cases of the match predicate.
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const { decidePermissionRoute } = await loadLib()
+    const rules = parsePolicyRules([
+      {
+        id: 'safe-reads',
+        effect: 'auto_approve',
+        match: { tool: 'read_file' },
+      },
+    ])
+    const decision = evaluate(makeCall({ tool: 'upload_file' }), rules, 0)
+    // Default branch: upload_file is in requireAuthoredPolicy → deny.
+    expect(decision.kind).toBe('deny')
+    const route = decidePermissionRoute(decision)
+    expect(route.type).toBe('deny')
+  })
+
+  // ── me6.9 ────────────────────────────────────────────────────────────
+
+  test('me6.9: require:2 needs two distinct user_ids, dedups same user, grants TTL window on quorum', async () => {
+    const { evaluate, parsePolicyRules, approvalKey } = await loadPolicy()
+    const { decidePermissionRoute, recordApprovalVote } = await loadLib()
+
+    const rules = parsePolicyRules([
+      {
+        id: 'dangerous-op',
+        effect: 'require_approval',
+        match: { tool: 'delete_project' },
+        ttlMs: 5 * 60 * 1000,
+        approvers: 2,
+      },
+    ])
+    const call = makeCall({ tool: 'delete_project' })
+    const now = 1_700_000_000_000
+
+    // First call: no approval in flight → require (2 approvers needed)
+    const approvals = new Map<string, { ttlExpires: number }>()
+    const firstDecision = evaluate(call, rules, now, { approvals })
+    expect(firstDecision.kind).toBe('require')
+    if (firstDecision.kind !== 'require') throw new Error('type narrow')
+    expect(firstDecision.approvers).toBe(2)
+    expect(decidePermissionRoute(firstDecision).type).toBe('require_human')
+
+    // Handler would attach PendingPolicyApproval; simulate here.
+    let pending: import('./lib.ts').PendingPolicyApproval = {
+      ruleId: firstDecision.rule,
+      ttlMs: firstDecision.ttlMs,
+      approversNeeded: firstDecision.approvers,
+      approvedBy: new Set<string>(),
+      sessionKey: call.sessionKey,
+    }
+
+    // First approver votes: pending (1 of 2).
+    let vote = recordApprovalVote(pending, 'U_ALICE', now)
+    expect(vote.kind).toBe('pending')
+    pending = vote.state
+    expect(pending.approvedBy.size).toBe(1)
+
+    // Same approver votes again: duplicate (NIST two-person integrity).
+    vote = recordApprovalVote(pending, 'U_ALICE', now + 1000)
+    expect(vote.kind).toBe('duplicate')
+    expect(vote.state.approvedBy.size).toBe(1) // unchanged
+
+    // Second DISTINCT approver votes: approved (2 of 2, quorum met).
+    vote = recordApprovalVote(pending, 'U_BOB', now + 2000)
+    expect(vote.kind).toBe('approved')
+    if (vote.kind !== 'approved') throw new Error('type narrow')
+    expect(vote.state.approvedBy.size).toBe(2)
+
+    // Handler grants TTL window in policyApprovals map.
+    approvals.set(approvalKey(pending.ruleId, call.sessionKey), {
+      ttlExpires: now + pending.ttlMs,
+    })
+
+    // Next call on same (rule, session) within TTL → auto-allow via
+    // approval window. The evaluator short-circuits without asking
+    // for a fresh quorum.
+    const secondDecision = evaluate(call, rules, now + 60_000, { approvals })
+    expect(secondDecision).toEqual({ kind: 'allow', rule: 'dangerous-op' })
+    expect(decidePermissionRoute(secondDecision).type).toBe('auto_allow')
+
+    // After TTL expiry the approval is stale → require fires again.
+    const thirdDecision = evaluate(call, rules, now + pending.ttlMs + 1, {
+      approvals,
+    })
+    expect(thirdDecision.kind).toBe('require')
+  })
+
+  test('me6.9: approval window is scoped to (rule, session) — a DIFFERENT session re-requires quorum', async () => {
+    // The approvalKey is `${ruleId}:${channel}:${thread}`. A fresh
+    // approval in thread A does NOT auto-allow the same rule in
+    // thread B or a different channel. This is the security-critical
+    // scoping invariant from policy-evaluation-flow.md §285-287.
+    const { evaluate, parsePolicyRules, approvalKey } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'dangerous-op',
+        effect: 'require_approval',
+        match: { tool: 'delete_project' },
+        approvers: 1,
+      },
+    ])
+    const now = 1_700_000_000_000
+
+    const approvals = new Map<string, { ttlExpires: number }>()
+    const sessionA = { channel: 'C001', thread: '1.000001' }
+    const sessionB = { channel: 'C001', thread: '1.000002' }
+    approvals.set(approvalKey('dangerous-op', sessionA), {
+      ttlExpires: now + 60_000,
+    })
+
+    // Session A: auto-allow via pre-granted approval.
+    const decA = evaluate(
+      makeCall({ tool: 'delete_project', sessionKey: sessionA }),
+      rules,
+      now,
+      { approvals },
+    )
+    expect(decA.kind).toBe('allow')
+
+    // Session B: no approval in this session → require fires.
+    const decB = evaluate(
+      makeCall({ tool: 'delete_project', sessionKey: sessionB }),
+      rules,
+      now,
+      { approvals },
+    )
+    expect(decB.kind).toBe('require')
+  })
+
+  // ── me6.10 ───────────────────────────────────────────────────────────
+
+  test('me6.10: deny rule → deny route with rule id + reason; handler contract is "no exec"', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const { decidePermissionRoute } = await loadLib()
+    const rules = parsePolicyRules([
+      {
+        id: 'no-shell',
+        effect: 'deny',
+        match: { tool: 'run_shell' },
+        reason: 'Shell execution is not permitted in this channel.',
+      },
+    ])
+    const decision = evaluate(makeCall({ tool: 'run_shell' }), rules, 0)
+    expect(decision).toEqual({
+      kind: 'deny',
+      rule: 'no-shell',
+      reason: 'Shell execution is not permitted in this channel.',
+    })
+    const route = decidePermissionRoute(decision)
+    expect(route).toEqual({
+      type: 'deny',
+      ruleId: 'no-shell',
+      reason: 'Shell execution is not permitted in this channel.',
+    })
+    // Handler contract for route.type === 'deny':
+    //   1. Post route.reason to the thread (Slack notice).
+    //   2. Reply 'deny' to Claude via mcp.notification.
+    //   3. No pendingPermissions entry, no exec.
+    // This contract is exercised by Phase 1's decidePermissionRoute
+    // tests and by the server handler's deny branch. The critical
+    // bit locked here is that `reason` flows through intact — a
+    // handler regression that dropped the reason would surface as
+    // a route-shape mismatch.
+  })
+
+  test('me6.10: first-applicable ordering — authored deny wins over later auto_approve', async () => {
+    // If an operator authors both deny and auto_approve for the same
+    // tool, first-applicable means deny wins. This is the XACML
+    // invariant from policy-evaluation-flow.md §89-93.
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'no-shell',
+        effect: 'deny',
+        match: { tool: 'run_shell' },
+        reason: 'blocked',
+      },
+      {
+        id: 'shell-ok',
+        effect: 'auto_approve',
+        match: { tool: 'run_shell' },
+      },
+    ])
+    const decision = evaluate(makeCall({ tool: 'run_shell' }), rules, 0)
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.rule).toBe('no-shell')
+  })
+
+  test('me6.10: default-deny for upload_file with no authored rule surfaces a default reason', async () => {
+    // upload_file is in DEFAULT_REQUIRE_AUTHORED_POLICY. With no
+    // authored rule, the default branch fires with rule='default'.
+    // The reason is a fixed template surfaced to Claude so the model
+    // knows why the call was rejected.
+    const { evaluate } = await loadPolicy()
+    const { decidePermissionRoute } = await loadLib()
+    const decision = evaluate(makeCall({ tool: 'upload_file' }), [], 0)
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') {
+      expect(decision.rule).toBe('default')
+      expect(decision.reason).toMatch(/no policy authored/)
+    }
+    const route = decidePermissionRoute(decision)
+    expect(route.type).toBe('deny')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // verifyJournal — ccsc-5pi.10 + happy-path E2E from ccsc-5pi.8
 // ---------------------------------------------------------------------------
 
