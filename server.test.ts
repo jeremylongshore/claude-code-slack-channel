@@ -908,6 +908,66 @@ describe('assertOutboundAllowed', () => {
 })
 
 // ---------------------------------------------------------------------------
+// assertPublishAllowed — publish-manifest gate (Epic 31-B.5, ccsc-0qk.5)
+//
+// Only user_ids in the top-level access.allowFrom may publish a manifest.
+// Same authorization surface that gates DMs. Default-safe: empty allowFrom
+// rejects everyone. Gate lands ahead of the publish_manifest MCP tool so
+// the authorization surface is fixed before any publish code is written —
+// symmetric to the 31-A.4 "manifest never reaches evaluate()" invariant.
+// ---------------------------------------------------------------------------
+
+describe('assertPublishAllowed (31-B.5)', () => {
+  test('allows user in access.allowFrom', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    const access = makeAccess({ allowFrom: ['U_ALICE', 'U_BOB'] })
+    expect(() => assertPublishAllowed('U_ALICE', access)).not.toThrow()
+    expect(() => assertPublishAllowed('U_BOB', access)).not.toThrow()
+  })
+
+  test('rejects user not in access.allowFrom with a clear, ID-bearing error', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    const access = makeAccess({ allowFrom: ['U_ALICE'] })
+    expect(() => assertPublishAllowed('U_EVE', access)).toThrow(/Publish gate/)
+    expect(() => assertPublishAllowed('U_EVE', access)).toThrow(/U_EVE/)
+    expect(() => assertPublishAllowed('U_EVE', access)).toThrow(/access\.allowFrom/)
+  })
+
+  test('rejects every caller when allowFrom is empty (hardened default)', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    // defaultAccess() sets allowFrom: [] — nobody can publish until an
+    // operator explicitly adds a user. This test locks in the fail-closed
+    // posture so a future refactor that inverts the check breaks here.
+    const access = makeAccess() // allowFrom: []
+    expect(() => assertPublishAllowed('U_ALICE', access)).toThrow(/Publish gate/)
+    expect(() => assertPublishAllowed('U_BOB', access)).toThrow(/Publish gate/)
+    expect(() => assertPublishAllowed('', access)).toThrow(/Publish gate/)
+  })
+
+  test('is case-sensitive on user_id (Slack IDs are opaque and exact-match)', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    const access = makeAccess({ allowFrom: ['U_ALICE'] })
+    // Slack user IDs are opaque and case-sensitive. A lookalike must fail.
+    expect(() => assertPublishAllowed('u_alice', access)).toThrow(/Publish gate/)
+    expect(() => assertPublishAllowed('U_ALICE ', access)).toThrow(/Publish gate/)
+  })
+
+  test('does not consult per-channel ChannelPolicy.allowFrom', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    // Channel-level allowFrom governs inbound message delivery, not the
+    // workspace-level publish act. Operators managing the per-channel
+    // list cannot accidentally grant publish authority.
+    const access = makeAccess({
+      allowFrom: [], // top-level empty
+      channels: {
+        C_GENERAL: { requireMention: false, allowFrom: ['U_ALICE'] },
+      },
+    })
+    expect(() => assertPublishAllowed('U_ALICE', access)).toThrow(/Publish gate/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Thread isolation — outbound gate (ccsc-xa3.5 landed → ccsc-xa3.6 fixed)
 // ---------------------------------------------------------------------------
 //
