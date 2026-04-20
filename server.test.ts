@@ -7502,14 +7502,15 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(errors[0]!.err).toBe('channel_not_found')
   })
 
-  test('non-ok Slack response without error string — falls back to generic marker', async () => {
+  test('non-ok Slack response without error string — falls back to generic marker, result undefined', async () => {
     const errors: Array<{ err: unknown }> = []
-    await buildAndPostAuditReceipt(
+    const result = await buildAndPostAuditReceipt(
       async () => ({ ok: false }),
       'C1', undefined, 'Bash',
       { ...baseChannel, audit: 'compact' },
       (ctx) => errors.push(ctx),
     )
+    expect(result).toBeUndefined()
     expect(errors).toHaveLength(1)
     expect(errors[0]!.err).toBe('non-ok response')
   })
