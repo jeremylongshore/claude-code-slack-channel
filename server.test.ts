@@ -3442,6 +3442,125 @@ describe('ManifestV1 schema (31-A.1)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// extractManifests — pure filter/parse/validate (Epic 31-A.2, ccsc-s53.2)
+//
+// Feeds the `read_peer_manifests` MCP tool in server.ts. "Silent drop"
+// posture per 000-docs/bot-manifest-protocol.md §81: malformed JSON,
+// failed Zod, missing magic header, or non-string bodies are all
+// dropped without surfacing to callers. These tests pin that posture.
+// ---------------------------------------------------------------------------
+
+describe('extractManifests (31-A.2)', () => {
+  /** Canonical valid manifest body as a JSON string. */
+  function validManifestJson(overrides: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      __claude_bot_manifest_v1__: true,
+      name: 'Example Bot',
+      vendor: 'Acme Corp',
+      version: '1.2.3',
+      description: 'A minimal example manifest for tests.',
+      tools: [{ name: 'reply', description: 'Post a reply.' }],
+      publishedAt: '2026-01-01T00:00:00.000Z',
+      ...overrides,
+    })
+  }
+
+  test('returns [] for an empty input array', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    expect(extractManifests([])).toEqual([])
+  })
+
+  test('returns [] when no message body contains the magic header', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    expect(
+      extractManifests(['plain chat', 'another message', JSON.stringify({ not: 'a manifest' })]),
+    ).toEqual([])
+  })
+
+  test('extracts a single valid manifest', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    const [m] = extractManifests([validManifestJson({ name: 'Solo Bot' })])
+    expect(m).toBeDefined()
+    expect(m?.name).toBe('Solo Bot')
+    expect(m?.__claude_bot_manifest_v1__).toBe(true)
+  })
+
+  test('preserves input order across a mix of valid and invalid entries', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    const out = extractManifests([
+      'plain chat',
+      validManifestJson({ name: 'First' }),
+      '{malformed json',
+      validManifestJson({ name: 'Second' }),
+    ])
+    expect(out.map((m) => m.name)).toEqual(['First', 'Second'])
+  })
+
+  test('silently drops entries whose JSON fails to parse', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    // Payload contains the magic key textually but is not valid JSON.
+    const malformed = '{"__claude_bot_manifest_v1__": true, name: missing-quotes}'
+    expect(extractManifests([malformed])).toEqual([])
+  })
+
+  test('silently drops entries that fail Zod validation', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    // Valid JSON, has the magic header, but version is not SemVer.
+    const invalid = validManifestJson({ version: 'not-a-version' })
+    expect(extractManifests([invalid])).toEqual([])
+  })
+
+  test('silently drops entries where the magic header is truthy but not literally true', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    // Crucial for the binding invariant: presence is not grant. Both
+    // payloads mention the magic key string so the cheap pre-filter
+    // accepts them, but the Zod literal() check must reject.
+    const imposterString = validManifestJson({ __claude_bot_manifest_v1__: 'yes' })
+    const imposterOne = validManifestJson({ __claude_bot_manifest_v1__: 1 })
+    expect(extractManifests([imposterString, imposterOne])).toEqual([])
+  })
+
+  test('skips null, undefined, empty-string, and non-string-shaped bodies without throwing', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    // Non-string-shaped entries arrive at the function as (conceptually)
+    // `unknown`; the function's signature narrows to string|null|undefined
+    // but we still exercise the runtime guards so a typed-but-lying caller
+    // can't crash the consumer.
+    const mixed: Array<string | null | undefined> = [
+      null,
+      undefined,
+      '',
+      validManifestJson({ name: 'Kept' }),
+      null,
+    ]
+    const out = extractManifests(mixed)
+    expect(out).toHaveLength(1)
+    expect(out[0]?.name).toBe('Kept')
+  })
+
+  test('pre-filter skips payloads that never mention the magic key', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    // JSON that parses fine but has no magic header — must be dropped
+    // *before* Zod is ever called. Impossible to observe directly, but
+    // behaviorally this case produces the same [] as the happy-not-
+    // matched case and must not throw.
+    expect(extractManifests([JSON.stringify({ kind: 'other', payload: {} })])).toEqual([])
+  })
+
+  test('returns duplicates when the same manifest appears in both pins and history', async () => {
+    const { extractManifests } = await import('./manifest.ts')
+    // Deliberate no-dedup contract: the caller (or Claude reading tool
+    // output) is responsible for how to treat duplicates. Position-
+    // preserving, non-deduping keeps the function trivially testable.
+    const body = validManifestJson({ name: 'Dup' })
+    const out = extractManifests([body, body])
+    expect(out).toHaveLength(2)
+    expect(out[0]?.name).toBe('Dup')
+    expect(out[1]?.name).toBe('Dup')
+  })
+})
+
 describe('createSessionSupervisor.activate', () => {
   let rawRoot: string
   let tmpRoot: string

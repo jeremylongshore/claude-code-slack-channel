@@ -94,3 +94,67 @@ export type ManifestV1 = z.infer<typeof ManifestV1>
  * that must not match).
  */
 export const MANIFEST_V1_MAGIC_KEY = '__claude_bot_manifest_v1__' as const
+
+// ---------------------------------------------------------------------------
+// extractManifests — pure filter/parse/validate for a batch of message texts
+// ---------------------------------------------------------------------------
+
+/**
+ * Cheap pre-filter: does a message body syntactically mention the magic
+ * header key? Used to short-circuit the parse step for the overwhelming
+ * majority of messages that are not manifest payloads. A false positive
+ * here (message body that coincidentally contains the key string in
+ * prose) is caught by `JSON.parse` or Zod on the next step — this is
+ * purely a perf filter, never a trust signal.
+ */
+function looksLikeManifest(text: string): boolean {
+  return text.includes(MANIFEST_V1_MAGIC_KEY)
+}
+
+/**
+ * Extract every valid v1 manifest from a batch of message texts (Epic
+ * 31-A.2, bead ccsc-s53.2). The flow is:
+ *
+ *   1. skip null / undefined / non-string bodies
+ *   2. cheap string-includes filter on the magic header key
+ *   3. `JSON.parse` — silent drop on any throw
+ *   4. `ManifestV1.safeParse` — silent drop on any Zod error
+ *
+ * "Silent drop" is the doc's chosen posture (§81, §255) for
+ * malformed/invalid manifests: a peer posting garbage must not break the
+ * consumer, and there is no caller-visible error channel because this is
+ * advertising, not an API. Operators get ground truth via the 30-A
+ * journal when the read tool logs the read event — per-message drop
+ * details are intentionally not surfaced.
+ *
+ * Size cap (40 KB per raw body) is a sibling bead (ccsc-s53.3); this
+ * function does not enforce it. Callers that receive potentially large
+ * bodies must pre-filter before calling, or wait for s53.3 to layer
+ * that in.
+ *
+ * Returns validated manifests in the order they appeared in the input.
+ * Duplicate de-dup is NOT performed here — a channel that has the same
+ * peer's manifest pinned AND in the last 50 messages will surface both
+ * copies, and the caller (or Claude reading the tool output) decides
+ * what to do with the duplication. Keeping this function position-
+ * preserving and non-deduping makes it trivially testable.
+ */
+export function extractManifests(
+  texts: ReadonlyArray<string | null | undefined>,
+): ManifestV1[] {
+  const out: ManifestV1[] = []
+  for (const text of texts) {
+    if (typeof text !== 'string' || text.length === 0) continue
+    if (!looksLikeManifest(text)) continue
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      continue
+    }
+    const result = ManifestV1.safeParse(parsed)
+    if (!result.success) continue
+    out.push(result.data)
+  }
+  return out
+}
