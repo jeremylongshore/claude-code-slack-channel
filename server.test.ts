@@ -3310,28 +3310,28 @@ describe('ManifestV1 schema (31-A.1)', () => {
 
   test('rejects name shorter than 1 or longer than 80 chars', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
-    expect(() => ManifestV1.parse({ ...validManifest() as object, name: '' })).toThrow()
+    expect(() => ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), name: '' })).toThrow()
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, name: 'x'.repeat(81) }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), name: 'x'.repeat(81) }),
     ).toThrow()
   })
 
   test('rejects vendor shorter than 1 or longer than 80 chars', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
-    expect(() => ManifestV1.parse({ ...validManifest() as object, vendor: '' })).toThrow()
+    expect(() => ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), vendor: '' })).toThrow()
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, vendor: 'v'.repeat(81) }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), vendor: 'v'.repeat(81) }),
     ).toThrow()
   })
 
   test('rejects description longer than 1000 chars', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, description: 'd'.repeat(1001) }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), description: 'd'.repeat(1001) }),
     ).toThrow()
     // Exactly 1000 is OK.
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, description: 'd'.repeat(1000) }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), description: 'd'.repeat(1000) }),
     ).not.toThrow()
   })
 
@@ -3341,7 +3341,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
     const { ManifestV1 } = await import('./manifest.ts')
     for (const v of ['0.0.1', '10.20.30', '1.2.3-beta', '1.2.3-rc.1', '1.0.0-alpha-1']) {
       expect(() =>
-        ManifestV1.parse({ ...validManifest() as object, version: v }),
+        ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), version: v }),
       ).not.toThrow()
     }
   })
@@ -3350,7 +3350,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
     const { ManifestV1 } = await import('./manifest.ts')
     for (const v of ['1.2', '1', '1.2.3.4', 'v1.2.3', '1.2.3+build', '']) {
       expect(() =>
-        ManifestV1.parse({ ...validManifest() as object, version: v }),
+        ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), version: v }),
       ).toThrow()
     }
   })
@@ -3360,18 +3360,18 @@ describe('ManifestV1 schema (31-A.1)', () => {
   test('accepts an empty tools list and rejects more than 50 entries', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, tools: [] }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), tools: [] }),
     ).not.toThrow()
     const fifty = Array.from({ length: 50 }, (_, i) => ({
       name: `t${i}`,
       description: 'd',
     }))
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, tools: fifty }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), tools: fifty }),
     ).not.toThrow()
     expect(() =>
       ManifestV1.parse({
-        ...validManifest() as object,
+        ...(validManifest() as Record<string, unknown>),
         tools: [...fifty, { name: 't50', description: 'd' }],
       }),
     ).toThrow()
@@ -3385,7 +3385,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
       { name: 'ok', description: 'd'.repeat(401) },
     ]) {
       expect(() =>
-        ManifestV1.parse({ ...validManifest() as object, tools: [bad] }),
+        ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), tools: [bad] }),
       ).toThrow()
     }
   })
@@ -3398,7 +3398,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
     // group participation is not something a peer should advertise here.
     for (const bad of ['D01234ABCD', 'G01234ABCD', 'c01234abcd', 'CABCabc', '', 'C']) {
       expect(() =>
-        ManifestV1.parse({ ...validManifest() as object, channels: [bad] }),
+        ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), channels: [bad] }),
       ).toThrow()
     }
   })
@@ -3409,11 +3409,11 @@ describe('ManifestV1 schema (31-A.1)', () => {
       `C${i.toString().padStart(5, '0')}AAAA`,
     )
     expect(() =>
-      ManifestV1.parse({ ...validManifest() as object, channels: fifty }),
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), channels: fifty }),
     ).not.toThrow()
     expect(() =>
       ManifestV1.parse({
-        ...validManifest() as object,
+        ...(validManifest() as Record<string, unknown>),
         channels: [...fifty, 'C99999ZZZZ'],
       }),
     ).toThrow()
@@ -3425,7 +3425,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
     const { ManifestV1 } = await import('./manifest.ts')
     for (const bad of ['not-an-email', 'user@', '@example.com', 'user@example']) {
       expect(() =>
-        ManifestV1.parse({ ...validManifest() as object, contact: bad }),
+        ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), contact: bad }),
       ).toThrow()
     }
   })
@@ -3436,7 +3436,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
     const { ManifestV1 } = await import('./manifest.ts')
     for (const bad of ['2026-01-01', '01/01/2026', 'yesterday', '', '2026-01-01 00:00:00']) {
       expect(() =>
-        ManifestV1.parse({ ...validManifest() as object, publishedAt: bad }),
+        ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), publishedAt: bad }),
       ).toThrow()
     }
   })
