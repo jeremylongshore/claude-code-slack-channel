@@ -108,6 +108,19 @@ export const MANIFEST_V1_MAGIC_KEY = '__claude_bot_manifest_v1__' as const
  */
 export const MAX_MANIFEST_BYTES = 40 * 1024
 
+/**
+ * Publish-side cap on the serialized manifest (Epic 31-B.2, bead
+ * ccsc-0qk.2). Deliberately stricter than `MAX_MANIFEST_BYTES` by a
+ * factor of 5 — Postel's Law: "be conservative in what you send,
+ * liberal in what you receive." A publisher writes what it controls;
+ * a reader tolerates what the peer happens to post. 8 KB is plenty
+ * for a well-formed v1 manifest (the schema caps description at 1000
+ * chars, up to 50 tools with ≤ 480 chars each, up to 50 channels) and
+ * surfaces operator mistakes (e.g. a pasted API payload that should
+ * have been a manifest) loudly at publish time.
+ */
+export const MAX_PUBLISH_MANIFEST_BYTES = 8 * 1024
+
 // ---------------------------------------------------------------------------
 // extractManifests — pure filter/parse/validate for a batch of message texts
 // ---------------------------------------------------------------------------
@@ -300,4 +313,38 @@ export function createManifestCache(
       return store.size
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// Publish-size gate (Epic 31-B.2, bead ccsc-0qk.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Serialize a validated manifest to its on-wire JSON form and assert
+ * the UTF-8 byte count is within the 8 KB publish cap. Throws on
+ * violation with a message that names both the actual byte count and
+ * the cap, so an operator debugging a rejected publish knows exactly
+ * which field to shrink.
+ *
+ * Returns the serialized string on success so the caller can post it
+ * directly. Keeping serialization and size-check in one function
+ * guarantees the bytes we measure are the bytes we post — a split
+ * signature (`assertPublishSize(manifest)` + separate
+ * `JSON.stringify` in the caller) would leave room for formatting
+ * differences to silently raise the effective cap.
+ *
+ * Stricter than the 40 KB read-side cap (Postel's Law — strict on
+ * output, liberal on input). See `MAX_PUBLISH_MANIFEST_BYTES` for the
+ * reasoning.
+ */
+export function assertPublishSizeAndSerialize(manifest: ManifestV1): string {
+  const body = JSON.stringify(manifest, null, 2)
+  const bytes = utf8ByteLength(body)
+  if (bytes > MAX_PUBLISH_MANIFEST_BYTES) {
+    throw new Error(
+      `Publish size: manifest serializes to ${bytes}B > ${MAX_PUBLISH_MANIFEST_BYTES}B cap. ` +
+        `Shrink description, tools[], or channels[] before republishing.`,
+    )
+  }
+  return body
 }
