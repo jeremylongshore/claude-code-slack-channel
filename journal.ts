@@ -930,6 +930,18 @@ export type VerifyResult =
   | { ok: true; eventsVerified: number }
   | { ok: false; eventsVerified: number; break: VerifyBreak }
 
+// Compile-time shape-drift guard. `lib.ts` duplicates the shape of
+// `VerifyResult` as `VerifyResultShape` (type-only, no runtime import)
+// to stay decoupled from journal.ts. These bidirectional checks break
+// the build the moment either side drifts.
+import type { VerifyResultShape } from './lib.ts'
+type _VerifyForward = VerifyResult extends VerifyResultShape ? true : never
+type _VerifyBackward = VerifyResultShape extends VerifyResult ? true : never
+const _verifyShapeForward: _VerifyForward = true
+const _verifyShapeBackward: _VerifyBackward = true
+void _verifyShapeForward
+void _verifyShapeBackward
+
 /** Verify a journal file end-to-end per audit-journal-architecture.md
  *  §237-261. Reads the file line-by-line, schema-validates each
  *  record, and recomputes `sha256(prevHash || canonicalJson(event

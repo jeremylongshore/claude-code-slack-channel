@@ -65,7 +65,7 @@ export interface Access {
    *  evaluator applies its defaults (allow for most tools, deny for
    *  tools listed in `requireAuthoredPolicy`). Shape is documented in
    *  ACCESS.md §Policy rules. */
-  policy?: unknown[]
+  policy?: readonly unknown[]
 }
 
 export type GateAction = 'deliver' | 'drop' | 'pair'
@@ -1291,7 +1291,7 @@ export function resolveJournalPath(
 }
 
 // ---------------------------------------------------------------------------
-// Policy decision routing (Epic 29-B Phase 1 — ccsc-me6.1/.2/.3)
+// Policy decision routing
 // ---------------------------------------------------------------------------
 
 /** Shape mirror of `PolicyDecision` from policy.ts, repeated here so
@@ -1300,7 +1300,13 @@ export function resolveJournalPath(
 export type PolicyDecisionShape =
   | { kind: 'allow'; rule?: string }
   | { kind: 'deny'; rule: string; reason: string }
-  | { kind: 'require'; rule: string; approver: 'human_approver'; ttlMs: number }
+  | {
+      kind: 'require'
+      rule: string
+      approver: 'human_approver'
+      ttlMs: number
+      approvers: number
+    }
 
 /** What the server handler should do with a policy decision. Four
  *  outcomes, one per matrix cell in (decision.kind) × (rule matched or
@@ -1352,7 +1358,7 @@ export function decidePermissionRoute(
 }
 
 // ---------------------------------------------------------------------------
-// Multi-approver quorum state (ccsc-me6.4 / me6.5 — Epic 29-B Phase 2)
+// Multi-approver quorum state
 // ---------------------------------------------------------------------------
 
 /** Pending multi-approver state for a single require_approval request.
@@ -1439,7 +1445,7 @@ export function recordApprovalVote(
 }
 
 // ---------------------------------------------------------------------------
-// --verify-audit-log CLI subcommand (ccsc-t7j, Epic 30-A.15)
+// --verify-audit-log CLI subcommand
 // ---------------------------------------------------------------------------
 
 /** Parse `--verify-audit-log` from argv. Returns the configured path, or

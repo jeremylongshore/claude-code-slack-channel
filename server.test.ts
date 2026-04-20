@@ -5320,6 +5320,7 @@ describe('decidePermissionRoute', () => {
         rule: 'dangerous-upload',
         approver: 'human_approver',
         ttlMs: 5 * 60 * 1000,
+        approvers: 1,
       }),
     ).toEqual({
       type: 'require_human',
@@ -5341,6 +5342,7 @@ describe('decidePermissionRoute', () => {
         rule: 'r',
         approver: 'human_approver',
         ttlMs: 1,
+        approvers: 1,
       }).type,
     ])
     expect(routes).toEqual(

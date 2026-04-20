@@ -97,11 +97,10 @@ if (_verifyPath !== null) {
     }
     process.exit(exitCode)
   } catch (err) {
-    console.error(
-      `[slack] verify-audit-log: unexpected error: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    )
+    // Log the full error object (not just .message) so the stack trace
+    // survives. verify is a diagnostic subcommand; an unexpected failure
+    // here is almost always worth the full crash context.
+    console.error('[slack] verify-audit-log: unexpected error:', err)
     process.exit(2)
   }
 }
@@ -256,7 +255,7 @@ function getAccess(): Access {
 }
 
 // ---------------------------------------------------------------------------
-// Policy engine — Epic 29-B Phase 1 (ccsc-me6.1 / me6.2 / me6.3 / me6.11)
+// Policy engine
 //
 // Policy rules are loaded ONCE at module boot from access.json's `policy`
 // field, parsed + shadow-linted, and frozen into `policyRules`. Hot reload
@@ -266,11 +265,7 @@ function getAccess(): Access {
 //
 // Policy approvals (short-lived TTL windows granted by human approvers
 // replying on Slack) live in a module-level Map keyed by approvalKey()
-// per policy-evaluation-flow.md §285-287. Phase 1 declares the map but
-// does NOT yet populate it from approval replies — that's me6.4/me6.5 in
-// Phase 2. Until then, a `require_approval` rule falls through to the
-// existing Block Kit human-approver flow unchanged, which is exactly the
-// right behavior for Phase 1.
+// per policy-evaluation-flow.md §285-287.
 //
 // Error policy: a malformed access.json `policy` field is fatal at boot.
 // Policy enforcement is safety-critical; silent degradation to "no policy"
@@ -292,6 +287,49 @@ function grantPolicyApproval(
 ): void {
   const key = approvalKey(pending.ruleId, pending.sessionKey)
   policyApprovals.set(key, { ttlExpires: now + pending.ttlMs })
+}
+
+/** Outcome of processing an allow-vote on a policy-scoped pending entry.
+ *  Three-way discriminator so callers switch on kind and supply their
+ *  own UX (Block Kit updates for buttons, reactions for text replies). */
+type VoteProcessResult =
+  | { kind: 'duplicate' }
+  | { kind: 'pending'; state: PendingPolicyApproval }
+  | { kind: 'approved'; state: PendingPolicyApproval }
+
+/** Shared vote handling for both resolvers. Mutates `entry.policy` on
+ *  pending/approved, grants the TTL window + journals `policy.approved`
+ *  on quorum. Kept in server.ts (not lib.ts) because it needs the
+ *  module-level `journalWrite` and `policyApprovals` map — dragging
+ *  those into a pure module would be the "forced abstraction" smell.
+ *
+ *  Precondition: `entry.policy` must be defined; callers guard. */
+function processApprovalVote(
+  entry: PendingPermissionEntry,
+  voterId: string,
+  now: number,
+): VoteProcessResult {
+  const vote = recordApprovalVote(entry.policy!, voterId, now)
+  if (vote.kind === 'duplicate') return { kind: 'duplicate' }
+  entry.policy = vote.state
+  if (vote.kind === 'approved') {
+    grantPolicyApproval(vote.state, now)
+    journalWrite({
+      kind: 'policy.approved',
+      outcome: 'allow',
+      actor: 'human_approver',
+      sessionKey: vote.state.sessionKey,
+      toolName: entry.tool_name,
+      input: {
+        tool: entry.tool_name,
+        approversNeeded: vote.state.approversNeeded,
+        approvers: Array.from(vote.state.approvedBy),
+      },
+      ruleId: vote.state.ruleId,
+    })
+    return { kind: 'approved', state: vote.state }
+  }
+  return { kind: 'pending', state: vote.state }
 }
 
 function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
@@ -1097,10 +1135,8 @@ const PermissionRequestSchema = z.object({
 const VALID_REQUEST_ID = /^[a-km-z]{5}$/
 
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params: { request_id: string; tool_name: string; description: string; input_preview: string } }) => {
-  // Validate request_id format to prevent malformed action_ids
   if (!VALID_REQUEST_ID.test(params.request_id)) return
 
-  // Find where to post — last active channel, or first opted-in channel
   const access = getAccess()
   const targetChannel = lastActiveChannel || Object.keys(access.channels || {})[0]
   if (!targetChannel) return
@@ -1129,18 +1165,17 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   })
 
   // ---------------------------------------------------------------------
-  // Policy evaluation (Epic 29-B Phase 1 — ccsc-me6.1/.2/.3/.11)
+  // Policy evaluation
   //
-  // Consult evaluate() before routing to the human approver. Three
-  // decision shapes, three routes:
+  // Consult evaluate() before routing to the human approver. Four
+  // routes from decidePermissionRoute():
   //
-  //   allow + rule      → matched auto_approve; bypass Block Kit and
-  //                       reply 'allow' to Claude immediately.
-  //   deny              → post reason to thread, reply 'deny' to Claude.
-  //   allow (no rule)   → default-allow for non-safety-critical tools;
-  //     OR require        fall through to the existing human-approver
-  //                       Block Kit flow (Phase 2 = me6.4 adds the
-  //                       policy-aware approval-tracking for 'require').
+  //   auto_allow      → matched auto_approve; bypass Block Kit and
+  //                     reply 'allow' to Claude immediately.
+  //   deny            → post reason to thread, reply 'deny' to Claude.
+  //   require_human   → attach PendingPolicyApproval, fall through to
+  //                     Block Kit flow with quorum tracking.
+  //   default_human   → no rule matched, fall through unchanged.
   //
   // The permission_request notification carries `input_preview` (string)
   // rather than structured args, so `argEquals` and `pathPrefix`
@@ -1170,7 +1205,6 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   const policyInput = { tool: params.tool_name, channel: targetChannel, thread_ts: lastActiveThread }
 
   if (route.type === 'auto_allow') {
-    // Matched auto_approve. Bypass Block Kit, reply to Claude directly.
     journalWrite({
       kind: 'policy.allow',
       outcome: 'allow',
@@ -1188,7 +1222,6 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   }
 
   if (route.type === 'deny') {
-    // Matched deny. Post reason to thread, reply 'deny' to Claude.
     // No Block Kit, no pendingPermissions entry — the decision is final.
     journalWrite({
       kind: 'policy.deny',
@@ -1222,17 +1255,12 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
     return
   }
 
-  // route.type === 'require_human' or 'default_human'. Either way, fall
-  // through to the existing Block Kit human-approver flow. Phase 2
-  // (ccsc-me6.4 / me6.5) attaches a PendingPolicyApproval to the pending
-  // entry for the require_human case so the button / text-reply
-  // resolvers can run the multi-approver quorum + NIST user_id dedup
-  // logic. default_human keeps the legacy single-approver fast path.
-  //
-  // Phase 1 emits a trace event for require_human so the journal
-  // records that a rule dispatched the request to a human;
-  // default_human is intentionally not traced (would 10x the journal
-  // on a busy channel for the no-opinion case — see release-plan R2).
+  // require_human attaches a PendingPolicyApproval so the button / text-
+  // reply resolvers can run the multi-approver quorum + NIST user_id
+  // dedup logic. default_human keeps the legacy single-approver fast
+  // path. require_human emits a trace event; default_human is
+  // intentionally not traced (would 10x the journal on a busy channel
+  // for the no-opinion case — see release-plan R2).
   let pendingPolicy: PendingPolicyApproval | undefined
   if (route.type === 'require_human' && decision.kind === 'require') {
     journalWrite({
@@ -1432,14 +1460,13 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
       return
     }
 
-    // Multi-approver path (ccsc-me6.4 / me6.5). When a PendingPolicyApproval
-    // is attached, votes accumulate with NIST `user_id` dedup until quorum.
-    // Deny always wins immediately — one "no" overrides any number of yeses.
+    // Multi-approver path: votes accumulate with NIST user_id dedup until
+    // quorum. Deny always wins immediately — one "no" overrides yeses.
+    // Shared state transition is in processApprovalVote(); UX is per-
+    // resolver (Block Kit updates here, reactions in the text-reply path).
     if (details.policy && verb === 'allow') {
-      const vote = recordApprovalVote(details.policy, userId, Date.now())
-      if (vote.kind === 'duplicate') {
-        // Same user_id already approved; surface an ephemeral note and
-        // leave the pending entry unchanged. Block Kit stays as-is.
+      const result = processApprovalVote(details, userId, Date.now())
+      if (result.kind === 'duplicate') {
         try {
           await web.chat.postEphemeral({
             channel: channelId,
@@ -1449,12 +1476,10 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
         } catch { /* non-critical */ }
         return
       }
-      if (vote.kind === 'pending') {
-        // Record the vote but don't resolve yet.
-        details.policy = vote.state
+      if (result.kind === 'pending') {
         const safeTool = escMrkdwn(details.tool_name)
         const safeDesc = escMrkdwn(details.description)
-        const progress = `${vote.state.approvedBy.size}/${vote.state.approversNeeded} approvals`
+        const progress = `${result.state.approvedBy.size}/${result.state.approversNeeded} approvals`
         if (channelId && messageTs) {
           try {
             await web.chat.update({
@@ -1492,23 +1517,9 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
         }
         return
       }
-      // vote.kind === 'approved' — quorum reached. Grant TTL window and
-      // fall through to the resolve path below with behavior='allow'.
-      details.policy = vote.state
-      grantPolicyApproval(vote.state, Date.now())
-      journalWrite({
-        kind: 'policy.approved',
-        outcome: 'allow',
-        actor: 'human_approver',
-        sessionKey: vote.state.sessionKey,
-        toolName: details.tool_name,
-        input: {
-          tool: details.tool_name,
-          approversNeeded: vote.state.approversNeeded,
-          approvers: Array.from(vote.state.approvedBy),
-        },
-        ruleId: vote.state.ruleId,
-      })
+      // result.kind === 'approved' — quorum reached. Fall through to the
+      // resolve path below with behavior='allow'. Helper has already
+      // granted the TTL window and journaled policy.approved.
     }
 
     const behavior = verb === 'allow' ? 'allow' : 'deny'
@@ -1735,13 +1746,13 @@ async function handleMessage(event: unknown): Promise<void> {
 
         const replyIsAllow = permMatch[1].toLowerCase().startsWith('y')
 
-        // Multi-approver path (ccsc-me6.4 / me6.5) via text reply. Mirrors
-        // the button handler: allow votes accumulate with user_id dedup
-        // until quorum; deny wins immediately.
+        // Multi-approver path via text reply. Same state transition as
+        // the button path (processApprovalVote); UX is reactions instead
+        // of Block Kit message updates.
         if (replyDetails.policy && replyIsAllow) {
           const voterId = ev['user'] as string
-          const vote = recordApprovalVote(replyDetails.policy, voterId, Date.now())
-          if (vote.kind === 'duplicate') {
+          const result = processApprovalVote(replyDetails, voterId, Date.now())
+          if (result.kind === 'duplicate') {
             try {
               await web.reactions.add({
                 channel: channelId,
@@ -1751,8 +1762,7 @@ async function handleMessage(event: unknown): Promise<void> {
             } catch { /* non-critical */ }
             return
           }
-          if (vote.kind === 'pending') {
-            replyDetails.policy = vote.state
+          if (result.kind === 'pending') {
             try {
               await web.reactions.add({
                 channel: channelId,
@@ -1762,23 +1772,8 @@ async function handleMessage(event: unknown): Promise<void> {
             } catch { /* non-critical */ }
             return
           }
-          // vote.kind === 'approved' — fall through to the resolve block
-          // below with behavior='allow'.
-          replyDetails.policy = vote.state
-          grantPolicyApproval(vote.state, Date.now())
-          journalWrite({
-            kind: 'policy.approved',
-            outcome: 'allow',
-            actor: 'human_approver',
-            sessionKey: vote.state.sessionKey,
-            toolName: replyDetails.tool_name,
-            input: {
-              tool: replyDetails.tool_name,
-              approversNeeded: vote.state.approversNeeded,
-              approvers: Array.from(vote.state.approvedBy),
-            },
-            ruleId: vote.state.ruleId,
-          })
+          // result.kind === 'approved' — fall through to the resolve
+          // block below with behavior='allow'.
         }
 
         await mcp.notification({

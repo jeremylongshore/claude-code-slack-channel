@@ -200,6 +200,19 @@ export type PolicyDecision =
       approvers: number
     }
 
+// Compile-time shape-drift guard. `lib.ts` deliberately duplicates the
+// shape of `PolicyDecision` as `PolicyDecisionShape` (type-only, no
+// runtime import) to stay decoupled from policy.ts. These bidirectional
+// `satisfies` casts break the build the moment either side drifts —
+// without forcing a runtime import or a third shared module.
+import type { PolicyDecisionShape } from './lib.ts'
+type _PolicyDecisionForward = PolicyDecision extends PolicyDecisionShape ? true : never
+type _PolicyDecisionBackward = PolicyDecisionShape extends PolicyDecision ? true : never
+const _decisionShapeForward: _PolicyDecisionForward = true
+const _decisionShapeBackward: _PolicyDecisionBackward = true
+void _decisionShapeForward
+void _decisionShapeBackward
+
 // ---------------------------------------------------------------------------
 // Path canonicalization (CWE-22) — see policy-evaluation-flow.md §174-196.
 // ---------------------------------------------------------------------------
@@ -513,7 +526,8 @@ export function checkMonotonicity(
 }
 
 // ---------------------------------------------------------------------------
-// detectBroadAutoApprove() — boot-time footgun warning per ccsc-me6.7
+// detectBroadAutoApprove() — boot-time footgun warning for auto_approve
+// rules with overly broad match (no `tool` and no `pathPrefix`).
 // ---------------------------------------------------------------------------
 
 export interface BroadMatchWarning {
