@@ -1483,8 +1483,7 @@ export function escMrkdwn(text: string): string {
  *  pending-receipts map at realistic volumes (<1k concurrent tool
  *  calls) is negligible.
  *
- *  Pure — no I/O beyond the crypto RNG read. Tested via the
- *  "generates unique, URL-safe" test. */
+ *  Pure — no I/O beyond the crypto RNG read. */
 export function generateCorrelationId(): string {
   return randomBytes(6).toString('base64url')
 }
