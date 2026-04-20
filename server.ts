@@ -35,6 +35,7 @@ import {
   parseSendableRoots,
   validateSendableRoots,
   assertOutboundAllowed as libAssertOutboundAllowed,
+  assertPublishAllowed,
   deliveredThreadKey as libDeliveredThreadKey,
   permissionPairingKey as permKey,
   listSessions as libListSessions,
@@ -61,7 +62,12 @@ import {
   type PendingPolicyApproval,
 } from './lib.ts'
 import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
-import { extractManifests, createManifestCache } from './manifest.ts'
+import {
+  extractManifests,
+  createManifestCache,
+  ManifestV1,
+  MANIFEST_V1_MAGIC_KEY,
+} from './manifest.ts'
 import {
   parsePolicyRules,
   evaluate as policyEvaluate,
@@ -655,6 +661,25 @@ const ReadPeerManifestsInput = z
   })
   .strict()
 
+const PublishManifestInput = z
+  .object({
+    // Public channels only (C...) — same posture as read. A manifest is
+    // a public advertisement; posting one into a DM or private group is
+    // out of scope for v1.
+    channel: z.string().regex(/^C[A-Z0-9]+$/),
+    // Claude must pass the Slack user_id of the human on whose behalf
+    // this publish is performed. The publish gate (assertPublishAllowed,
+    // bead ccsc-0qk.5) verifies this against access.allowFrom — the same
+    // workspace-level allowlist that gates DMs. A caller outside the
+    // allowlist is rejected with a clear error.
+    caller_user_id: z.string().regex(/^U[A-Z0-9]+$/),
+    // Manifest body. Validated against the full ManifestV1 schema; any
+    // deviation (missing magic header, wrong types, oversize field) is
+    // rejected with Zod's standard error before any Slack side effects.
+    manifest: ManifestV1,
+  })
+  .strict()
+
 // NOTE: These schemas are duplicated for isolated testing in `server.test.ts`.
 // If you update a schema here, please update the corresponding copy there.
 export const toolSchemas = {
@@ -665,6 +690,7 @@ export const toolSchemas = {
   download_attachment: DownloadAttachmentInput,
   list_sessions: ListSessionsInput,
   read_peer_manifests: ReadPeerManifestsInput,
+  publish_manifest: PublishManifestInput,
 } as const
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -778,6 +804,31 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['channel'],
+      },
+    },
+    {
+      name: 'publish_manifest',
+      description:
+        "Publish this bot's manifest in a Slack channel as a pinned message. Replaces any prior manifest this bot posted in that channel (pins.list → unpin prior → post → pins.add). Only users in access.allowFrom may publish; caller_user_id is the authorizing human's user_id. The manifest must match the v1 schema (magic header, SemVer version, tools/channels bounds, ISO datetime). Channel must be opted-in.",
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          channel: {
+            type: 'string',
+            description: 'Public channel ID (C...) to publish into.',
+          },
+          caller_user_id: {
+            type: 'string',
+            description:
+              "Slack user_id of the human on whose behalf the publish is performed. Must be in access.allowFrom.",
+          },
+          manifest: {
+            type: 'object',
+            description:
+              'v1 manifest body (see 000-docs/bot-manifest-protocol.md §17-55). Must include __claude_bot_manifest_v1__: true plus name, vendor, SemVer version, description, tools[], publishedAt.',
+          },
+        },
+        required: ['channel', 'caller_user_id', 'manifest'],
       },
     },
   ],
@@ -1248,6 +1299,140 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           {
             type: 'text',
             text: JSON.stringify({ channel, count: manifests.length, manifests }, null, 2),
+          },
+        ],
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // publish_manifest — Epic 31-B.1 + 31-B.3 (ccsc-0qk.1, ccsc-0qk.3)
+    //
+    // Post this bot's manifest into a Slack channel with "replace"
+    // semantics: before posting, unpin any prior manifest this bot
+    // published in the same channel, so at most one pinned manifest from
+    // us exists per channel. Flow per the bead: pins.list → filter to
+    // our own prior manifests → unpin each → chat.postMessage → pins.add.
+    //
+    // Two gates run before any Slack side effects:
+    //
+    //   1. assertPublishAllowed(caller_user_id, access) — only humans in
+    //      access.allowFrom may authorise a publish (ccsc-0qk.5).
+    //   2. assertOutboundAllowed(channel, undefined) — channel must be
+    //      opted-in, same gate used for reply/read_peer_manifests.
+    //
+    // The manifest body itself is already Zod-validated by toolSchemas
+    // (PublishManifestInput) before the handler is entered, so
+    // oversized fields, wrong types, and missing magic header are all
+    // caught pre-dispatch.
+    //
+    // Size cap (8 KB, stricter than read's 40 KB) and the 1-publish-per-
+    // channel-per-hour rate limit are sibling beads (ccsc-0qk.2,
+    // ccsc-0qk.4); they layer on without changing this surface.
+    // -----------------------------------------------------------------------
+    case 'publish_manifest': {
+      const channel: string = args.channel
+      const callerUserId: string = args.caller_user_id
+      const manifest = args.manifest as import('./manifest.ts').ManifestV1
+
+      // Gate 1: only allowlisted humans may publish.
+      try {
+        assertPublishAllowed(callerUserId, getAccess())
+      } catch (publishErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'publish_manifest',
+          input: { channel, caller_user_id: callerUserId },
+          reason: publishErr instanceof Error ? publishErr.message : String(publishErr),
+        })
+        throw publishErr
+      }
+
+      // Gate 2: channel must be opted in, same as any outbound write.
+      try {
+        assertOutboundAllowed(channel, undefined)
+      } catch (outboundErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'publish_manifest',
+          input: { channel, caller_user_id: callerUserId },
+          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+        })
+        throw outboundErr
+      }
+      journalWrite({
+        kind: 'gate.outbound.allow',
+        outcome: 'allow',
+        toolName: 'publish_manifest',
+        input: { channel, caller_user_id: callerUserId },
+      })
+
+      // Replace semantics: unpin any prior manifest this bot posted in
+      // this channel before posting the new one. Best-effort — if the
+      // pins.list or a pins.remove fails, log and continue so a flaky
+      // Slack call doesn't break the publish. Worst case, the channel
+      // accumulates an extra pinned manifest from us; a subsequent
+      // publish will sweep it up.
+      let replaced = 0
+      try {
+        const pins = await web.pins.list({ channel })
+        for (const item of pins.items ?? []) {
+          const msg = (item as {
+            message?: { text?: string | null; bot_id?: string; user?: string; ts?: string }
+          }).message
+          if (!msg || !msg.ts) continue
+          const text = msg.text ?? ''
+          const isOurs =
+            (selfBotId && msg.bot_id === selfBotId) ||
+            (botUserId && msg.user === botUserId)
+          if (!isOurs) continue
+          if (!text.includes(MANIFEST_V1_MAGIC_KEY)) continue
+          try {
+            await web.pins.remove({ channel, timestamp: msg.ts })
+            replaced += 1
+          } catch (unpinErr) {
+            console.warn('[publish_manifest] pins.remove failed — continuing', {
+              channel,
+              ts: msg.ts,
+              error: unpinErr instanceof Error ? unpinErr.message : String(unpinErr),
+            })
+          }
+        }
+      } catch (pinsListErr) {
+        console.warn('[publish_manifest] pins.list failed — skipping replace sweep', {
+          channel,
+          error: pinsListErr instanceof Error ? pinsListErr.message : String(pinsListErr),
+        })
+      }
+
+      // Post + pin. If either fails the whole publish fails — a posted-
+      // but-unpinned manifest would be invisible to read_peer_manifests
+      // consumers anyway (they default to pins + last 50 messages, so
+      // the post would eventually surface via history, but the replace-
+      // semantics contract is pinned-message only). Fail loud here.
+      const postRes = await web.chat.postMessage({
+        channel,
+        text: JSON.stringify(manifest, null, 2),
+        unfurl_links: false,
+        unfurl_media: false,
+      })
+      const ts = (postRes.ts as string) || ''
+      if (!ts) {
+        throw new Error('publish_manifest: chat.postMessage returned no ts')
+      }
+      await web.pins.add({ channel, timestamp: ts })
+
+      journalWrite({
+        kind: 'manifest.publish',
+        toolName: 'publish_manifest',
+        input: { channel, caller_user_id: callerUserId, replaced },
+      })
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ channel, ts, replaced }, null, 2),
           },
         ],
       }

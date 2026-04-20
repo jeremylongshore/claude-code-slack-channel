@@ -4740,12 +4740,14 @@ describe('JournalEvent', () => {
   test('covers every EventKind value enumerated in the design doc', async () => {
     const { JournalEvent, EventKind } = await import('./journal.ts')
     const kinds = EventKind.options
-    // 19 original kinds + manifest.read + manifest.read.cached (Epic 31-A.5).
-    // If this number drifts, update the doc count in journal.ts's header
-    // comment too — both must agree.
-    expect(kinds).toHaveLength(21)
+    // 19 original kinds + manifest.read + manifest.read.cached (Epic
+    // 31-A.5) + manifest.publish (Epic 31-B.1/.3). If this number
+    // drifts, update the doc count in journal.ts's header comment too —
+    // both must agree.
+    expect(kinds).toHaveLength(22)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
+    expect(kinds).toContain('manifest.publish')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -7746,6 +7748,125 @@ describe('MCP tool input schemas (S5)', () => {
     test('rejects any extra field (.strict() on empty object)', () => {
       const result = ListSessionsInput.safeParse({ foo: 'bar' })
       expect(result.success).toBe(false)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // publish_manifest (Epic 31-B.1/.3, ccsc-0qk.1 + ccsc-0qk.3)
+  //
+  // Duplicated from server.ts. Unlike the other schemas, this one refers
+  // to the real ManifestV1 (manifest.ts) so the test can exercise the
+  // full nested-validation path. Construction lives inside beforeAll so
+  // the dynamic import only runs once per process.
+  // -------------------------------------------------------------------------
+  describe('PublishManifestInput', () => {
+    let PublishManifestInput: z.ZodTypeAny
+
+    beforeAll(async () => {
+      const { ManifestV1 } = await import('./manifest.ts')
+      PublishManifestInput = z
+        .object({
+          channel: z.string().regex(/^C[A-Z0-9]+$/),
+          caller_user_id: z.string().regex(/^U[A-Z0-9]+$/),
+          manifest: ManifestV1,
+        })
+        .strict()
+    })
+
+    const validManifest = () => ({
+      __claude_bot_manifest_v1__: true,
+      name: 'Example Bot',
+      vendor: 'Acme Corp',
+      version: '1.0.0',
+      description: 'stub',
+      tools: [],
+      publishedAt: '2026-01-01T00:00:00.000Z',
+    })
+
+    test('accepts a minimal valid publish request', () => {
+      const result = PublishManifestInput.safeParse({
+        channel: 'C01234ABCD',
+        caller_user_id: 'U0ABCDEF',
+        manifest: validManifest(),
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects DM ids (D...) and private-group ids (G...) in channel', () => {
+      for (const bad of ['D01234ABCD', 'G01234ABCD', 'c01234abcd', '']) {
+        const result = PublishManifestInput.safeParse({
+          channel: bad,
+          caller_user_id: 'U0ABCDEF',
+          manifest: validManifest(),
+        })
+        expect(result.success).toBe(false)
+      }
+    })
+
+    test('rejects caller_user_id that is not a Slack user_id (U...)', () => {
+      for (const bad of ['u0abcdef', 'B0ABCDEF', 'W0ABCDEF', '', 'USPACE  ']) {
+        const result = PublishManifestInput.safeParse({
+          channel: 'C01234ABCD',
+          caller_user_id: bad,
+          manifest: validManifest(),
+        })
+        expect(result.success).toBe(false)
+      }
+    })
+
+    test('rejects a manifest missing the magic header (nested Zod)', () => {
+      const bad = { ...validManifest() } as Record<string, unknown>
+      delete bad.__claude_bot_manifest_v1__
+      const result = PublishManifestInput.safeParse({
+        channel: 'C01234ABCD',
+        caller_user_id: 'U0ABCDEF',
+        manifest: bad,
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        // Error path drills into the nested manifest object.
+        expect(
+          result.error.issues.some((i) => i.path[0] === 'manifest'),
+        ).toBe(true)
+      }
+    })
+
+    test('rejects a manifest with a non-SemVer version (nested Zod)', () => {
+      const bad = { ...validManifest(), version: 'not-a-version' }
+      const result = PublishManifestInput.safeParse({
+        channel: 'C01234ABCD',
+        caller_user_id: 'U0ABCDEF',
+        manifest: bad,
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects unknown top-level fields (.strict() contract)', () => {
+      const result = PublishManifestInput.safeParse({
+        channel: 'C01234ABCD',
+        caller_user_id: 'U0ABCDEF',
+        manifest: validManifest(),
+        extra: 'nope',
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(
+          result.error.issues.some((i) => i.code === 'unrecognized_keys'),
+        ).toBe(true)
+      }
+    })
+
+    test('rejects each missing required field individually', () => {
+      for (const field of ['channel', 'caller_user_id', 'manifest'] as const) {
+        const input: Record<string, unknown> = {
+          channel: 'C01234ABCD',
+          caller_user_id: 'U0ABCDEF',
+          manifest: validManifest(),
+        }
+        delete input[field]
+        const result = PublishManifestInput.safeParse(input)
+        expect(result.success).toBe(false)
+      }
     })
   })
 })

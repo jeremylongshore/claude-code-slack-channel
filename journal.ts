@@ -13,7 +13,7 @@
  *     v:        1,                          // schema version; chain refuses mixed versions
  *     ts:       '2026-04-19T12:34:56.789Z', // ISO-8601 UTC with ms precision
  *     seq:      42,                         // monotonic per chain
- *     kind:     'gate.inbound.drop',        // discriminated union of 21 event kinds
+ *     kind:     'gate.inbound.drop',        // discriminated union of 22 event kinds
  *     toolName?: 'reply',
  *     input?:   { chat_id: 'C01', text: '...' },     // post-redaction
  *     outcome?: 'allow' | 'deny' | 'require' | 'drop' | 'n/a',
@@ -83,9 +83,13 @@ export const EventKind = z.enum([
   // see 000-docs/bot-manifest-protocol.md §163-166.
   'manifest.read',
   'manifest.read.cached',
+  // Publisher side (Epic 31-B, ccsc-0qk.1/0qk.3). Emitted after a successful
+  // publish_manifest call, carrying the replaced-count so operators can see
+  // how many prior manifests were unpinned during the replace sweep.
+  'manifest.publish',
 ])
 
-/** TypeScript string union of the 21 event kinds. */
+/** TypeScript string union of the 22 event kinds. */
 export type EventKind = z.infer<typeof EventKind>
 
 // ---------------------------------------------------------------------------
