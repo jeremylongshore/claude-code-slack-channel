@@ -79,6 +79,23 @@ function makeOpts(overrides: Partial<GateOptions> = {}): GateOptions {
   }
 }
 
+/** Extract every module specifier from a TypeScript source file.
+ *  Handles `import … from 'x'`, `import('x')`, `require('x')`, and
+ *  `export … from 'x'` (re-exports). Comments are stripped first so
+ *  prose mentioning a banned name (e.g. "manifest") does not false-
+ *  positive. Used by the 31-A.4 invariant test below and available
+ *  to any future import-graph lint in this suite. */
+function extractImportSpecifiers(src: string): string[] {
+  const stripped = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+  const specs: string[] = []
+  const re = /(?:\bfrom|\bimport\s*\(|\brequire\s*\()\s*(['"])([^'"]+)\1/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(stripped)) !== null) specs.push(m[2]!)
+  return specs
+}
+
 // ---------------------------------------------------------------------------
 // gate()
 // ---------------------------------------------------------------------------
@@ -3100,6 +3117,49 @@ describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
       rule('r2', 'auto_approve', { tool: 'upload_file' }),
     ]
     expect(checkMonotonicity([], next)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 31-A.4 invariant — manifest data NEVER passed to evaluate()
+//
+// Design: 000-docs/bot-manifest-protocol.md §91-109 ("The binding invariant").
+// policy.ts must not import from any manifest module, directly or via
+// re-export. This test parses policy.ts's import specifiers on every CI run.
+// A violation is a merge block, not a warning. Miller 2006: "advertisements
+// are not grants." The peer's manifest is content, never authority.
+// ---------------------------------------------------------------------------
+
+describe('31-A.4 invariant — manifest data never reaches evaluate()', () => {
+  test('policy.ts imports no manifest-module specifier', () => {
+    const src = readFileSync(join(import.meta.dir, 'policy.ts'), 'utf8')
+    const specs = extractImportSpecifiers(src)
+    const violators = specs.filter((s) => /manifest/i.test(s))
+    expect(
+      violators,
+      `policy.ts must not import from a manifest module — violates Epic 31-A.4 invariant ` +
+        `(see 000-docs/bot-manifest-protocol.md §91-109). Offending specifiers: ${JSON.stringify(violators)}`,
+    ).toEqual([])
+  })
+
+  test('extractImportSpecifiers catches from, import(), require(), re-export, case variants', () => {
+    // Sanity check on the parser so the guard above can't silently pass.
+    const fixture = [
+      `import { X } from './manifest.ts'`,
+      `import type { Y } from "./Manifest"`,
+      `const m = await import('./manifest-consumer')`,
+      `const r = require('./MANIFEST-reader')`,
+      `export { Z } from './manifest/index.ts'`,
+      `// mentions manifest in a comment — must not count`,
+      `/* also manifest in a block comment */`,
+      `import { safe } from './policy.ts' // trailing comment about manifest`,
+    ].join('\n')
+    const specs = extractImportSpecifiers(fixture)
+    const manifestSpecs = specs.filter((s) => /manifest/i.test(s))
+    expect(manifestSpecs.length).toBe(5)
+    // And the comment-only "mentions manifest" line must not appear.
+    expect(specs).toContain('./policy.ts')
+    expect(specs.every((s) => !/comment/i.test(s))).toBe(true)
   })
 })
 
