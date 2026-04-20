@@ -95,6 +95,19 @@ export type ManifestV1 = z.infer<typeof ManifestV1>
  */
 export const MANIFEST_V1_MAGIC_KEY = '__claude_bot_manifest_v1__' as const
 
+/**
+ * Hard cap on a single manifest's raw body, in bytes after UTF-8 encode
+ * (Epic 31-A.3). The doc (§47) phrases the cap as "≤ 40 KB"; we treat
+ * "KB" as 1024 bytes, the convention used everywhere else in this
+ * codebase for memory-safety constants. Anything over is silently
+ * dropped before `JSON.parse` is called — the point of the cap is to
+ * bound the cost of the parse step, which can blow up memory
+ * super-linearly on deeply-nested or hostile payloads. A peer that can
+ * make us allocate 100 MB to parse one pinned message is a cheap DoS
+ * otherwise.
+ */
+export const MAX_MANIFEST_BYTES = 40 * 1024
+
 // ---------------------------------------------------------------------------
 // extractManifests — pure filter/parse/validate for a batch of message texts
 // ---------------------------------------------------------------------------
@@ -109,6 +122,15 @@ export const MANIFEST_V1_MAGIC_KEY = '__claude_bot_manifest_v1__' as const
  */
 function looksLikeManifest(text: string): boolean {
   return text.includes(MANIFEST_V1_MAGIC_KEY)
+}
+
+/** UTF-8 byte length of a string. Uses TextEncoder so the count matches
+ *  what Slack's servers and the doc mean by "40 KB after UTF-8 encode"
+ *  (§47) — `string.length` would count UTF-16 code units and under-
+ *  report for multi-byte code points. */
+const utf8Encoder = new TextEncoder()
+function utf8ByteLength(s: string): number {
+  return utf8Encoder.encode(s).length
 }
 
 /**
@@ -145,6 +167,21 @@ export function extractManifests(
   return texts.flatMap((text) => {
     if (typeof text !== 'string' || text.length === 0) return []
     if (!looksLikeManifest(text)) return []
+    // 40 KB raw-body size cap (ccsc-s53.3). Checked *after* the
+    // pre-filter (so we only pay the byte-count walk on candidate
+    // payloads) but *before* `JSON.parse` (so the parser can't be
+    // weaponised to allocate gigabytes on a hostile pinned message).
+    // Oversized drops log a debug line because they are operator-
+    // actionable — a peer hitting the cap is either buggy or adversarial.
+    // Malformed-JSON and Zod-failure drops stay silent (see §81): common
+    // and not a signal.
+    const bytes = utf8ByteLength(text)
+    if (bytes > MAX_MANIFEST_BYTES) {
+      console.debug(
+        `[manifest] silent drop: oversized body ${bytes}B > ${MAX_MANIFEST_BYTES}B cap`,
+      )
+      return []
+    }
     try {
       const parsed: unknown = JSON.parse(text)
       const result = ManifestV1.safeParse(parsed)
