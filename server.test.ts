@@ -32,6 +32,8 @@ import {
   buildAuditReceiptMessage,
   buildAndPostAuditReceipt,
   type Access,
+  type AuditReceiptPostArgs,
+  type AuditReceiptPostError,
   type GateOptions,
   type Session,
   type SessionKey,
@@ -7436,8 +7438,8 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   const baseChannel: ChannelPolicy = { requireMention: false, allowFrom: [] }
 
   test('audit: undefined — no post, no onError, returns undefined', async () => {
-    const calls: unknown[] = []
-    const errors: unknown[] = []
+    const calls: AuditReceiptPostArgs[] = []
+    const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
       'C1', undefined, 'Bash', undefined,
@@ -7449,8 +7451,8 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('audit: off — no post, no onError, returns undefined', async () => {
-    const calls: unknown[] = []
-    const errors: unknown[] = []
+    const calls: AuditReceiptPostArgs[] = []
+    const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
       'C1', undefined, 'Bash',
@@ -7463,7 +7465,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('audit: compact — posts once and returns correlationId + ts', async () => {
-    const calls: Array<{ channel: string; thread_ts?: string }> = []
+    const calls: AuditReceiptPostArgs[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: '1700000000.000100' } },
       'C_OPS', 'T_ROOT', 'Write',
@@ -7479,7 +7481,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('audit: full — posts once with correct args and returns populated result', async () => {
-    const calls: Array<{ channel: string; thread_ts?: string; blocks: unknown[] }> = []
+    const calls: AuditReceiptPostArgs[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: 'ts_full' } },
       'C_SEC', 'T_AUDIT', 'Read',
@@ -7496,7 +7498,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('non-ok Slack response — onError fires with Slack error string, result undefined, no throw', async () => {
-    const errors: Array<{ correlationId: string; err: unknown }> = []
+    const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: false, error: 'channel_not_found' }),
       'C1', undefined, 'Bash',
@@ -7510,7 +7512,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('non-ok Slack response without error string — falls back to generic marker, result undefined', async () => {
-    const errors: Array<{ err: unknown }> = []
+    const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: false }),
       'C1', undefined, 'Bash',
@@ -7523,7 +7525,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('Slack throws — onError fires, result undefined, no throw (projection must not block exec)', async () => {
-    const errors: Array<{ err: unknown }> = []
+    const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => { throw new Error('slack rate limit') },
       'C1', undefined, 'Bash',
@@ -7536,7 +7538,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   })
 
   test('missing ts on ok response — onError fires with specific message, result undefined', async () => {
-    const errors: Array<{ err: unknown }> = []
+    const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: true }),
       'C1', undefined, 'Bash',
