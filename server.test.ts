@@ -5605,6 +5605,12 @@ describe('Epic 29-B integration — full policy chain', () => {
   const loadLib = async () => await import('./lib.ts')
   const loadPolicy = async () => await import('./policy.ts')
 
+  /** Fixed epoch ms used as `now` across the multi-approver tests.
+   *  Exact value is arbitrary — picked to be recent-ish and human-
+   *  readable. What matters is that it's the same across calls in a
+   *  single test so TTL math is deterministic. */
+  const T0 = 1_700_000_000_000
+
   const makeCall = (
     overrides: Partial<import('./policy.ts').ToolCall> = {},
   ): import('./policy.ts').ToolCall => ({
@@ -5673,7 +5679,7 @@ describe('Epic 29-B integration — full policy chain', () => {
       },
     ])
     const call = makeCall({ tool: 'delete_project' })
-    const now = 1_700_000_000_000
+    const now = T0
 
     // First call: no approval in flight → require (2 approvers needed)
     const approvals = new Map<string, { ttlExpires: number }>()
@@ -5742,7 +5748,7 @@ describe('Epic 29-B integration — full policy chain', () => {
         approvers: 1,
       },
     ])
-    const now = 1_700_000_000_000
+    const now = T0
 
     const approvals = new Map<string, { ttlExpires: number }>()
     const sessionA = { channel: 'C001', thread: '1.000001' }
