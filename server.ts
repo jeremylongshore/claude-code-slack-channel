@@ -1192,28 +1192,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // Collect candidate message bodies from both sources the doc
       // specifies (§79). Pin errors and history errors do not fail the
       // tool — a peer that has pinned a valid manifest should surface
-      // even if the history call hiccups, and vice versa.
+      // even if the history call hiccups, and vice versa. Parallelised
+      // via allSettled so the tool's latency is max(pins, history)
+      // rather than pins + history.
+      const [pinsResult, historyResult] = await Promise.allSettled([
+        web.pins.list({ channel }),
+        web.conversations.history({ channel, limit: 50 }),
+      ])
+
       const texts: Array<string | null | undefined> = []
-      try {
-        const pins = await web.pins.list({ channel })
-        for (const item of pins.items ?? []) {
+      if (pinsResult.status === 'fulfilled') {
+        for (const item of pinsResult.value.items ?? []) {
           // pins.list returns {type: 'message', message: {...}} among
           // other item kinds; only message items can carry manifests.
           const msg = (item as { message?: { text?: string | null } }).message
           if (msg) texts.push(msg.text ?? null)
         }
-      } catch {
-        // Pin fetch failure: fall through to history. The tool does not
-        // surface a partial-error signal — this is read-side advertising,
-        // not a transaction.
       }
-      try {
-        const history = await web.conversations.history({ channel, limit: 50 })
-        for (const msg of history.messages ?? []) {
+      if (historyResult.status === 'fulfilled') {
+        for (const msg of historyResult.value.messages ?? []) {
           texts.push((msg as { text?: string | null }).text ?? null)
         }
-      } catch {
-        // History fetch failure: same posture as pins above.
       }
 
       const manifests = extractManifests(texts)

@@ -142,19 +142,15 @@ function looksLikeManifest(text: string): boolean {
 export function extractManifests(
   texts: ReadonlyArray<string | null | undefined>,
 ): ManifestV1[] {
-  const out: ManifestV1[] = []
-  for (const text of texts) {
-    if (typeof text !== 'string' || text.length === 0) continue
-    if (!looksLikeManifest(text)) continue
-    let parsed: unknown
+  return texts.flatMap((text) => {
+    if (typeof text !== 'string' || text.length === 0) return []
+    if (!looksLikeManifest(text)) return []
     try {
-      parsed = JSON.parse(text)
+      const parsed: unknown = JSON.parse(text)
+      const result = ManifestV1.safeParse(parsed)
+      return result.success ? [result.data] : []
     } catch {
-      continue
+      return []
     }
-    const result = ManifestV1.safeParse(parsed)
-    if (!result.success) continue
-    out.push(result.data)
-  }
-  return out
+  })
 }
