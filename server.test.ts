@@ -31,6 +31,8 @@ import {
   shouldPostAuditReceipt,
   buildAuditReceiptMessage,
   buildAndPostAuditReceipt,
+  enforceAuditReceiptCap,
+  AUDIT_RECEIPTS_MAX,
   type Access,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
@@ -7647,5 +7649,53 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result).toBeUndefined()
     expect(errors).toHaveLength(1)
     expect(errors[0]!.err).toBe('ok response missing ts')
+  })
+})
+
+describe('enforceAuditReceiptCap (audit-receipt memory safety)', () => {
+  test('under cap — no-op, returns 0', () => {
+    const m = new Map<string, number>()
+    m.set('a', 1)
+    m.set('b', 2)
+    expect(enforceAuditReceiptCap(m, 10)).toBe(0)
+    expect(m.size).toBe(2)
+  })
+
+  test('exactly at cap — no-op', () => {
+    const m = new Map<string, number>()
+    for (let i = 0; i < 5; i++) m.set(`k${i}`, i)
+    expect(enforceAuditReceiptCap(m, 5)).toBe(0)
+    expect(m.size).toBe(5)
+  })
+
+  test('over cap — evicts oldest FIFO until size equals cap, returns eviction count', () => {
+    const m = new Map<string, number>()
+    for (let i = 0; i < 10; i++) m.set(`k${i}`, i)
+    expect(enforceAuditReceiptCap(m, 3)).toBe(7)
+    expect(m.size).toBe(3)
+    // Only the last three inserted keys survive.
+    expect([...m.keys()]).toEqual(['k7', 'k8', 'k9'])
+  })
+
+  test('cap of zero — evicts everything', () => {
+    const m = new Map<string, number>()
+    m.set('a', 1)
+    m.set('b', 2)
+    expect(enforceAuditReceiptCap(m, 0)).toBe(2)
+    expect(m.size).toBe(0)
+  })
+
+  test('cap larger than size — returns 0', () => {
+    const m = new Map<string, number>([['x', 1]])
+    expect(enforceAuditReceiptCap(m, 100)).toBe(0)
+    expect(m.size).toBe(1)
+  })
+
+  test('AUDIT_RECEIPTS_MAX is a reasonable production value', () => {
+    // Guard against accidental regression (e.g. someone setting it to 0 or
+    // Number.MAX_SAFE_INTEGER). The production value should be high enough
+    // for bursty workloads but bounded for memory safety.
+    expect(AUDIT_RECEIPTS_MAX).toBeGreaterThanOrEqual(100)
+    expect(AUDIT_RECEIPTS_MAX).toBeLessThanOrEqual(10_000)
   })
 })

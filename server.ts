@@ -54,6 +54,8 @@ import {
   PERMISSION_REPLY_RE,
   escMrkdwn,
   buildAndPostAuditReceipt,
+  enforceAuditReceiptCap,
+  AUDIT_RECEIPTS_MAX,
   type Access,
   type GateResult,
   type PendingPolicyApproval,
@@ -331,6 +333,7 @@ async function postAuditReceiptIfEnabled(
     tool,
     postedAt: Date.now(),
   })
+  enforceAuditReceiptCap(auditReceipts, AUDIT_RECEIPTS_MAX)
   return result.correlationId
 }
 

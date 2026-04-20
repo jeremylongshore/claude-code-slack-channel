@@ -22,6 +22,16 @@ export const MAX_PENDING = 3
 export const MAX_PAIRING_REPLIES = 2
 export const PAIRING_EXPIRY_MS = 60 * 60 * 1000 // 1 hour
 
+/** Upper bound on the in-memory auditReceipts map in server.ts. Pre-
+ *  execution receipts accumulate entries that would otherwise grow
+ *  unbounded on a long-running server — there's no MCP tool-
+ *  completion signal to clear them (see ccsc-4nm). When the map
+ *  exceeds this cap, the oldest entries are evicted FIFO via
+ *  `enforceAuditReceiptCap`. Eviction is silent (projection is
+ *  best-effort; the authoritative hash-chained journal already
+ *  captured the decision). */
+export const AUDIT_RECEIPTS_MAX = 500
+
 /** Matches permission relay replies (e.g. "y abcde", "no xyzwq").
  *  Used in gate() to block peer-bot messages that look like permission
  *  approvals, and in server.ts to route human permission replies. */
@@ -1580,6 +1590,31 @@ export async function buildAndPostAuditReceipt(
   } catch (err) {
     return reportError(err)
   }
+}
+
+/** Enforce a FIFO capacity cap on an auditReceipts-style Map. If size
+ *  exceeds `max`, evict oldest insertion-order entries until it fits.
+ *  Javascript Map preserves insertion order, so `keys().next().value`
+ *  is the oldest entry.
+ *
+ *  Pure with respect to external state (mutates only the passed map).
+ *  Silent eviction is intentional: the authoritative hash-chained
+ *  journal already captured the decision the evicted receipt was
+ *  projecting, so the operator loses no information — just the Slack-
+ *  side correlation affordance for that specific receipt. A long-
+ *  running server with 500+ concurrent approved tool calls either has
+ *  volume high enough that the thread is unreadable anyway, or has
+ *  had post-exec finalization (ccsc-4nm) wired by then to clear
+ *  entries as tools complete. */
+export function enforceAuditReceiptCap<V>(receipts: Map<string, V>, max: number): number {
+  let evicted = 0
+  while (receipts.size > max) {
+    const oldestKey = receipts.keys().next().value
+    if (oldestKey === undefined) break
+    receipts.delete(oldestKey)
+    evicted += 1
+  }
+  return evicted
 }
 
 /** Slack Block Kit context-block payload for the pre-execution receipt.
