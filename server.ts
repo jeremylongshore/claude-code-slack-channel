@@ -328,7 +328,11 @@ async function postAuditReceiptIfEnabled(
       unfurl_media: false,
     })
     if (!posted.ok || typeof posted.ts !== 'string') {
-      console.error('[slack] audit receipt post returned non-ok', { channel, tool })
+      console.error('[slack] audit receipt post returned non-ok', {
+        channel,
+        tool,
+        correlationId,
+      })
       return undefined
     }
     auditReceipts.set(correlationId, {
@@ -340,7 +344,12 @@ async function postAuditReceiptIfEnabled(
     })
     return correlationId
   } catch (err) {
-    console.error('[slack] audit receipt post failed (non-blocking):', err)
+    console.error('[slack] audit receipt post failed (non-blocking):', {
+      channel,
+      tool,
+      correlationId,
+      err,
+    })
     return undefined
   }
 }
