@@ -7450,13 +7450,15 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
 
   test('audit: off — no post, no onError, returns undefined', async () => {
     const calls: unknown[] = []
+    const errors: unknown[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
       'C1', undefined, 'Bash',
       { ...baseChannel, audit: 'off' },
-      () => {},
+      (ctx) => errors.push(ctx),
     )
     expect(calls).toHaveLength(0)
+    expect(errors).toHaveLength(0)
     expect(result).toBeUndefined()
   })
 
