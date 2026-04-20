@@ -429,7 +429,7 @@ Unknown keys inside `agentCard` are *stripped* (Zod's default
 compatibility: a future v2 publisher can include new sub-fields
 without breaking v1 readers.
 
-### Migration path if A2A formalises signed manifests
+### Migration path if A2A formalizes signed manifests
 
 A2A is moving toward signed agent-cards — the spec already reserves a
 `supportsAuthenticatedExtendedCard` flag for the mechanism. When that
@@ -441,7 +441,7 @@ like this:
    field. The shape of the payload is otherwise a superset of v1.
 2. Extend the consumer (`extractManifests`) to accept either magic
    key, Zod-validate against the matching schema, and for v2 verify
-   the signature over the canonicalised body. Failed signature
+   the signature over the canonicalized body. Failed signature
    verification is a silent drop, same posture as the v1 validation
    drops documented in §81.
 3. Extend the publisher (`publish_manifest`) to produce v2 payloads
@@ -454,7 +454,7 @@ like this:
 
 Through that migration this document's invariants are unchanged:
 advertisements are still not grants, `policy.ts` still cannot import
-from the manifest module, access.json is still not mutated by any
+from the manifest module, `access.json` is still not mutated by any
 manifest code path. Signed manifests change the trust *surface* of
 the content (a peer's claim becomes verifiably attributable) without
 changing who has authority (the access store). The scope of Epic
@@ -463,7 +463,7 @@ continues to hold whether the data is v1 or v2.
 
 Actual signing work is deferred to a future epic — this note exists
 so reviewers of that future work can see the migration was planned
-for, not retrofitted around surprise.
+for, not retrofitted as an afterthought.
 
 ---
 
