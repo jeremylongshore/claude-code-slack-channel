@@ -1509,6 +1509,79 @@ export interface AuditReceiptContextBlock {
   elements: Array<{ type: 'mrkdwn'; text: string }>
 }
 
+/** Arguments passed to the dependency-injected postMessage function
+ *  by `buildAndPostAuditReceipt`. Structural subset of Slack's
+ *  `chat.postMessage` that the receipt flow needs — deliberately
+ *  narrow so lib.ts stays decoupled from `@slack/web-api`. */
+export interface AuditReceiptPostArgs {
+  channel: string
+  thread_ts: string | undefined
+  text: string
+  blocks: AuditReceiptContextBlock[]
+  unfurl_links: false
+  unfurl_media: false
+}
+
+/** Slack-style response from the injected postMessage function.
+ *  Structural subset of `ChatPostMessageResponse`. When `ok` is false
+ *  Slack's real response usually carries an `error` string explaining
+ *  why (e.g. `channel_not_found`, `rate_limited`); propagating it
+ *  through makes failed-projection diagnostics actionable. */
+export interface AuditReceiptPostResponse {
+  ok: boolean
+  ts?: string
+  error?: string
+}
+
+/** Error context handed to the onError callback when a receipt post
+ *  fails (non-ok response, thrown exception, or missing ts). Covers
+ *  everything an operator would need to trace the failed projection. */
+export interface AuditReceiptPostError {
+  channel: string
+  tool: string
+  correlationId: string
+  err: unknown
+}
+
+/** Decide + build + post an audit receipt with dependency-injected
+ *  postMessage. Returns `{correlationId, ts}` on success, `undefined`
+ *  when projection is off (`shouldPostAuditReceipt` returns false) OR
+ *  when the post failed. Post failures invoke `onError` but never
+ *  throw — the "projection must not block tool execution" invariant
+ *  is enforced here. Pure with respect to I/O beyond the injected
+ *  poster. */
+export async function buildAndPostAuditReceipt(
+  post: (args: AuditReceiptPostArgs) => Promise<AuditReceiptPostResponse>,
+  channel: string,
+  thread: string | undefined,
+  tool: string,
+  channelPolicy: ChannelPolicy | undefined,
+  onError: (ctx: AuditReceiptPostError) => void,
+): Promise<{ correlationId: string; ts: string } | undefined> {
+  if (!shouldPostAuditReceipt(channelPolicy)) return undefined
+  const correlationId = generateCorrelationId()
+  const { text, blocks } = buildAuditReceiptMessage(tool, correlationId)
+  const reportError = (err: unknown): undefined => {
+    onError({ channel, tool, correlationId, err })
+    return undefined
+  }
+  try {
+    const posted = await post({
+      channel,
+      thread_ts: thread,
+      text,
+      blocks,
+      unfurl_links: false,
+      unfurl_media: false,
+    })
+    if (!posted.ok) return reportError(posted.error || 'non-ok response')
+    if (typeof posted.ts !== 'string') return reportError('ok response missing ts')
+    return { correlationId, ts: posted.ts }
+  } catch (err) {
+    return reportError(err)
+  }
+}
+
 /** Slack Block Kit context-block payload for the pre-execution receipt.
  *  Intentionally minimal: `:receipt:` emoji + tool name (escaped) +
  *  correlation ID. Kept pure so server.ts and tests share one builder.

@@ -30,7 +30,10 @@ import {
   generateCorrelationId,
   shouldPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildAndPostAuditReceipt,
   type Access,
+  type AuditReceiptPostArgs,
+  type AuditReceiptPostError,
   type GateOptions,
   type Session,
   type SessionKey,
@@ -7428,5 +7431,122 @@ describe('buildAuditReceiptMessage (30-B.2)', () => {
     const block = msg.blocks[0] as { elements: Array<{ text: string }> }
     expect(block.elements[0]!.text).not.toContain('<evil>')
     expect(block.elements[0]!.text).toContain('&lt;evil&gt;')
+  })
+})
+
+describe('buildAndPostAuditReceipt (30-B.9)', () => {
+  const baseChannel: ChannelPolicy = { requireMention: false, allowFrom: [] }
+
+  test('audit: undefined — no post, no onError, returns undefined', async () => {
+    const calls: AuditReceiptPostArgs[] = []
+    const errors: AuditReceiptPostError[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
+      'C1', undefined, 'Bash', undefined,
+      (ctx) => errors.push(ctx),
+    )
+    expect(calls).toHaveLength(0)
+    expect(errors).toHaveLength(0)
+    expect(result).toBeUndefined()
+  })
+
+  test('audit: off — no post, no onError, returns undefined', async () => {
+    const calls: AuditReceiptPostArgs[] = []
+    const errors: AuditReceiptPostError[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'off' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(calls).toHaveLength(0)
+    expect(errors).toHaveLength(0)
+    expect(result).toBeUndefined()
+  })
+
+  test('audit: compact — posts once and returns correlationId + ts', async () => {
+    const calls: AuditReceiptPostArgs[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1700000000.000100' } },
+      'C_OPS', 'T_ROOT', 'Write',
+      { ...baseChannel, audit: 'compact' },
+      () => { throw new Error('onError should not fire on success') },
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.channel).toBe('C_OPS')
+    expect(calls[0]!.thread_ts).toBe('T_ROOT')
+    expect(result).toBeDefined()
+    expect(result!.ts).toBe('1700000000.000100')
+    expect(result!.correlationId.length).toBeGreaterThan(0)
+  })
+
+  test('audit: full — posts once with correct args and returns populated result', async () => {
+    const calls: AuditReceiptPostArgs[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: 'ts_full' } },
+      'C_SEC', 'T_AUDIT', 'Read',
+      { ...baseChannel, audit: 'full' },
+      () => { throw new Error('onError should not fire on success') },
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.channel).toBe('C_SEC')
+    expect(calls[0]!.thread_ts).toBe('T_AUDIT')
+    expect(calls[0]!.blocks).toHaveLength(1)
+    expect(result).toBeDefined()
+    expect(result!.ts).toBe('ts_full')
+    expect(result!.correlationId.length).toBeGreaterThan(0)
+  })
+
+  test('non-ok Slack response — onError fires with Slack error string, result undefined, no throw', async () => {
+    const errors: AuditReceiptPostError[] = []
+    const result = await buildAndPostAuditReceipt(
+      async () => ({ ok: false, error: 'channel_not_found' }),
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.correlationId.length).toBeGreaterThan(0)
+    expect(errors[0]!.err).toBe('channel_not_found')
+  })
+
+  test('non-ok Slack response without error string — falls back to generic marker, result undefined', async () => {
+    const errors: AuditReceiptPostError[] = []
+    const result = await buildAndPostAuditReceipt(
+      async () => ({ ok: false }),
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.err).toBe('non-ok response')
+  })
+
+  test('Slack throws — onError fires, result undefined, no throw (projection must not block exec)', async () => {
+    const errors: AuditReceiptPostError[] = []
+    const result = await buildAndPostAuditReceipt(
+      async () => { throw new Error('slack rate limit') },
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect((errors[0]!.err as Error).message).toBe('slack rate limit')
+  })
+
+  test('missing ts on ok response — onError fires with specific message, result undefined', async () => {
+    const errors: AuditReceiptPostError[] = []
+    const result = await buildAndPostAuditReceipt(
+      async () => ({ ok: true }),
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.err).toBe('ok response missing ts')
   })
 })
