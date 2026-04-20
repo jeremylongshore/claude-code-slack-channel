@@ -1,4 +1,4 @@
-# claude-code-slack-channel v0.5.1
+# claude-code-slack-channel v0.6.0
 
 Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channels, just like you'd chat in the terminal. Per-thread session isolation, hash-chained tamper-evident audit journal, policy-gated tools, five-layer prompt-injection defense.
 
@@ -6,7 +6,7 @@ Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channe
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
-**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.5.1)
+**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.6.0)
 
 > **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login.
 
@@ -85,6 +85,43 @@ claude --channels plugin:slack-channel@claude-code-plugins
 1. DM the bot in Slack — you'll get a 6-character pairing code
 2. In your terminal: `/slack-channel:access pair <code>`
 3. You're connected. Chat away.
+
+## Policy Engine (v0.6.0+)
+
+Author rules in `access.json.policy` to automate permission decisions for Claude Code tool calls. Three rule effects, first-applicable ordering:
+
+```json
+{
+  "policy": [
+    {
+      "id": "safe-reads",
+      "effect": "auto_approve",
+      "match": { "tool": "read_file", "pathPrefix": "/workspace/docs" }
+    },
+    {
+      "id": "no-shell",
+      "effect": "deny",
+      "match": { "tool": "run_shell" },
+      "reason": "Shell execution is not permitted."
+    },
+    {
+      "id": "dangerous-delete",
+      "effect": "require_approval",
+      "match": { "tool": "delete_project" },
+      "approvers": 2,
+      "ttlMs": 300000
+    }
+  ]
+}
+```
+
+- **`auto_approve`** — skip the Block Kit prompt; the tool call runs immediately and a `policy.allow` event is journaled.
+- **`deny`** — the reason is posted back into the originating thread and the call is rejected. `policy.deny` is journaled.
+- **`require_approval`** — route through human approver(s). `approvers: 2` requires two **distinct** Slack `user_id`s (NIST two-person integrity; the same user cannot double-satisfy quorum by clicking twice). A single deny from any allowlisted user rejects the request immediately regardless of quorum count.
+- Successful approvals grant a TTL window scoped to `(rule, channel, thread)` so a chain of similar calls doesn't re-prompt.
+- Parse errors in `access.json.policy` are **fatal at boot** — policy is safety-critical, silent degradation is not offered. Missing or empty `policy` is fine (first-install path).
+
+Full schema reference: [`ACCESS.md`](ACCESS.md#policy-rules). Decision procedure: [`000-docs/policy-evaluation-flow.md`](000-docs/policy-evaluation-flow.md). Release scope and what was deliberately deferred: [`000-docs/v0.6.0-release-plan.md`](000-docs/v0.6.0-release-plan.md).
 
 ## Access Control
 
