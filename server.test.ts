@@ -7527,8 +7527,8 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect((errors[0]!.err as Error).message).toBe('slack rate limit')
   })
 
-  test('missing ts on ok response — onError fires, result undefined', async () => {
-    const errors: Array<unknown> = []
+  test('missing ts on ok response — onError fires with specific message, result undefined', async () => {
+    const errors: Array<{ err: unknown }> = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: true }),
       'C1', undefined, 'Bash',
@@ -7537,5 +7537,6 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     )
     expect(result).toBeUndefined()
     expect(errors).toHaveLength(1)
+    expect(errors[0]!.err).toBe('ok response missing ts')
   })
 })

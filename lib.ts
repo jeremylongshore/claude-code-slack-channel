@@ -1570,12 +1570,21 @@ export async function buildAndPostAuditReceipt(
       unfurl_links: false,
       unfurl_media: false,
     })
-    if (!posted.ok || typeof posted.ts !== 'string') {
+    if (!posted.ok) {
       onError({
         channel,
         tool,
         correlationId,
         err: posted.error ?? 'non-ok response',
+      })
+      return undefined
+    }
+    if (typeof posted.ts !== 'string') {
+      onError({
+        channel,
+        tool,
+        correlationId,
+        err: 'ok response missing ts',
       })
       return undefined
     }
