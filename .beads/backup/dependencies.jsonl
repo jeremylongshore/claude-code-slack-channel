@@ -17,6 +17,7 @@
 {"created_at":"2026-04-19T00:01:02Z","created_by":"jeremylongshore","depends_on_id":"ccsc-0qk.16","issue_id":"ccsc-0qk.8","metadata":"{}","type":"parent-child"}
 {"created_at":"2026-04-19T00:01:03Z","created_by":"jeremylongshore","depends_on_id":"ccsc-0qk.16","issue_id":"ccsc-0qk.9","metadata":"{}","type":"parent-child"}
 {"created_at":"2026-04-19T15:59:58Z","created_by":"jeremylongshore","depends_on_id":"ccsc-9d9","issue_id":"ccsc-3fo","metadata":"{}","type":"blocks"}
+{"created_at":"2026-04-19T20:51:24Z","created_by":"jeremylongshore","depends_on_id":"ccsc-rc1","issue_id":"ccsc-4an","metadata":"{}","type":"supersedes"}
 {"created_at":"2026-04-18T22:22:15Z","created_by":"jeremylongshore","depends_on_id":"ccsc-hmj","issue_id":"ccsc-5pi","metadata":"{}","type":"blocks"}
 {"created_at":"2026-04-18T22:22:16Z","created_by":"jeremylongshore","depends_on_id":"ccsc-xfj","issue_id":"ccsc-5pi","metadata":"{}","type":"blocks"}
 {"created_at":"2026-04-18T23:59:49Z","created_by":"jeremylongshore","depends_on_id":"ccsc-5pi.12","issue_id":"ccsc-5pi.1","metadata":"{}","type":"parent-child"}
