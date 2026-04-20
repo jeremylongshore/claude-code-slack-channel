@@ -56,6 +56,16 @@ export interface Access {
   ackReaction?: string
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
+  /** Optional array of declarative policy rules, consumed by the
+   *  policy evaluator (see `policy.ts` and
+   *  `000-docs/policy-evaluation-flow.md`). Typed as `unknown[]` here
+   *  so lib.ts stays decoupled from policy.ts — server.ts calls
+   *  `parsePolicyRules()` to produce a validated `PolicyRule[]` at
+   *  boot. A missing or empty field means "no authored rules"; the
+   *  evaluator applies its defaults (allow for most tools, deny for
+   *  tools listed in `requireAuthoredPolicy`). Shape is documented in
+   *  ACCESS.md §Policy rules. */
+  policy?: unknown[]
 }
 
 export type GateAction = 'deliver' | 'drop' | 'pair'
@@ -1278,6 +1288,67 @@ export function resolveJournalPath(
   }
 
   return { path: null, source: null }
+}
+
+// ---------------------------------------------------------------------------
+// Policy decision routing (Epic 29-B Phase 1 — ccsc-me6.1/.2/.3)
+// ---------------------------------------------------------------------------
+
+/** Shape mirror of `PolicyDecision` from policy.ts, repeated here so
+ *  lib.ts stays framework-free (no policy.ts import — avoids a cycle
+ *  and keeps lib.ts pure). Discriminated on `kind`. */
+export type PolicyDecisionShape =
+  | { kind: 'allow'; rule?: string }
+  | { kind: 'deny'; rule: string; reason: string }
+  | { kind: 'require'; rule: string; approver: 'human_approver'; ttlMs: number }
+
+/** What the server handler should do with a policy decision. Four
+ *  outcomes, one per matrix cell in (decision.kind) × (rule matched or
+ *  default branch):
+ *
+ *   - `auto_allow`     — matched an auto_approve rule; server replies
+ *                        `allow` to Claude immediately, no Block Kit.
+ *   - `deny`           — matched a deny rule; server posts `reason` to
+ *                        the thread and replies `deny` to Claude.
+ *   - `require_human`  — matched a require_approval rule; server falls
+ *                        through to the existing Block Kit human-approver
+ *                        flow (Phase 2 adds policy-aware approval
+ *                        tracking). Journal emits a `policy.require`
+ *                        trace so the audit trail records the dispatch.
+ *   - `default_human`  — default branch `allow` with no rule match; the
+ *                        evaluator has no opinion. Fall through to the
+ *                        existing Block Kit flow unchanged. No trace
+ *                        event (silencing the no-opinion case keeps the
+ *                        journal legible on busy channels).
+ */
+export type PermissionRoute =
+  | { type: 'auto_allow'; ruleId: string }
+  | { type: 'deny'; ruleId: string; reason: string }
+  | { type: 'require_human'; ruleId: string }
+  | { type: 'default_human' }
+
+/** Pure mapping from a `PolicyDecision` to a `PermissionRoute`. Testable
+ *  without mocking MCP, Slack, or the journal.
+ *
+ *  Contract: every `PolicyDecision` maps to exactly one route. The
+ *  `default_human` case is triggered only by `{ kind: 'allow' }` with no
+ *  `rule` (the evaluator's default branch for tools outside
+ *  `requireAuthoredPolicy`). A matched `auto_approve` rule produces
+ *  `{ kind: 'allow', rule: <id> }` and routes to `auto_allow`.
+ */
+export function decidePermissionRoute(
+  decision: PolicyDecisionShape,
+): PermissionRoute {
+  switch (decision.kind) {
+    case 'allow':
+      return decision.rule !== undefined
+        ? { type: 'auto_allow', ruleId: decision.rule }
+        : { type: 'default_human' }
+    case 'deny':
+      return { type: 'deny', ruleId: decision.rule, reason: decision.reason }
+    case 'require':
+      return { type: 'require_human', ruleId: decision.rule }
+  }
 }
 
 // ---------------------------------------------------------------------------

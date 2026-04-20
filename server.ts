@@ -48,12 +48,22 @@ import {
   resolveJournalPath,
   parseVerifyArg,
   formatVerifyResult,
+  decidePermissionRoute,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   type Access,
   type GateResult,
 } from './lib.ts'
 import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
+import {
+  parsePolicyRules,
+  evaluate as policyEvaluate,
+  detectShadowing,
+  approvalKey,
+  type PolicyRule,
+  type ToolCall as PolicyToolCall,
+  type ApprovalKey,
+} from './policy.ts'
 
 // ---------------------------------------------------------------------------
 // --verify-audit-log subcommand (ccsc-t7j, Epic 30-A.15)
@@ -240,6 +250,69 @@ function getAccess(): Access {
   const access = loadAccess()
   pruneExpired(access)
   return access
+}
+
+// ---------------------------------------------------------------------------
+// Policy engine — Epic 29-B Phase 1 (ccsc-me6.1 / me6.2 / me6.3 / me6.11)
+//
+// Policy rules are loaded ONCE at module boot from access.json's `policy`
+// field, parsed + shadow-linted, and frozen into `policyRules`. Hot reload
+// is intentionally NOT wired (see 000-docs/v0.6.0-release-plan.md §R3 and
+// policy-evaluation-flow.md §234 — monotonicity check is the hot-reload
+// invariant, and operators restart to apply new rules).
+//
+// Policy approvals (short-lived TTL windows granted by human approvers
+// replying on Slack) live in a module-level Map keyed by approvalKey()
+// per policy-evaluation-flow.md §285-287. Phase 1 declares the map but
+// does NOT yet populate it from approval replies — that's me6.4/me6.5 in
+// Phase 2. Until then, a `require_approval` rule falls through to the
+// existing Block Kit human-approver flow unchanged, which is exactly the
+// right behavior for Phase 1.
+//
+// Error policy: a malformed access.json `policy` field is fatal at boot.
+// Policy enforcement is safety-critical; silent degradation to "no policy"
+// on a parse error would let calls through that the operator intended to
+// block. Fail loud so the operator fixes the config.
+// ---------------------------------------------------------------------------
+
+let policyRules: readonly PolicyRule[] = loadPolicyRulesAtBoot()
+const policyApprovals = new Map<ApprovalKey, { ttlExpires: number }>()
+
+function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
+  const bootAccess = STATIC_MODE && staticAccess ? staticAccess : loadAccess()
+  const raw = bootAccess.policy
+  if (raw === undefined || (Array.isArray(raw) && raw.length === 0)) {
+    // Missing or empty `policy` field is the first-install path — no
+    // authored rules means the evaluator applies defaults (allow most
+    // tools, deny tools in requireAuthoredPolicy). Not an error.
+    return []
+  }
+  let parsed: PolicyRule[]
+  try {
+    parsed = parsePolicyRules(raw)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(
+      `[slack] policy parse failed at boot: ${msg}\n` +
+        `  File: ${ACCESS_FILE}\n` +
+        `  Field: policy\n` +
+        `  Fix the rules or remove the policy field to boot without enforcement.`,
+    )
+    process.exit(1)
+  }
+  // detectShadowing is warn-not-block per policy-evaluation-flow.md §199
+  // — an operator may have intentionally authored an unreachable rule
+  // (e.g. as a placeholder during a refactor) and shouldn't be forced
+  // to delete it just to boot. Warnings go to stderr; a journal event
+  // is not emitted here because the journal writer isn't open yet.
+  const shadows = detectShadowing(parsed)
+  for (const warning of shadows) {
+    console.error(`[slack] policy shadow warning: ${warning.message}`)
+  }
+  console.error(
+    `[slack] policy: loaded ${parsed.length} rule(s), ${shadows.length} shadow warning(s)`,
+  )
+  return parsed
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,6 +1089,118 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
     sessionKey: lastActiveThread !== undefined ? { channel: targetChannel, thread: lastActiveThread } : undefined,
     input: { channel: targetChannel, thread_ts: lastActiveThread },
   })
+
+  // ---------------------------------------------------------------------
+  // Policy evaluation (Epic 29-B Phase 1 — ccsc-me6.1/.2/.3/.11)
+  //
+  // Consult evaluate() before routing to the human approver. Three
+  // decision shapes, three routes:
+  //
+  //   allow + rule      → matched auto_approve; bypass Block Kit and
+  //                       reply 'allow' to Claude immediately.
+  //   deny              → post reason to thread, reply 'deny' to Claude.
+  //   allow (no rule)   → default-allow for non-safety-critical tools;
+  //     OR require        fall through to the existing human-approver
+  //                       Block Kit flow (Phase 2 = me6.4 adds the
+  //                       policy-aware approval-tracking for 'require').
+  //
+  // The permission_request notification carries `input_preview` (string)
+  // rather than structured args, so `argEquals` and `pathPrefix`
+  // predicates cannot match from this notification alone. Rules can
+  // still match on `tool`, `channel`, `thread_ts`, and `actor`. Filed
+  // for future work when the MCP surface carries structured input.
+  // ---------------------------------------------------------------------
+  const sessionThread = lastActiveThread ?? ''
+  const policyCall: PolicyToolCall = {
+    tool: params.tool_name,
+    input: {},
+    sessionKey: { channel: targetChannel, thread: sessionThread },
+    actor: 'claude_process',
+  }
+  const decision = policyEvaluate(
+    policyCall,
+    policyRules,
+    Date.now(),
+    { approvals: policyApprovals },
+  )
+  const route = decidePermissionRoute(decision)
+
+  const policySessionKey =
+    lastActiveThread !== undefined
+      ? { channel: targetChannel, thread: lastActiveThread }
+      : undefined
+  const policyInput = { tool: params.tool_name, channel: targetChannel, thread_ts: lastActiveThread }
+
+  if (route.type === 'auto_allow') {
+    // Matched auto_approve. Bypass Block Kit, reply to Claude directly.
+    journalWrite({
+      kind: 'policy.allow',
+      outcome: 'allow',
+      actor: 'claude_process',
+      sessionKey: policySessionKey,
+      toolName: params.tool_name,
+      input: policyInput,
+      ruleId: route.ruleId,
+    })
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: params.request_id, behavior: 'allow' },
+    })
+    return
+  }
+
+  if (route.type === 'deny') {
+    // Matched deny. Post reason to thread, reply 'deny' to Claude.
+    // No Block Kit, no pendingPermissions entry — the decision is final.
+    journalWrite({
+      kind: 'policy.deny',
+      outcome: 'deny',
+      actor: 'claude_process',
+      sessionKey: policySessionKey,
+      toolName: params.tool_name,
+      input: policyInput,
+      ruleId: route.ruleId,
+      reason: route.reason,
+    })
+    const safeTool = escMrkdwn(params.tool_name)
+    const safeReason = escMrkdwn(route.reason)
+    try {
+      await web.chat.postMessage({
+        channel: targetChannel,
+        thread_ts: lastActiveThread,
+        text: `🚫 Policy denied \`${safeTool}\`: ${safeReason}`,
+        unfurl_links: false,
+        unfurl_media: false,
+      })
+    } catch (postErr) {
+      // Surface the post failure but still deny to Claude — the policy
+      // decision is authoritative even if the user-facing notice fails.
+      console.error('[slack] policy.deny notice post failed:', postErr)
+    }
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: params.request_id, behavior: 'deny' },
+    })
+    return
+  }
+
+  // route.type === 'require_human' or 'default_human'. Either way, fall
+  // through to the existing Block Kit human-approver flow. Phase 1 emits
+  // a trace event for require_human so the journal records that a rule
+  // dispatched the request to a human; default_human is intentionally
+  // not traced (would 10x the journal on a busy channel for the no-
+  // opinion case — see release-plan R2).
+  if (route.type === 'require_human') {
+    journalWrite({
+      kind: 'policy.require',
+      outcome: 'require',
+      actor: 'claude_process',
+      sessionKey: policySessionKey,
+      toolName: params.tool_name,
+      input: policyInput,
+      ruleId: route.ruleId,
+    })
+  }
 
   pruneStalePermissions()
   // Pin the request to the thread it was issued from. The button /

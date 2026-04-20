@@ -5240,6 +5240,113 @@ describe('formatVerifyResult', () => {
 })
 
 // ---------------------------------------------------------------------------
+// decidePermissionRoute — ccsc-me6.1 / me6.2 / me6.3, Epic 29-B Phase 1
+//
+// Pure mapping from a PolicyDecision to a PermissionRoute. Each branch
+// of the evaluator's three-shape output must route to exactly one of
+// four outcomes: auto_allow, deny, require_human, default_human.
+// ---------------------------------------------------------------------------
+
+describe('decidePermissionRoute', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('matched auto_approve rule routes to auto_allow with the rule id', async () => {
+    const { decidePermissionRoute } = await loadLib()
+    expect(decidePermissionRoute({ kind: 'allow', rule: 'safe-reads' })).toEqual({
+      type: 'auto_allow',
+      ruleId: 'safe-reads',
+    })
+  })
+
+  test('default-branch allow (no rule) routes to default_human', async () => {
+    // The evaluator returns `{ kind: 'allow' }` with no `rule` when no
+    // rule matched AND the tool is not in requireAuthoredPolicy. In
+    // this case we fall through to the existing Block Kit flow — the
+    // evaluator has no opinion, so the human-approver UI stays in
+    // charge (Phase 1 doesn't auto-approve the no-opinion case).
+    const { decidePermissionRoute } = await loadLib()
+    expect(decidePermissionRoute({ kind: 'allow' })).toEqual({
+      type: 'default_human',
+    })
+  })
+
+  test('deny routes to deny with the rule id and reason propagated', async () => {
+    const { decidePermissionRoute } = await loadLib()
+    expect(
+      decidePermissionRoute({
+        kind: 'deny',
+        rule: 'no-shell',
+        reason: 'Shell execution is not permitted in this channel.',
+      }),
+    ).toEqual({
+      type: 'deny',
+      ruleId: 'no-shell',
+      reason: 'Shell execution is not permitted in this channel.',
+    })
+  })
+
+  test('default-deny (rule = "default") still routes to deny with the default reason', async () => {
+    // The evaluator's default branch for tools in requireAuthoredPolicy
+    // (e.g. upload_file with no authored rule) returns a deny with
+    // rule='default'. The route should still be 'deny' — the server
+    // handler has one deny path regardless of whether a user-authored
+    // or default rule produced the decision.
+    const { decidePermissionRoute } = await loadLib()
+    expect(
+      decidePermissionRoute({
+        kind: 'deny',
+        rule: 'default',
+        reason: "no policy authored for tool 'upload_file'",
+      }),
+    ).toEqual({
+      type: 'deny',
+      ruleId: 'default',
+      reason: "no policy authored for tool 'upload_file'",
+    })
+  })
+
+  test('require routes to require_human with the rule id (TTL is consumed by Phase 2, not Phase 1)', async () => {
+    // Phase 1 falls through to the existing Block Kit flow on require.
+    // Phase 2 (ccsc-me6.4) adds policy-aware approval tracking using
+    // the ttlMs; Phase 1 just needs to route correctly and emit the
+    // trace event.
+    const { decidePermissionRoute } = await loadLib()
+    expect(
+      decidePermissionRoute({
+        kind: 'require',
+        rule: 'dangerous-upload',
+        approver: 'human_approver',
+        ttlMs: 5 * 60 * 1000,
+      }),
+    ).toEqual({
+      type: 'require_human',
+      ruleId: 'dangerous-upload',
+    })
+  })
+
+  test('routing is exhaustive — every decision kind maps to exactly one route', async () => {
+    // Lock the matrix cells: allow/rule, allow/no-rule, deny, require.
+    // Four decisions in, four route types out. Regression-guard against
+    // a future refactor that accidentally collapses a case.
+    const { decidePermissionRoute } = await loadLib()
+    const routes = new Set([
+      decidePermissionRoute({ kind: 'allow', rule: 'r' }).type,
+      decidePermissionRoute({ kind: 'allow' }).type,
+      decidePermissionRoute({ kind: 'deny', rule: 'r', reason: 'x' }).type,
+      decidePermissionRoute({
+        kind: 'require',
+        rule: 'r',
+        approver: 'human_approver',
+        ttlMs: 1,
+      }).type,
+    ])
+    expect(routes).toEqual(
+      new Set(['auto_allow', 'default_human', 'deny', 'require_human']),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
 // verifyJournal — ccsc-5pi.10 + happy-path E2E from ccsc-5pi.8
 // ---------------------------------------------------------------------------
 

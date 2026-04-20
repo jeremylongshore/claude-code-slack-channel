@@ -219,7 +219,26 @@ The evaluator is a **veto layer**, not the sole gate. Even an allowed decision s
 
 ### Where policies live
 
-Currently: policies are consumed as a `PolicyRule[]` by `evaluate()` — the loader and on-disk format land with the server integration in **Epic 29-B**. This section will be updated when the file format is frozen; until then, treat the schema above as the stable contract.
+Policies live under the top-level `policy` key in `access.json` (same file as `dmPolicy`, `allowFrom`, `channels`). The server parses and validates them **once at boot** via `parsePolicyRules()`; `detectShadowing()` runs and emits warnings to stderr. A malformed rule or a duplicate id is **fatal at boot** — the server exits with a descriptive error message. Silent degradation to "no policy" is not offered: policy enforcement is safety-critical, so a parse failure demands operator action rather than opening a hole.
+
+```json
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["U012AB3CD4E"],
+  "channels": { "C0123456789": { "replyAllowedFrom": [] } },
+  "pending": {},
+  "policy": [
+    { "id": "safe-reads", "effect": "auto_approve", "match": { "tool": "read_file", "pathPrefix": "/workspace/docs" } },
+    { "id": "no-shell",   "effect": "deny",         "match": { "tool": "run_shell" }, "reason": "Shell execution is not permitted from this channel." }
+  ]
+}
+```
+
+A missing or empty `policy` field means "no authored rules" and is **not** an error — the evaluator applies defaults (allow most tools, deny tools in `requireAuthoredPolicy` like `upload_file`). This is the first-install path.
+
+**Hot reload is intentionally not supported** (see `000-docs/v0.6.0-release-plan.md` §R3). Operators restart the server to apply new rules. The `checkMonotonicity()` invariant is reserved for a future hot-reload path; landing one now would require a signal handler and a drain-in-flight-approvals protocol that v0.6.0 deliberately defers.
+
+Epic 29-B wired the loader and the `evaluate()` call into the permission-relay handler. The wiring lives in `server.ts` at the `PermissionRequestSchema` handler — see the `decidePermissionRoute()` helper in `lib.ts` for the pure decision-routing logic.
 
 ## File attachments — sendable roots
 
