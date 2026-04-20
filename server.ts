@@ -52,6 +52,10 @@ import {
   recordApprovalVote,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
+  escMrkdwn,
+  generateCorrelationId,
+  shouldPostAuditReceipt,
+  buildAuditReceiptMessage,
   type Access,
   type GateResult,
   type PendingPolicyApproval,
@@ -275,6 +279,71 @@ function getAccess(): Access {
 
 let policyRules: readonly PolicyRule[] = loadPolicyRulesAtBoot()
 const policyApprovals = new Map<ApprovalKey, { ttlExpires: number }>()
+
+/** Pre-execution audit receipts awaiting their post-execution edit.
+ *  Keyed by correlation ID. Populated when a tool call passes policy
+ *  (auto_allow or quorum-approved) and the originating channel's
+ *  `audit` mode is `'compact'` or `'full'`. Consumed by the
+ *  post-execution edit hook (Epic 30-B.3) to update the receipt
+ *  with outcome. Entries with no matching post-execution signal
+ *  persist as stubs; Epic 30-B.6 adds reaper logic for these. */
+interface PendingAuditReceipt {
+  channel: string
+  thread: string | undefined
+  ts: string
+  tool: string
+  postedAt: number
+}
+const auditReceipts = new Map<string, PendingAuditReceipt>()
+
+/** Post a pre-execution audit receipt if the channel opts in via
+ *  `ChannelPolicy.audit`. Returns the generated correlation ID when
+ *  posted, or `undefined` when projection is off (default-safe) or
+ *  the Slack post failed.
+ *
+ *  Projection is best-effort by design: a failed post must never
+ *  block the tool call it was meant to witness. Errors are logged to
+ *  stderr only (enforced fully by Epic 30-B.6 reaper/backoff work).
+ *  The authoritative audit record remains the hash-chained local
+ *  journal — this is the *projection* surface per
+ *  [`000-docs/audit-journal-architecture.md`](000-docs/audit-journal-architecture.md). */
+async function postAuditReceiptIfEnabled(
+  client: WebClient,
+  accessSnapshot: Access,
+  channel: string,
+  thread: string | undefined,
+  tool: string,
+): Promise<string | undefined> {
+  const channelPolicy = accessSnapshot.channels[channel]
+  if (!shouldPostAuditReceipt(channelPolicy)) return undefined
+  const correlationId = generateCorrelationId()
+  const { text, blocks } = buildAuditReceiptMessage(tool, correlationId)
+  try {
+    const posted = await client.chat.postMessage({
+      channel,
+      thread_ts: thread,
+      text,
+      blocks: blocks as never,
+      unfurl_links: false,
+      unfurl_media: false,
+    })
+    if (!posted.ok || typeof posted.ts !== 'string') {
+      console.error('[slack] audit receipt post returned non-ok', { channel, tool })
+      return undefined
+    }
+    auditReceipts.set(correlationId, {
+      channel,
+      thread,
+      ts: posted.ts,
+      tool,
+      postedAt: Date.now(),
+    })
+    return correlationId
+  } catch (err) {
+    console.error('[slack] audit receipt post failed (non-blocking):', err)
+    return undefined
+  }
+}
 
 /** Grant a TTL-windowed approval for the (rule, session) pair. Called
  *  when a quorum of approvers has voted Allow on a `require_approval`
@@ -1099,6 +1168,14 @@ type PendingPermissionEntry = {
   description: string
   input_preview: string
   createdAt: number
+  /** Channel the tool call was issued against. Captured at entry
+   *  creation so the post-approval audit receipt (Epic 30-B.2) posts
+   *  in the originating channel even if the approver clicks from a
+   *  different surface. */
+  channel: string
+  /** Thread the tool call was issued in. `undefined` for top-level
+   *  messages. Used alongside `channel` for receipt posting. */
+  thread: string | undefined
   policy?: PendingPolicyApproval
 }
 const pendingPermissions = new Map<string, PendingPermissionEntry>()
@@ -1108,14 +1185,6 @@ function pruneStalePermissions(): void {
   for (const [id, entry] of pendingPermissions) {
     if (entry.createdAt < cutoff) pendingPermissions.delete(id)
   }
-}
-
-/** Escape Slack mrkdwn special characters to prevent injection. */
-function escMrkdwn(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
 }
 
 // Type assertion avoids TS2589 (excessively deep type instantiation) caused
@@ -1205,6 +1274,13 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   const policyInput = { tool: params.tool_name, channel: targetChannel, thread_ts: lastActiveThread }
 
   if (route.type === 'auto_allow') {
+    const correlationId = await postAuditReceiptIfEnabled(
+      web,
+      access,
+      targetChannel,
+      lastActiveThread,
+      params.tool_name,
+    )
     journalWrite({
       kind: 'policy.allow',
       outcome: 'allow',
@@ -1213,6 +1289,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
       toolName: params.tool_name,
       input: policyInput,
       ruleId: route.ruleId,
+      correlationId,
     })
     await mcp.notification({
       method: 'notifications/claude/channel/permission',
@@ -1292,6 +1369,8 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
     description: params.description,
     input_preview: params.input_preview,
     createdAt: Date.now(),
+    channel: targetChannel,
+    thread: lastActiveThread,
     policy: pendingPolicy,
   })
 
@@ -1525,6 +1604,20 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
     const behavior = verb === 'allow' ? 'allow' : 'deny'
     const verdict = behavior === 'allow' ? 'allowed' : 'denied'
     const safeTool = escMrkdwn(details.tool_name)
+
+    // Post the pre-execution audit receipt into the originating
+    // thread before releasing Claude to execute. Only fires on
+    // 'allow' since no execution follows a deny. No-op when the
+    // channel's policy opts out via audit: undefined | 'off'.
+    if (behavior === 'allow') {
+      await postAuditReceiptIfEnabled(
+        web,
+        access,
+        details.channel,
+        details.thread,
+        details.tool_name,
+      )
+    }
 
     await mcp.notification({
       method: 'notifications/claude/channel/permission',
@@ -1774,6 +1867,20 @@ async function handleMessage(event: unknown): Promise<void> {
           }
           // result.kind === 'approved' — fall through to the resolve
           // block below with behavior='allow'.
+        }
+
+        // Post the pre-execution audit receipt into the originating
+        // thread before releasing Claude. Same guardrails as the button
+        // path: only on allow, only when the channel opts in, never
+        // blocks tool execution on projection failure.
+        if (replyIsAllow) {
+          await postAuditReceiptIfEnabled(
+            web,
+            result.access!,
+            replyDetails.channel,
+            replyDetails.thread,
+            replyDetails.tool_name,
+          )
         }
 
         await mcp.notification({

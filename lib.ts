@@ -11,6 +11,7 @@
 import { resolve, sep, basename, join } from 'path'
 import { realpathSync, mkdirSync, readdirSync, readFileSync, statSync, existsSync } from 'fs'
 import { writeFile, chmod, rename, unlink, readFile } from 'fs/promises'
+import { randomBytes } from 'crypto'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -1456,6 +1457,76 @@ export function recordApprovalVote(
     return { kind: 'approved', state: newState }
   }
   return { kind: 'pending', state: newState }
+}
+
+// ---------------------------------------------------------------------------
+// Slack mrkdwn escaping (shared between policy notices and audit receipts)
+// ---------------------------------------------------------------------------
+
+/** Escape Slack mrkdwn special characters to prevent injection of
+ *  control sequences (link syntax, channel refs) via attacker-
+ *  controlled strings like tool names or policy reasons. Pure. */
+export function escMrkdwn(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+}
+
+// ---------------------------------------------------------------------------
+// Epic 30-B — audit receipt projection (pre-execution receipt blocks)
+// ---------------------------------------------------------------------------
+
+/** Generate a short, URL-safe correlation ID for linking a pre-execution
+ *  receipt to its eventual outcome (30-B.3). Uses 6 bytes of CSPRNG
+ *  entropy → 8-char base64url output. Collision probability across the
+ *  pending-receipts map at realistic volumes (<1k concurrent tool
+ *  calls) is negligible.
+ *
+ *  Pure — no I/O beyond the crypto RNG read. Tested via the
+ *  "generates unique, URL-safe" test. */
+export function generateCorrelationId(): string {
+  return randomBytes(6).toString('base64url')
+}
+
+/** Decide whether a given channel's policy opts in to audit receipt
+ *  projection. Absent or `'off'` returns false (default-safe): no
+ *  receipts posted, no cost, no information leak. `'compact'` and
+ *  `'full'` both return true — the mode difference is the *content*
+ *  of the post-execution edit (30-B.4 / 30-B.5), not the presence of
+ *  the pre-execution receipt. */
+export function shouldPostAuditReceipt(policy: ChannelPolicy | undefined): boolean {
+  const mode = policy?.audit
+  return mode === 'compact' || mode === 'full'
+}
+
+/** Slack Block Kit context-block payload for the pre-execution receipt.
+ *  Intentionally minimal: `:receipt:` emoji + tool name (escaped) +
+ *  correlation ID. Kept pure so server.ts and tests share one builder.
+ *
+ *  The returned shape matches Slack's Block Kit JSON — safe to spread
+ *  into `chat.postMessage({ blocks: ... })`. The `text` field is the
+ *  accessible fallback for notifications. */
+export function buildAuditReceiptMessage(
+  tool: string,
+  correlationId: string,
+): { text: string; blocks: readonly unknown[] } {
+  const safeTool = escMrkdwn(tool)
+  const safeCid = escMrkdwn(correlationId)
+  return {
+    text: `:receipt: audit: ${tool} (${correlationId})`,
+    blocks: [
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `:receipt: \`${safeTool}\` • cid \`${safeCid}\``,
+          },
+        ],
+      },
+    ],
+  }
 }
 
 // ---------------------------------------------------------------------------
