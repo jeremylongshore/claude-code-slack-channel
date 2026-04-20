@@ -1523,10 +1523,14 @@ export interface AuditReceiptPostArgs {
 }
 
 /** Slack-style response from the injected postMessage function.
- *  Structural subset of `ChatPostMessageResponse`. */
+ *  Structural subset of `ChatPostMessageResponse`. When `ok` is false
+ *  Slack's real response usually carries an `error` string explaining
+ *  why (e.g. `channel_not_found`, `rate_limited`); propagating it
+ *  through makes failed-projection diagnostics actionable. */
 export interface AuditReceiptPostResponse {
   ok: boolean
   ts?: string
+  error?: string
 }
 
 /** Error context handed to the onError callback when a receipt post
@@ -1567,7 +1571,12 @@ export async function buildAndPostAuditReceipt(
       unfurl_media: false,
     })
     if (!posted.ok || typeof posted.ts !== 'string') {
-      onError({ channel, tool, correlationId, err: 'non-ok response' })
+      onError({
+        channel,
+        tool,
+        correlationId,
+        err: posted.error ?? 'non-ok response',
+      })
       return undefined
     }
     return { correlationId, ts: posted.ts }

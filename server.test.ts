@@ -7488,10 +7488,10 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result).toBeDefined()
   })
 
-  test('non-ok Slack response — onError fires, result undefined, no throw', async () => {
+  test('non-ok Slack response — onError fires with Slack error string, result undefined, no throw', async () => {
     const errors: Array<{ correlationId: string; err: unknown }> = []
     const result = await buildAndPostAuditReceipt(
-      async () => ({ ok: false }),
+      async () => ({ ok: false, error: 'channel_not_found' }),
       'C1', undefined, 'Bash',
       { ...baseChannel, audit: 'compact' },
       (ctx) => errors.push(ctx),
@@ -7499,6 +7499,19 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result).toBeUndefined()
     expect(errors).toHaveLength(1)
     expect(errors[0]!.correlationId.length).toBeGreaterThan(0)
+    expect(errors[0]!.err).toBe('channel_not_found')
+  })
+
+  test('non-ok Slack response without error string — falls back to generic marker', async () => {
+    const errors: Array<{ err: unknown }> = []
+    await buildAndPostAuditReceipt(
+      async () => ({ ok: false }),
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.err).toBe('non-ok response')
   })
 
   test('Slack throws — onError fires, result undefined, no throw (projection must not block exec)', async () => {
