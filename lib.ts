@@ -32,12 +32,26 @@ export const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
 export type DmPolicy = 'pairing' | 'allowlist' | 'disabled'
 
+/** Audit-log projection mode for a channel. See ChannelPolicy.audit.
+ *  The authoritative record remains the local hash-chained journal at
+ *  `~/.claude/channels/slack/audit.log`; this mode controls a
+ *  best-effort projection of events into Slack threads. See
+ *  `000-docs/audit-journal-architecture.md` for the projection vs.
+ *  authoritative-log distinction. */
+export type AuditMode = 'off' | 'compact' | 'full'
+
 export interface ChannelPolicy {
   requireMention: boolean
   allowFrom: string[]
   /** Opt-in list of bot user IDs allowed to deliver messages in this channel.
    *  Absent or empty = all bot messages dropped (default-safe). */
   allowBotIds?: string[]
+  /** Audit-log projection into this channel's Slack threads. Absent or
+   *  `'off'` = no projection (default-safe). `'compact'` projects tool
+   *  name + outcome only. `'full'` projects redacted inputs + outcome
+   *  (redaction lives in the 30-A journal layer). Projection failures
+   *  are log-only and never block tool execution. */
+  audit?: AuditMode
 }
 
 export interface PendingEntry {
