@@ -13,7 +13,7 @@
  *     v:        1,                          // schema version; chain refuses mixed versions
  *     ts:       '2026-04-19T12:34:56.789Z', // ISO-8601 UTC with ms precision
  *     seq:      42,                         // monotonic per chain
- *     kind:     'gate.inbound.drop',        // discriminated union of 19 event kinds
+ *     kind:     'gate.inbound.drop',        // discriminated union of 21 event kinds
  *     toolName?: 'reply',
  *     input?:   { chat_id: 'C01', text: '...' },     // post-redaction
  *     outcome?: 'allow' | 'deny' | 'require' | 'drop' | 'n/a',
@@ -78,9 +78,14 @@ export const EventKind = z.enum([
   'system.boot',
   'system.shutdown',
   'system.reload',
+  // Bot-manifest protocol (Epic 31-A). Emitted on every read_peer_manifests
+  // call so manifest activity is forensically visible even when cached;
+  // see 000-docs/bot-manifest-protocol.md §163-166.
+  'manifest.read',
+  'manifest.read.cached',
 ])
 
-/** TypeScript string union of the 19 event kinds. */
+/** TypeScript string union of the 21 event kinds. */
 export type EventKind = z.infer<typeof EventKind>
 
 // ---------------------------------------------------------------------------

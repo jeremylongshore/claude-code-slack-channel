@@ -61,7 +61,7 @@ import {
   type PendingPolicyApproval,
 } from './lib.ts'
 import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
-import { extractManifests } from './manifest.ts'
+import { extractManifests, createManifestCache } from './manifest.ts'
 import {
   parsePolicyRules,
   evaluate as policyEvaluate,
@@ -460,6 +460,13 @@ const deliveredThreads = new Set<string>()
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
 const seenEvents = new Map<string, number>()
+
+// Per-channel read cache for `read_peer_manifests` (Epic 31-A.5). Five-minute
+// TTL doubles as the rate limit on pins.list / conversations.history — within
+// the window, repeated tool invocations return the cached manifest list
+// instead of re-hitting Slack. A process restart clears the cache by design
+// (000-docs/bot-manifest-protocol.md §166).
+const manifestCache = createManifestCache()
 
 // ---------------------------------------------------------------------------
 // Session supervisor — lifecycle authority for per-thread sessions
@@ -1189,9 +1196,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         input: { channel },
       })
 
-      // Collect candidate message bodies from both sources the doc
-      // specifies (§79). Pin errors and history errors do not fail the
-      // tool — a peer that has pinned a valid manifest should surface
+      // Cache hit within the 5-minute TTL: return the cached list
+      // without hitting Slack (Epic 31-A.5, doc §84). The journal still
+      // records a manifest.read.cached event so manifest activity is
+      // forensically visible even when served from cache (§165).
+      const cached = manifestCache.get(channel)
+      if (cached !== undefined) {
+        journalWrite({
+          kind: 'manifest.read.cached',
+          toolName: 'read_peer_manifests',
+          input: { channel, count: cached.length },
+        })
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                { channel, count: cached.length, manifests: cached },
+                null,
+                2,
+              ),
+            },
+          ],
+        }
+      }
+
+      // Cache miss: fetch candidate message bodies from both sources the
+      // doc specifies (§79). Pin errors and history errors do not fail
+      // the tool — a peer that has pinned a valid manifest should surface
       // even if the history call hiccups, and vice versa. Parallelised
       // via allSettled so the tool's latency is max(pins, history)
       // rather than pins + history.
@@ -1216,6 +1248,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       const manifests = extractManifests(texts)
+      manifestCache.set(channel, manifests)
+      journalWrite({
+        kind: 'manifest.read',
+        toolName: 'read_peer_manifests',
+        input: { channel, count: manifests.length },
+      })
       return {
         content: [
           {

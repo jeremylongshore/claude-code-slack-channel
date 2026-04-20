@@ -3657,6 +3657,154 @@ describe('extractManifests (31-A.2)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// createManifestCache — per-channel read cache (Epic 31-A.5, ccsc-s53.5)
+//
+// Doubles as the rate limit on `read_peer_manifests`: within the 5-minute
+// TTL the consumer returns the cached list instead of hitting pins.list /
+// conversations.history again. Tests use an injected time source so
+// expiry can be exercised without waiting 5 minutes of wall-clock time.
+// Design: 000-docs/bot-manifest-protocol.md §84, §165.
+// ---------------------------------------------------------------------------
+
+describe('createManifestCache (31-A.5)', () => {
+  /** Build a fake validated ManifestV1 for cache-payload tests. The
+   *  cache is opaque over its value — any ReadonlyArray<ManifestV1>
+   *  works — so we don't need to re-run Zod inside these tests. */
+  const m = (name: string): import('./manifest.ts').ManifestV1 => ({
+    __claude_bot_manifest_v1__: true,
+    name,
+    vendor: 'Acme',
+    version: '1.0.0',
+    description: 'stub',
+    tools: [],
+    publishedAt: '2026-01-01T00:00:00.000Z',
+  })
+
+  test('exports MANIFEST_CACHE_TTL_MS = 5 minutes in ms', async () => {
+    const { MANIFEST_CACHE_TTL_MS } = await import('./manifest.ts')
+    expect(MANIFEST_CACHE_TTL_MS).toBe(5 * 60 * 1000)
+  })
+
+  test('miss on an empty cache returns undefined', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    const cache = createManifestCache({ now: () => 0 })
+    expect(cache.get('C_NONE')).toBeUndefined()
+    expect(cache.size()).toBe(0)
+  })
+
+  test('set then get within TTL returns the stored list', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    const cache = createManifestCache({ now: () => 1000 })
+    const payload = [m('Alpha'), m('Beta')]
+    cache.set('C_AB', payload)
+    expect(cache.get('C_AB')).toEqual(payload)
+    expect(cache.size()).toBe(1)
+  })
+
+  test('get at exactly ttlMs from cachedAt treats entry as expired (fail-closed)', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    // `now - cachedAt >= ttlMs` is expired — boundary is inclusive on the
+    // expired side so any 5-minute-old entry is refreshed, not served.
+    let nowValue = 0
+    const cache = createManifestCache({ now: () => nowValue, ttlMs: 1000 })
+    nowValue = 100
+    cache.set('C_TTL', [m('X')])
+    nowValue = 100 + 999
+    expect(cache.get('C_TTL')).toEqual([m('X')])
+    nowValue = 100 + 1000
+    expect(cache.get('C_TTL')).toBeUndefined()
+  })
+
+  test('get of an expired entry lazily evicts it', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    let nowValue = 0
+    const cache = createManifestCache({ now: () => nowValue, ttlMs: 100 })
+    cache.set('C_EVICT', [m('Gone')])
+    expect(cache.size()).toBe(1)
+    nowValue = 500
+    expect(cache.get('C_EVICT')).toBeUndefined()
+    expect(cache.size()).toBe(0) // lazily swept on access
+  })
+
+  test('set overwrites the cachedAt stamp when a key is already present', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    let nowValue = 0
+    const cache = createManifestCache({ now: () => nowValue, ttlMs: 1000 })
+    nowValue = 100
+    cache.set('C_REFRESH', [m('V1')])
+    nowValue = 900 // still fresh
+    expect(cache.get('C_REFRESH')).toEqual([m('V1')])
+    nowValue = 950
+    cache.set('C_REFRESH', [m('V2')]) // refresh stamp to 950
+    nowValue = 950 + 999
+    expect(cache.get('C_REFRESH')).toEqual([m('V2')]) // still fresh vs. 950 stamp
+  })
+
+  test('evicts the oldest entry on insert when size would exceed maxEntries', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    let nowValue = 0
+    const cache = createManifestCache({ now: () => nowValue, maxEntries: 2 })
+    nowValue = 10
+    cache.set('C_A', [m('A')])
+    nowValue = 20
+    cache.set('C_B', [m('B')])
+    nowValue = 30
+    cache.set('C_C', [m('C')]) // should evict C_A (oldest cachedAt)
+    expect(cache.size()).toBe(2)
+    expect(cache.get('C_A')).toBeUndefined()
+    expect(cache.get('C_B')).toEqual([m('B')])
+    expect(cache.get('C_C')).toEqual([m('C')])
+  })
+
+  test('does not evict when overwriting an existing key at the cap', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    let nowValue = 0
+    const cache = createManifestCache({ now: () => nowValue, maxEntries: 2 })
+    nowValue = 10
+    cache.set('C_A', [m('A')])
+    nowValue = 20
+    cache.set('C_B', [m('B')])
+    nowValue = 30
+    cache.set('C_A', [m('A2')]) // overwrite, not a new slot — no eviction
+    expect(cache.size()).toBe(2)
+    expect(cache.get('C_A')).toEqual([m('A2')])
+    expect(cache.get('C_B')).toEqual([m('B')])
+  })
+
+  test('clear drops every entry', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    const cache = createManifestCache({ now: () => 0 })
+    cache.set('C_1', [m('X')])
+    cache.set('C_2', [m('Y')])
+    expect(cache.size()).toBe(2)
+    cache.clear()
+    expect(cache.size()).toBe(0)
+    expect(cache.get('C_1')).toBeUndefined()
+    expect(cache.get('C_2')).toBeUndefined()
+  })
+
+  test('entries are isolated by channelId (no cross-channel leakage)', async () => {
+    const { createManifestCache } = await import('./manifest.ts')
+    const cache = createManifestCache({ now: () => 0 })
+    cache.set('C_ALICE', [m('AliceBot')])
+    cache.set('C_BOB', [m('BobBot')])
+    expect(cache.get('C_ALICE')?.[0]?.name).toBe('AliceBot')
+    expect(cache.get('C_BOB')?.[0]?.name).toBe('BobBot')
+  })
+
+  test('default TTL is 5 minutes when opts.ttlMs is omitted', async () => {
+    const { createManifestCache, MANIFEST_CACHE_TTL_MS } = await import('./manifest.ts')
+    let nowValue = 0
+    const cache = createManifestCache({ now: () => nowValue })
+    cache.set('C_D', [m('D')])
+    nowValue = MANIFEST_CACHE_TTL_MS - 1
+    expect(cache.get('C_D')).toEqual([m('D')])
+    nowValue = MANIFEST_CACHE_TTL_MS
+    expect(cache.get('C_D')).toBeUndefined()
+  })
+})
+
 describe('createSessionSupervisor.activate', () => {
   let rawRoot: string
   let tmpRoot: string
@@ -4486,7 +4634,12 @@ describe('JournalEvent', () => {
   test('covers every EventKind value enumerated in the design doc', async () => {
     const { JournalEvent, EventKind } = await import('./journal.ts')
     const kinds = EventKind.options
-    expect(kinds).toHaveLength(19)
+    // 19 original kinds + manifest.read + manifest.read.cached (Epic 31-A.5).
+    // If this number drifts, update the doc count in journal.ts's header
+    // comment too — both must agree.
+    expect(kinds).toHaveLength(21)
+    expect(kinds).toContain('manifest.read')
+    expect(kinds).toContain('manifest.read.cached')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }

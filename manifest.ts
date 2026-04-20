@@ -149,10 +149,9 @@ function utf8ByteLength(s: string): number {
  * journal when the read tool logs the read event — per-message drop
  * details are intentionally not surfaced.
  *
- * Size cap (40 KB per raw body) is a sibling bead (ccsc-s53.3); this
- * function does not enforce it. Callers that receive potentially large
- * bodies must pre-filter before calling, or wait for s53.3 to layer
- * that in.
+ * The 40 KB raw-body size cap (ccsc-s53.3, §47) is enforced here too —
+ * oversized bodies are dropped before `JSON.parse` is called so a
+ * hostile pinned message cannot force gigabyte-scale allocation.
  *
  * Returns validated manifests in the order they appeared in the input.
  * Duplicate de-dup is NOT performed here — a channel that has the same
@@ -190,4 +189,115 @@ export function extractManifests(
       return []
     }
   })
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel read cache + rate limit (Epic 31-A.5, bead ccsc-s53.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * TTL for a cached per-channel manifest list. Doubles as the rate limit
+ * on reads: within the TTL window, the consumer returns the cached value
+ * and does not hit `pins.list` / `conversations.history` again. Design
+ * doc §84. Five minutes is long enough that a chatty operator does not
+ * spam Slack, short enough that a peer's manifest edit surfaces within
+ * roughly a coffee break.
+ */
+export const MANIFEST_CACHE_TTL_MS = 5 * 60 * 1000
+
+export interface ManifestCacheEntry {
+  readonly cachedAt: number
+  readonly manifests: ReadonlyArray<ManifestV1>
+}
+
+export interface ManifestCache {
+  /** Return the cached manifests if the entry is fresh (age < TTL).
+   *  Returns `undefined` on miss — either no entry, or the entry has
+   *  expired. Expired entries are lazily evicted on access. Caller
+   *  decides what to do on miss (fetch + `set`, typically). */
+  get(channelId: string): ReadonlyArray<ManifestV1> | undefined
+  /** Store `manifests` for `channelId`, stamped at the cache's `now()`.
+   *  If the cache is at `maxEntries`, evicts the single oldest entry
+   *  (smallest `cachedAt`) before inserting — soft LRU. */
+  set(channelId: string, manifests: ReadonlyArray<ManifestV1>): void
+  /** Drop every entry. Exposed for test teardown and for future
+   *  operator commands (e.g. a `/manifest:flush` on schema change). */
+  clear(): void
+  /** Current entry count. Exposed for tests and operator inspection. */
+  size(): number
+}
+
+export interface ManifestCacheOptions {
+  /** Time source. Accept for testability; defaults to `Date.now`.
+   *  Must return wall-clock milliseconds since the Unix epoch. */
+  now?: () => number
+  /** Soft cap on distinct-channel entries. When insertion would exceed
+   *  this, the oldest entry is evicted. Default 256 — larger than the
+   *  channel count in any realistic workspace, small enough to bound
+   *  memory to roughly (maxEntries × 40 KB) worst case when every slot
+   *  holds a cap-size manifest list. */
+  maxEntries?: number
+  /** Entry TTL in ms. Defaults to `MANIFEST_CACHE_TTL_MS`. Exposed for
+   *  tests that need to exercise the expiry boundary without waiting
+   *  five minutes of wall-clock time. */
+  ttlMs?: number
+}
+
+/**
+ * Create a per-channel manifest cache. Opaque over an internal
+ * `Map<channelId, ManifestCacheEntry>` — the cache itself is a plain
+ * object with method members, not a class, so there is no `this`
+ * binding to worry about when the caller passes the methods around
+ * (e.g. into a lambda). Entries are dropped on process exit by design
+ * (protocol doc §166 "A restart clears it.") — persistence is out of
+ * scope.
+ */
+export function createManifestCache(
+  opts: ManifestCacheOptions = {},
+): ManifestCache {
+  const now = opts.now ?? Date.now
+  const maxEntries = opts.maxEntries ?? 256
+  const ttlMs = opts.ttlMs ?? MANIFEST_CACHE_TTL_MS
+  const store = new Map<string, ManifestCacheEntry>()
+
+  return {
+    get(channelId) {
+      const entry = store.get(channelId)
+      if (!entry) return undefined
+      if (now() - entry.cachedAt >= ttlMs) {
+        // Lazy eviction of an expired entry. Avoids a keep-alive bug
+        // where an expired entry stays around forever because it's
+        // never touched again — each `get` of an expired entry also
+        // removes it.
+        store.delete(channelId)
+        return undefined
+      }
+      return entry.manifests
+    },
+    set(channelId, manifests) {
+      // Soft LRU-by-age: on an insertion that would breach the cap,
+      // drop the single entry with the smallest `cachedAt`. Scanning
+      // the map is O(n) but n ≤ maxEntries = 256, so the cost is
+      // bounded and negligible compared to the Slack round-trip that
+      // populated the value.
+      if (store.size >= maxEntries && !store.has(channelId)) {
+        let oldestKey: string | undefined
+        let oldestAt = Infinity
+        for (const [k, v] of store) {
+          if (v.cachedAt < oldestAt) {
+            oldestAt = v.cachedAt
+            oldestKey = k
+          }
+        }
+        if (oldestKey !== undefined) store.delete(oldestKey)
+      }
+      store.set(channelId, { cachedAt: now(), manifests })
+    },
+    clear() {
+      store.clear()
+    },
+    size() {
+      return store.size
+    },
+  }
 }
