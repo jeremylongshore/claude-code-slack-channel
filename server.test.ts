@@ -30,6 +30,7 @@ import {
   generateCorrelationId,
   shouldPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildAndPostAuditReceipt,
   type Access,
   type GateOptions,
   type Session,
@@ -7428,5 +7429,100 @@ describe('buildAuditReceiptMessage (30-B.2)', () => {
     const block = msg.blocks[0] as { elements: Array<{ text: string }> }
     expect(block.elements[0]!.text).not.toContain('<evil>')
     expect(block.elements[0]!.text).toContain('&lt;evil&gt;')
+  })
+})
+
+describe('buildAndPostAuditReceipt (30-B.9)', () => {
+  const baseChannel: ChannelPolicy = { requireMention: false, allowFrom: [] }
+
+  test("audit: undefined — no post, no onError, returns undefined", async () => {
+    const calls: unknown[] = []
+    const errors: unknown[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
+      'C1', undefined, 'Bash', undefined,
+      (ctx) => errors.push(ctx),
+    )
+    expect(calls).toHaveLength(0)
+    expect(errors).toHaveLength(0)
+    expect(result).toBeUndefined()
+  })
+
+  test("audit: 'off' — no post, no onError, returns undefined", async () => {
+    const calls: unknown[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'off' },
+      () => {},
+    )
+    expect(calls).toHaveLength(0)
+    expect(result).toBeUndefined()
+  })
+
+  test("audit: 'compact' — posts once and returns correlationId + ts", async () => {
+    const calls: Array<{ channel: string; thread_ts?: string }> = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1700000000.000100' } },
+      'C_OPS', 'T_ROOT', 'Write',
+      { ...baseChannel, audit: 'compact' },
+      () => { throw new Error('onError should not fire on success') },
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.channel).toBe('C_OPS')
+    expect(calls[0]!.thread_ts).toBe('T_ROOT')
+    expect(result).toBeDefined()
+    expect(result!.ts).toBe('1700000000.000100')
+    expect(result!.correlationId.length).toBeGreaterThan(0)
+  })
+
+  test("audit: 'full' — posts once, returns populated result", async () => {
+    const calls: unknown[] = []
+    const result = await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: 'ts1' } },
+      'C1', undefined, 'Read',
+      { ...baseChannel, audit: 'full' },
+      () => {},
+    )
+    expect(calls).toHaveLength(1)
+    expect(result).toBeDefined()
+  })
+
+  test('non-ok Slack response — onError fires, result undefined, no throw', async () => {
+    const errors: Array<{ correlationId: string; err: unknown }> = []
+    const result = await buildAndPostAuditReceipt(
+      async () => ({ ok: false }),
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect(errors[0]!.correlationId.length).toBeGreaterThan(0)
+  })
+
+  test('Slack throws — onError fires, result undefined, no throw (projection must not block exec)', async () => {
+    const errors: Array<{ err: unknown }> = []
+    const result = await buildAndPostAuditReceipt(
+      async () => { throw new Error('slack rate limit') },
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
+    expect((errors[0]!.err as Error).message).toBe('slack rate limit')
+  })
+
+  test('missing ts on ok response — onError fires, result undefined', async () => {
+    const errors: Array<unknown> = []
+    const result = await buildAndPostAuditReceipt(
+      async () => ({ ok: true }),
+      'C1', undefined, 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      (ctx) => errors.push(ctx),
+    )
+    expect(result).toBeUndefined()
+    expect(errors).toHaveLength(1)
   })
 })

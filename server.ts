@@ -53,9 +53,7 @@ import {
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   escMrkdwn,
-  generateCorrelationId,
-  shouldPostAuditReceipt,
-  buildAuditReceiptMessage,
+  buildAndPostAuditReceipt,
   type Access,
   type GateResult,
   type PendingPolicyApproval,
@@ -314,44 +312,24 @@ async function postAuditReceiptIfEnabled(
   thread: string | undefined,
   tool: string,
 ): Promise<string | undefined> {
-  const channelPolicy = accessSnapshot.channels[channel]
-  if (!shouldPostAuditReceipt(channelPolicy)) return undefined
-  const correlationId = generateCorrelationId()
-  const { text, blocks } = buildAuditReceiptMessage(tool, correlationId)
-  try {
-    const posted = await client.chat.postMessage({
-      channel,
-      thread_ts: thread,
-      text,
-      blocks,
-      unfurl_links: false,
-      unfurl_media: false,
-    })
-    if (!posted.ok || typeof posted.ts !== 'string') {
-      console.error('[slack] audit receipt post returned non-ok', {
-        channel,
-        tool,
-        correlationId,
-      })
-      return undefined
-    }
-    auditReceipts.set(correlationId, {
-      channel,
-      thread,
-      ts: posted.ts,
-      tool,
-      postedAt: Date.now(),
-    })
-    return correlationId
-  } catch (err) {
-    console.error('[slack] audit receipt post failed (non-blocking):', {
-      channel,
-      tool,
-      correlationId,
-      err,
-    })
-    return undefined
-  }
+  const result = await buildAndPostAuditReceipt(
+    (args) =>
+      client.chat.postMessage(args) as Promise<{ ok: boolean; ts?: string }>,
+    channel,
+    thread,
+    tool,
+    accessSnapshot.channels[channel],
+    (ctx) => console.error('[slack] audit receipt post failed (non-blocking):', ctx),
+  )
+  if (!result) return undefined
+  auditReceipts.set(result.correlationId, {
+    channel,
+    thread,
+    ts: result.ts,
+    tool,
+    postedAt: Date.now(),
+  })
+  return result.correlationId
 }
 
 /** Grant a TTL-windowed approval for the (rule, session) pair. Called
