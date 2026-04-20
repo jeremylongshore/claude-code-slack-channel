@@ -69,6 +69,7 @@ import {
   findOurPriorManifestPins,
   ManifestV1,
   assertPublishSizeAndSerialize,
+  type PinItemLike,
 } from './manifest.ts'
 import {
   parsePolicyRules,
@@ -1431,7 +1432,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       try {
         const pins = await web.pins.list({ channel })
         const priorTs = findOurPriorManifestPins(
-          (pins.items ?? []) as ReadonlyArray<import('./manifest.ts').PinItemLike>,
+          (pins.items ?? []) as ReadonlyArray<PinItemLike>,
           { botId: selfBotId, botUserId },
         )
         for (const ts of priorTs) {
