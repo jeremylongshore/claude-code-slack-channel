@@ -1612,7 +1612,7 @@ export function enforceAuditReceiptCap<V>(receipts: Map<string, V>, max: number)
     const oldestKey = receipts.keys().next().value
     if (oldestKey === undefined) break
     receipts.delete(oldestKey)
-    evicted += 1
+    evicted++
   }
   return evicted
 }
