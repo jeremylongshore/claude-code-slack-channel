@@ -100,10 +100,17 @@ export const DenyRule = z.object({
   reason: z.string().min(1).max(200),
 })
 
-/** `require_approval`: hold the call until a human approver responds on
+/** `require_approval`: hold the call until human approver(s) respond on
  *  Slack. `ttlMs` is how long an approval remains valid after it
  *  arrives; future calls that match the same rule + session within the
- *  window are auto-approved. Default = 5 minutes. */
+ *  window are auto-approved. Default = 5 minutes.
+ *
+ *  `approvers` is the quorum threshold (NIST two-person integrity when
+ *  ≥2). Same Slack `user_id` cannot double-satisfy — the server tracks
+ *  approvedBy as a Set<user_id> and dedups on that. Display name is
+ *  never used (spoofable). Hard ceiling of 10 is anti-footgun: no real
+ *  workflow needs more than that, and an operator typo like `100`
+ *  should be loud, not a deadlock. */
 export const RequireApprovalRule = z.object({
   ...RuleBase,
   effect: z.literal('require_approval'),
@@ -113,6 +120,7 @@ export const RequireApprovalRule = z.object({
     .positive()
     .max(24 * 60 * 60 * 1000) // 24h hard ceiling
     .default(5 * 60 * 1000),
+  approvers: z.number().int().min(1).max(10).default(1),
 })
 
 /** Discriminated union over the three effects. evaluate() (29-A.3)
@@ -186,6 +194,10 @@ export type PolicyDecision =
       /** How long an approval, once granted, is fresh for. Propagated
        *  from the matching `RequireApprovalRule.ttlMs`. */
       ttlMs: number
+      /** Quorum threshold — how many distinct Slack `user_id`s must
+       *  approve before the decision flips to allow. Propagated from
+       *  `RequireApprovalRule.approvers` (default 1). */
+      approvers: number
     }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +337,7 @@ export function evaluate(
           rule: rule.id,
           approver: 'human_approver',
           ttlMs: rule.ttlMs,
+          approvers: rule.approvers,
         }
       }
     }
@@ -497,4 +510,52 @@ export function checkMonotonicity(
   }
 
   return violations
+}
+
+// ---------------------------------------------------------------------------
+// detectBroadAutoApprove() — boot-time footgun warning per ccsc-me6.7
+// ---------------------------------------------------------------------------
+
+export interface BroadMatchWarning {
+  ruleId: string
+  message: string
+}
+
+/** Flag `auto_approve` rules whose `match` is too broad to be intentional.
+ *  The heuristic: a narrow auto_approve must scope itself with at least
+ *  one of `tool` or `pathPrefix`. Without either, the rule auto-approves
+ *  based on `channel` / `actor` / `thread_ts` / `argEquals` alone — which
+ *  means any tool, on any path, in that scope gets a green light.
+ *
+ *  That's almost always a misconfiguration: the operator meant to bound
+ *  the rule to a specific safe operation and forgot. Warn loud at boot
+ *  so the operator catches it before a silent over-grant lands in prod.
+ *  Warn-not-block (same posture as `detectShadowing`) — an operator who
+ *  intentionally wants "trust claude_process fully in this channel" can
+ *  still boot; they just see the warning in logs.
+ *
+ *  Not shadow-detection (which flags unreachable rules) and not
+ *  monotonicity (which flags weakening reloads). This is a separate
+ *  axis: "this rule IS reachable and would be monotone, but its shape
+ *  means it probably matches far more than you think."
+ */
+export function detectBroadAutoApprove(
+  rules: readonly PolicyRule[],
+): BroadMatchWarning[] {
+  const warnings: BroadMatchWarning[] = []
+  for (const rule of rules) {
+    if (rule.effect !== 'auto_approve') continue
+    const hasNarrow =
+      rule.match.tool !== undefined || rule.match.pathPrefix !== undefined
+    if (!hasNarrow) {
+      warnings.push({
+        ruleId: rule.id,
+        message:
+          `auto_approve rule '${rule.id}' has no 'tool' or 'pathPrefix' in its match — ` +
+          `this rule auto-approves ANY tool call within its scope, which is almost always ` +
+          `a misconfiguration. Narrow the rule or convert to require_approval.`,
+      })
+    }
+  }
+  return warnings
 }

@@ -49,16 +49,19 @@ import {
   parseVerifyArg,
   formatVerifyResult,
   decidePermissionRoute,
+  recordApprovalVote,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   type Access,
   type GateResult,
+  type PendingPolicyApproval,
 } from './lib.ts'
 import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
 import {
   parsePolicyRules,
   evaluate as policyEvaluate,
   detectShadowing,
+  detectBroadAutoApprove,
   approvalKey,
   type PolicyRule,
   type ToolCall as PolicyToolCall,
@@ -278,6 +281,19 @@ function getAccess(): Access {
 let policyRules: readonly PolicyRule[] = loadPolicyRulesAtBoot()
 const policyApprovals = new Map<ApprovalKey, { ttlExpires: number }>()
 
+/** Grant a TTL-windowed approval for the (rule, session) pair. Called
+ *  when a quorum of approvers has voted Allow on a `require_approval`
+ *  request. Future calls matching the same rule + session within the
+ *  window auto-allow without re-prompting (see evaluate() §310-321 in
+ *  policy.ts for the lookup side of this contract). */
+function grantPolicyApproval(
+  pending: PendingPolicyApproval,
+  now: number,
+): void {
+  const key = approvalKey(pending.ruleId, pending.sessionKey)
+  policyApprovals.set(key, { ttlExpires: now + pending.ttlMs })
+}
+
 function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
   const bootAccess = STATIC_MODE && staticAccess ? staticAccess : loadAccess()
   const raw = bootAccess.policy
@@ -309,8 +325,16 @@ function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
   for (const warning of shadows) {
     console.error(`[slack] policy shadow warning: ${warning.message}`)
   }
+  // detectBroadAutoApprove (ccsc-me6.7) — footgun linter for auto_approve
+  // rules that don't specify `tool` or `pathPrefix`. Warn-not-block for
+  // the same reasons as shadow detection.
+  const broads = detectBroadAutoApprove(parsed)
+  for (const warning of broads) {
+    console.error(`[slack] policy footgun warning: ${warning.message}`)
+  }
   console.error(
-    `[slack] policy: loaded ${parsed.length} rule(s), ${shadows.length} shadow warning(s)`,
+    `[slack] policy: loaded ${parsed.length} rule(s), ` +
+      `${shadows.length} shadow warning(s), ${broads.length} footgun warning(s)`,
   )
   return parsed
 }
@@ -1025,7 +1049,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
 // from authorizing a different thread's tool call even when the
 // requestIds genuinely differ. The composite key closes that gap.
 const PERM_TTL_MS = 5 * 60 * 1000
-const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string; createdAt: number }>()
+/** Pending permission entries. The optional `policy` field is populated
+ *  only for `require_approval`-matched requests (Epic 29-B Phase 2 —
+ *  ccsc-me6.4). When present, the button / text-reply resolvers take
+ *  the multi-approver code path: record the voter's `user_id`, check
+ *  quorum, grant a TTL window on success. When absent, the single-
+ *  approver fast path applies (any allowlisted reply resolves the
+ *  request immediately, preserving pre-29-B behavior). */
+type PendingPermissionEntry = {
+  tool_name: string
+  description: string
+  input_preview: string
+  createdAt: number
+  policy?: PendingPolicyApproval
+}
+const pendingPermissions = new Map<string, PendingPermissionEntry>()
 
 function pruneStalePermissions(): void {
   const cutoff = Date.now() - PERM_TTL_MS
@@ -1185,21 +1223,34 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
   }
 
   // route.type === 'require_human' or 'default_human'. Either way, fall
-  // through to the existing Block Kit human-approver flow. Phase 1 emits
-  // a trace event for require_human so the journal records that a rule
-  // dispatched the request to a human; default_human is intentionally
-  // not traced (would 10x the journal on a busy channel for the no-
-  // opinion case — see release-plan R2).
-  if (route.type === 'require_human') {
+  // through to the existing Block Kit human-approver flow. Phase 2
+  // (ccsc-me6.4 / me6.5) attaches a PendingPolicyApproval to the pending
+  // entry for the require_human case so the button / text-reply
+  // resolvers can run the multi-approver quorum + NIST user_id dedup
+  // logic. default_human keeps the legacy single-approver fast path.
+  //
+  // Phase 1 emits a trace event for require_human so the journal
+  // records that a rule dispatched the request to a human;
+  // default_human is intentionally not traced (would 10x the journal
+  // on a busy channel for the no-opinion case — see release-plan R2).
+  let pendingPolicy: PendingPolicyApproval | undefined
+  if (route.type === 'require_human' && decision.kind === 'require') {
     journalWrite({
       kind: 'policy.require',
       outcome: 'require',
       actor: 'claude_process',
       sessionKey: policySessionKey,
       toolName: params.tool_name,
-      input: policyInput,
+      input: { ...policyInput, approversNeeded: decision.approvers },
       ruleId: route.ruleId,
     })
+    pendingPolicy = {
+      ruleId: decision.rule,
+      ttlMs: decision.ttlMs,
+      approversNeeded: decision.approvers,
+      approvedBy: new Set<string>(),
+      sessionKey: { channel: targetChannel, thread: sessionThread },
+    }
   }
 
   pruneStalePermissions()
@@ -1213,6 +1264,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }: { params:
     description: params.description,
     input_preview: params.input_preview,
     createdAt: Date.now(),
+    policy: pendingPolicy,
   })
 
   const safeTool = escMrkdwn(params.tool_name)
@@ -1378,6 +1430,85 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
         } catch { /* non-critical */ }
       }
       return
+    }
+
+    // Multi-approver path (ccsc-me6.4 / me6.5). When a PendingPolicyApproval
+    // is attached, votes accumulate with NIST `user_id` dedup until quorum.
+    // Deny always wins immediately — one "no" overrides any number of yeses.
+    if (details.policy && verb === 'allow') {
+      const vote = recordApprovalVote(details.policy, userId, Date.now())
+      if (vote.kind === 'duplicate') {
+        // Same user_id already approved; surface an ephemeral note and
+        // leave the pending entry unchanged. Block Kit stays as-is.
+        try {
+          await web.chat.postEphemeral({
+            channel: channelId,
+            user: userId,
+            text: 'You have already approved this request. A different approver must vote to reach quorum.',
+          })
+        } catch { /* non-critical */ }
+        return
+      }
+      if (vote.kind === 'pending') {
+        // Record the vote but don't resolve yet.
+        details.policy = vote.state
+        const safeTool = escMrkdwn(details.tool_name)
+        const safeDesc = escMrkdwn(details.description)
+        const progress = `${vote.state.approvedBy.size}/${vote.state.approversNeeded} approvals`
+        if (channelId && messageTs) {
+          try {
+            await web.chat.update({
+              channel: channelId,
+              ts: messageTs,
+              text: `Claude wants to run ${safeTool} — ${progress}`,
+              blocks: [
+                {
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}\n\n_${progress} — awaiting additional approver(s)._`,
+                  },
+                },
+                {
+                  type: 'actions',
+                  elements: [
+                    {
+                      type: 'button',
+                      text: { type: 'plain_text', text: '✅ Allow' },
+                      style: 'primary',
+                      action_id: `perm:allow:${requestId}`,
+                    },
+                    {
+                      type: 'button',
+                      text: { type: 'plain_text', text: '❌ Deny' },
+                      style: 'danger',
+                      action_id: `perm:deny:${requestId}`,
+                    },
+                  ],
+                },
+              ],
+            })
+          } catch { /* non-critical */ }
+        }
+        return
+      }
+      // vote.kind === 'approved' — quorum reached. Grant TTL window and
+      // fall through to the resolve path below with behavior='allow'.
+      details.policy = vote.state
+      grantPolicyApproval(vote.state, Date.now())
+      journalWrite({
+        kind: 'policy.approved',
+        outcome: 'allow',
+        actor: 'human_approver',
+        sessionKey: vote.state.sessionKey,
+        toolName: details.tool_name,
+        input: {
+          tool: details.tool_name,
+          approversNeeded: vote.state.approversNeeded,
+          approvers: Array.from(vote.state.approvedBy),
+        },
+        ruleId: vote.state.ruleId,
+      })
     }
 
     const behavior = verb === 'allow' ? 'allow' : 'deny'
@@ -1590,7 +1721,8 @@ async function handleMessage(event: unknown): Promise<void> {
 
         // Skip if already resolved (e.g. by a button click) OR if the
         // requestId is not pending in THIS thread.
-        if (!pendingPermissions.has(replyKey)) {
+        const replyDetails = pendingPermissions.get(replyKey)
+        if (!replyDetails) {
           try {
             await web.reactions.add({
               channel: channelId,
@@ -1601,11 +1733,59 @@ async function handleMessage(event: unknown): Promise<void> {
           return
         }
 
+        const replyIsAllow = permMatch[1].toLowerCase().startsWith('y')
+
+        // Multi-approver path (ccsc-me6.4 / me6.5) via text reply. Mirrors
+        // the button handler: allow votes accumulate with user_id dedup
+        // until quorum; deny wins immediately.
+        if (replyDetails.policy && replyIsAllow) {
+          const voterId = ev['user'] as string
+          const vote = recordApprovalVote(replyDetails.policy, voterId, Date.now())
+          if (vote.kind === 'duplicate') {
+            try {
+              await web.reactions.add({
+                channel: channelId,
+                timestamp: ev['ts'] as string,
+                name: 'no_entry_sign',
+              })
+            } catch { /* non-critical */ }
+            return
+          }
+          if (vote.kind === 'pending') {
+            replyDetails.policy = vote.state
+            try {
+              await web.reactions.add({
+                channel: channelId,
+                timestamp: ev['ts'] as string,
+                name: 'ballot_box_with_check',
+              })
+            } catch { /* non-critical */ }
+            return
+          }
+          // vote.kind === 'approved' — fall through to the resolve block
+          // below with behavior='allow'.
+          replyDetails.policy = vote.state
+          grantPolicyApproval(vote.state, Date.now())
+          journalWrite({
+            kind: 'policy.approved',
+            outcome: 'allow',
+            actor: 'human_approver',
+            sessionKey: vote.state.sessionKey,
+            toolName: replyDetails.tool_name,
+            input: {
+              tool: replyDetails.tool_name,
+              approversNeeded: vote.state.approversNeeded,
+              approvers: Array.from(vote.state.approvedBy),
+            },
+            ruleId: vote.state.ruleId,
+          })
+        }
+
         await mcp.notification({
           method: 'notifications/claude/channel/permission',
           params: {
             request_id: requestId,
-            behavior: permMatch[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
+            behavior: replyIsAllow ? 'allow' : 'deny',
           },
         })
         pendingPermissions.delete(replyKey)

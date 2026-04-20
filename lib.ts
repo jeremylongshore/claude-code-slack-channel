@@ -1352,6 +1352,93 @@ export function decidePermissionRoute(
 }
 
 // ---------------------------------------------------------------------------
+// Multi-approver quorum state (ccsc-me6.4 / me6.5 — Epic 29-B Phase 2)
+// ---------------------------------------------------------------------------
+
+/** Pending multi-approver state for a single require_approval request.
+ *  Attached to the `pendingPermissions` entry (server.ts) when the
+ *  matching rule's effect is `require_approval`. While pending, Slack
+ *  approval votes accumulate in `approvedBy` (a Set of verified Slack
+ *  `user_id`s — NEVER display names, per NIST two-person integrity).
+ *
+ *  Quorum is reached when `approvedBy.size >= approversNeeded`. At
+ *  that moment the server grants a TTL-windowed approval in the
+ *  `policyApprovals` map so that future calls matching the same
+ *  (rule, session) within `ttlMs` auto-allow without re-prompting.
+ *
+ *  A single deny vote (from any allowlisted user) rejects the request
+ *  immediately — no deny-quorum. That's the conservative posture: one
+ *  "no" overrides any number of "yes" answers. The multi-approver
+ *  invariant is about requiring multiple humans to say yes, not about
+ *  blocking a dissenter.
+ */
+export interface PendingPolicyApproval {
+  /** Rule id of the matching `require_approval` rule. Used to scope
+   *  the granted approval in the `policyApprovals` map. */
+  ruleId: string
+  /** How long the granted approval is fresh for once quorum is
+   *  reached. Propagated from `RequireApprovalRule.ttlMs`. */
+  ttlMs: number
+  /** Quorum threshold. ≥1. A rule with `approvers: 1` is single-
+   *  approver (the common case, and the default). */
+  approversNeeded: number
+  /** Set of verified Slack `user_id`s that have approved so far.
+   *  Adding the same id twice is a no-op (the underlying Set dedups),
+   *  which is the NIST two-person integrity invariant. */
+  approvedBy: Set<string>
+  /** The (channel, thread) this request belongs to. Stamped on the
+   *  granted approval so `approvalKey(ruleId, sessionKey)` in
+   *  `policyApprovals` matches the one `evaluate()` looks up on
+   *  subsequent calls. */
+  sessionKey: { channel: string; thread: string }
+}
+
+/** Outcome of recording an approval vote. Three cases, exhaustively
+ *  covered — the caller switches on `kind` and acts accordingly.
+ *
+ *   - `approved` — this vote reached quorum. Caller grants the TTL
+ *     window in `policyApprovals`, notifies Claude with `allow`, and
+ *     deletes the pending entry.
+ *   - `pending` — the vote was recorded but quorum is not yet met.
+ *     Caller updates the Block Kit message to reflect the new count
+ *     (`N/M approvals`) and keeps the pending entry alive.
+ *   - `duplicate` — the voter has already voted. Per NIST two-person
+ *     integrity the same human cannot double-satisfy a quorum, so the
+ *     repeat vote is ignored. Caller may surface a message to the
+ *     user explaining why their click was a no-op.
+ */
+export type ApprovalVoteOutcome =
+  | { kind: 'approved'; state: PendingPolicyApproval }
+  | { kind: 'pending'; state: PendingPolicyApproval }
+  | { kind: 'duplicate'; state: PendingPolicyApproval }
+
+/** Record a verified Slack `user_id`'s approval vote into the pending
+ *  state. Pure — returns a new state object, never mutates `state`.
+ *
+ *  The `now` parameter is unused in the current logic (TTL math happens
+ *  at quorum time in the caller, with a fresh `clock()` read), but the
+ *  signature carries it so the contract is clock-injected from day one
+ *  — when we add "expired pending" handling in a follow-up we only
+ *  change the implementation, not every call site.
+ */
+export function recordApprovalVote(
+  state: PendingPolicyApproval,
+  voterId: string,
+  _now: number,
+): ApprovalVoteOutcome {
+  if (state.approvedBy.has(voterId)) {
+    return { kind: 'duplicate', state }
+  }
+  const newApprovedBy = new Set(state.approvedBy)
+  newApprovedBy.add(voterId)
+  const newState: PendingPolicyApproval = { ...state, approvedBy: newApprovedBy }
+  if (newApprovedBy.size >= state.approversNeeded) {
+    return { kind: 'approved', state: newState }
+  }
+  return { kind: 'pending', state: newState }
+}
+
+// ---------------------------------------------------------------------------
 // --verify-audit-log CLI subcommand (ccsc-t7j, Epic 30-A.15)
 // ---------------------------------------------------------------------------
 

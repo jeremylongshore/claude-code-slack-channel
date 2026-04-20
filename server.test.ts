@@ -2461,17 +2461,19 @@ describe('PolicyDecision shape (29-A.2)', () => {
     }
   })
 
-  test('require decision carries rule + approver + ttlMs', async () => {
+  test('require decision carries rule + approver + ttlMs + approvers', async () => {
     type PD = import('./policy.ts').PolicyDecision
     const r: PD = {
       kind: 'require',
       rule: 'upload-approval',
       approver: 'human_approver',
       ttlMs: 5 * 60 * 1000,
+      approvers: 1,
     }
     expect(r.kind).toBe('require')
     if (r.kind === 'require') {
       expect(r.approver).toBe('human_approver')
+      expect(r.approvers).toBe(1)
       expect(r.ttlMs).toBeGreaterThan(0)
     }
   })
@@ -2629,15 +2631,16 @@ describe('evaluate() — policy engine (29-A.3)', () => {
     expect(decision).toEqual({ kind: 'deny', rule: 'r1', reason: 'nope' })
   })
 
-  test('require_approval rule → require with ttlMs', async () => {
+  test('require_approval rule → require with ttlMs + approvers default 1', async () => {
     const { evaluate } = await import('./policy.ts')
-    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000 } as never)]
+    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000, approvers: 1 } as never)]
     const decision = evaluate(baseCall(), rules, 0)
     expect(decision).toEqual({
       kind: 'require',
       rule: 'r1',
       approver: 'human_approver',
       ttlMs: 60_000,
+      approvers: 1,
     })
   })
 
@@ -5343,6 +5346,231 @@ describe('decidePermissionRoute', () => {
     expect(routes).toEqual(
       new Set(['auto_allow', 'default_human', 'deny', 'require_human']),
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// recordApprovalVote — ccsc-me6.4 / me6.5, Epic 29-B Phase 2
+//
+// Multi-approver quorum with NIST two-person integrity (user_id dedup).
+// ---------------------------------------------------------------------------
+
+describe('recordApprovalVote', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  const pending = (
+    approversNeeded: number,
+    approvedBy: string[] = [],
+  ): import('./lib.ts').PendingPolicyApproval => ({
+    ruleId: 'upload-approval',
+    ttlMs: 5 * 60 * 1000,
+    approversNeeded,
+    approvedBy: new Set(approvedBy),
+    sessionKey: { channel: 'C0123456789', thread: '1712345678.001100' },
+  })
+
+  test('single-approver: first vote reaches quorum immediately', async () => {
+    const { recordApprovalVote } = await loadLib()
+    const out = recordApprovalVote(pending(1), 'U_ALICE', 0)
+    expect(out.kind).toBe('approved')
+    expect(out.state.approvedBy.has('U_ALICE')).toBe(true)
+    expect(out.state.approvedBy.size).toBe(1)
+  })
+
+  test('two-approver: first vote is pending, second distinct vote approves', async () => {
+    const { recordApprovalVote } = await loadLib()
+    const first = recordApprovalVote(pending(2), 'U_ALICE', 0)
+    expect(first.kind).toBe('pending')
+    expect(first.state.approvedBy.size).toBe(1)
+    const second = recordApprovalVote(first.state, 'U_BOB', 0)
+    expect(second.kind).toBe('approved')
+    expect(second.state.approvedBy.size).toBe(2)
+    expect(second.state.approvedBy.has('U_ALICE')).toBe(true)
+    expect(second.state.approvedBy.has('U_BOB')).toBe(true)
+  })
+
+  test('duplicate vote by same user_id is ignored (NIST two-person integrity)', async () => {
+    // Same human cannot double-satisfy a 2-approver quorum. The second
+    // vote returns 'duplicate' and leaves the state unchanged.
+    const { recordApprovalVote } = await loadLib()
+    const first = recordApprovalVote(pending(2), 'U_ALICE', 0)
+    expect(first.kind).toBe('pending')
+    const second = recordApprovalVote(first.state, 'U_ALICE', 0)
+    expect(second.kind).toBe('duplicate')
+    expect(second.state.approvedBy.size).toBe(1)
+    expect(second.state).toBe(first.state) // unchanged reference
+  })
+
+  test('three-approver: needs three DISTINCT user_ids, dedup pushes total back', async () => {
+    const { recordApprovalVote } = await loadLib()
+    let st = pending(3)
+    let out = recordApprovalVote(st, 'U_ALICE', 0)
+    expect(out.kind).toBe('pending')
+    st = out.state
+    // Alice tries again
+    out = recordApprovalVote(st, 'U_ALICE', 0)
+    expect(out.kind).toBe('duplicate')
+    st = out.state
+    out = recordApprovalVote(st, 'U_BOB', 0)
+    expect(out.kind).toBe('pending')
+    st = out.state
+    out = recordApprovalVote(st, 'U_CAROL', 0)
+    expect(out.kind).toBe('approved')
+    expect(out.state.approvedBy.size).toBe(3)
+  })
+
+  test('is pure — input state is never mutated', async () => {
+    const { recordApprovalVote } = await loadLib()
+    const initial = pending(2)
+    const initialSize = initial.approvedBy.size
+    const out = recordApprovalVote(initial, 'U_ALICE', 0)
+    expect(out.kind).toBe('pending')
+    // Initial Set was not modified
+    expect(initial.approvedBy.size).toBe(initialSize)
+    expect(initial.approvedBy.has('U_ALICE')).toBe(false)
+    // New state has the vote
+    expect(out.state.approvedBy.has('U_ALICE')).toBe(true)
+  })
+
+  test('clock parameter accepted but unused in current logic (signature locked for expiry follow-up)', async () => {
+    // The `now` parameter exists so a future change adding "pending
+    // expired" handling doesn't need to touch every call site. Confirm
+    // the current logic ignores it by varying it across calls.
+    const { recordApprovalVote } = await loadLib()
+    const a = recordApprovalVote(pending(1), 'U_X', 0)
+    const b = recordApprovalVote(pending(1), 'U_X', Number.MAX_SAFE_INTEGER)
+    expect(a.kind).toBe(b.kind)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// RequireApprovalRule.approvers — ccsc-me6.4 schema extension
+// ---------------------------------------------------------------------------
+
+describe('RequireApprovalRule approvers field', () => {
+  const loadPolicyModule = async () => await import('./policy.ts')
+
+  test('defaults to 1 when omitted', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    const parsed = PolicyRule.parse({
+      id: 'r1',
+      effect: 'require_approval',
+      match: { tool: 'upload_file' },
+    }) as { effect: 'require_approval'; approvers: number }
+    expect(parsed.approvers).toBe(1)
+  })
+
+  test('accepts explicit quorum up to 10', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    for (const n of [1, 2, 3, 5, 10]) {
+      expect(() =>
+        PolicyRule.parse({
+          id: 'r1',
+          effect: 'require_approval',
+          match: { tool: 'upload_file' },
+          approvers: n,
+        }),
+      ).not.toThrow()
+    }
+  })
+
+  test('rejects approvers < 1', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'require_approval',
+        match: { tool: 'upload_file' },
+        approvers: 0,
+      }),
+    ).toThrow()
+  })
+
+  test('rejects approvers > 10 (anti-footgun ceiling)', async () => {
+    const { PolicyRule } = await loadPolicyModule()
+    expect(() =>
+      PolicyRule.parse({
+        id: 'r1',
+        effect: 'require_approval',
+        match: { tool: 'upload_file' },
+        approvers: 11,
+      }),
+    ).toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// detectBroadAutoApprove — ccsc-me6.7 footgun linter
+// ---------------------------------------------------------------------------
+
+describe('detectBroadAutoApprove', () => {
+  const loadPolicyModule = async () => await import('./policy.ts')
+
+  test('warns on auto_approve with no tool or pathPrefix', async () => {
+    const { detectBroadAutoApprove, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      {
+        id: 'too-broad',
+        effect: 'auto_approve',
+        match: { actor: 'claude_process' },
+      },
+    ])
+    const warnings = detectBroadAutoApprove(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.ruleId).toBe('too-broad')
+    expect(warnings[0]!.message).toMatch(/no 'tool' or 'pathPrefix'/)
+  })
+
+  test('no warning when auto_approve has a tool match', async () => {
+    const { detectBroadAutoApprove, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      { id: 'safe', effect: 'auto_approve', match: { tool: 'read_file' } },
+    ])
+    expect(detectBroadAutoApprove(rules)).toEqual([])
+  })
+
+  test('no warning when auto_approve has a pathPrefix match', async () => {
+    const { detectBroadAutoApprove, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      {
+        id: 'scoped',
+        effect: 'auto_approve',
+        match: { pathPrefix: '/workspace/safe' },
+      },
+    ])
+    expect(detectBroadAutoApprove(rules)).toEqual([])
+  })
+
+  test('does not warn on deny or require_approval rules (scope: auto_approve only)', async () => {
+    // A broad deny is the opposite of a footgun — it fails closed. A
+    // broad require_approval pulls a human into the loop, also safe.
+    // The linter only flags the auto-grant path.
+    const { detectBroadAutoApprove, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      {
+        id: 'broad-deny',
+        effect: 'deny',
+        match: { actor: 'claude_process' },
+        reason: 'kill switch',
+      },
+      {
+        id: 'broad-require',
+        effect: 'require_approval',
+        match: { actor: 'claude_process' },
+      },
+    ])
+    expect(detectBroadAutoApprove(rules)).toEqual([])
+  })
+
+  test('flags multiple offenders in one pass', async () => {
+    const { detectBroadAutoApprove, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      { id: 'ok', effect: 'auto_approve', match: { tool: 'read_file' } },
+      { id: 'bad-1', effect: 'auto_approve', match: { channel: 'C0000000000' } },
+      { id: 'bad-2', effect: 'auto_approve', match: { actor: 'session_owner' } },
+    ])
+    const warnings = detectBroadAutoApprove(rules)
+    expect(warnings.map((w) => w.ruleId).sort()).toEqual(['bad-1', 'bad-2'])
   })
 })
 
