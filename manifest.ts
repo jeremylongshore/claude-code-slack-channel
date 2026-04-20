@@ -400,6 +400,79 @@ export function createManifestCache(
  * reasoning.
  */
 // ---------------------------------------------------------------------------
+// findOurPriorManifestPins — pure filter for the replace sweep (ccsc-0qk.10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape we need from a pins.list item to decide whether it's a prior
+ * manifest we posted. Kept deliberately minimal so the consumer can
+ * pass Slack's full item shape via structural typing without a runtime
+ * coercion — every field is optional so a file-kind pin (no `.message`)
+ * is handled gracefully.
+ */
+export interface PinItemLike {
+  readonly type?: string
+  readonly message?: {
+    readonly text?: string | null
+    readonly bot_id?: string
+    readonly user?: string
+    readonly ts?: string
+  }
+}
+
+/** Identity handles needed to recognise our own posts in a pins.list
+ *  response. Either field may be empty when bootstrap hasn't finished
+ *  populating them; the filter treats empty values as "don't match". */
+export interface BotIdentity {
+  readonly botId?: string
+  readonly botUserId?: string
+}
+
+/**
+ * Return the message timestamps of pins this bot posted that carry a
+ * v1 manifest body (Epic 31-B.10, bead ccsc-0qk.10). Extracted from
+ * the publish_manifest handler so the replace-sweep filter can be
+ * tested independently of any Slack mock.
+ *
+ * Filter semantics, each applied as a distinct reject step:
+ *
+ *   1. type !== 'message' — skip file and file_comment pins.
+ *   2. no message or no ts — not actionable.
+ *   3. bot_id / user does not match our identity — peer's pin, don't touch.
+ *   4. body does not contain the magic header — not a manifest,
+ *      leave it alone even if we posted it.
+ *
+ * Returns ts values in the input's iteration order. Deduplication is
+ * NOT performed — the caller (the publish handler) calls pins.remove
+ * once per ts, and Slack itself de-dupes repeat removes.
+ *
+ * If both `selfBotId` and `botUserId` on `identity` are empty strings
+ * (bootstrap hasn't populated them yet), the filter returns `[]` —
+ * fail-closed: better to skip the replace sweep than to mistakenly
+ * unpin a peer's manifest.
+ */
+export function findOurPriorManifestPins(
+  items: ReadonlyArray<PinItemLike>,
+  identity: BotIdentity,
+): string[] {
+  const selfBotId = identity.botId ?? ''
+  const botUserId = identity.botUserId ?? ''
+  if (!selfBotId && !botUserId) return []
+  return items.flatMap((item) => {
+    if (item.type !== 'message') return []
+    const msg = item.message
+    if (!msg || !msg.ts) return []
+    const isOurs =
+      (!!selfBotId && msg.bot_id === selfBotId) ||
+      (!!botUserId && msg.user === botUserId)
+    if (!isOurs) return []
+    const text = msg.text ?? ''
+    if (!text.includes(MANIFEST_V1_MAGIC_KEY)) return []
+    return [msg.ts]
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Publish rate limiter (Epic 31-B.4, bead ccsc-0qk.4)
 // ---------------------------------------------------------------------------
 

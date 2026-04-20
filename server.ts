@@ -66,8 +66,8 @@ import {
   extractManifests,
   createManifestCache,
   createPublishRateLimiter,
+  findOurPriorManifestPins,
   ManifestV1,
-  MANIFEST_V1_MAGIC_KEY,
   assertPublishSizeAndSerialize,
 } from './manifest.ts'
 import {
@@ -1430,30 +1430,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       let replaced = 0
       try {
         const pins = await web.pins.list({ channel })
-        for (const item of pins.items ?? []) {
-          // pins.list returns items of several kinds (message, file,
-          // file_comment); only message items carry a manifest. Narrow
-          // on `type` first so we don't optimistically cast file items
-          // into a message shape that Slack never promised.
-          const narrowed = item as { type?: string; message?: unknown }
-          if (narrowed.type !== 'message') continue
-          const msg = narrowed.message as
-            | { text?: string | null; bot_id?: string; user?: string; ts?: string }
-            | undefined
-          if (!msg || !msg.ts) continue
-          const text = msg.text ?? ''
-          const isOurs =
-            (selfBotId && msg.bot_id === selfBotId) ||
-            (botUserId && msg.user === botUserId)
-          if (!isOurs) continue
-          if (!text.includes(MANIFEST_V1_MAGIC_KEY)) continue
+        const priorTs = findOurPriorManifestPins(
+          (pins.items ?? []) as ReadonlyArray<import('./manifest.ts').PinItemLike>,
+          { botId: selfBotId, botUserId },
+        )
+        for (const ts of priorTs) {
           try {
-            await web.pins.remove({ channel, timestamp: msg.ts })
+            await web.pins.remove({ channel, timestamp: ts })
             replaced += 1
           } catch (unpinErr) {
             console.warn('[publish_manifest] pins.remove failed — continuing', {
               channel,
-              ts: msg.ts,
+              ts,
               error: unpinErr instanceof Error ? unpinErr.message : String(unpinErr),
             })
           }

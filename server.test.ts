@@ -3887,6 +3887,246 @@ describe('extractManifests (31-A.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// findOurPriorManifestPins — replace-sweep filter (Epic 31-B.10, ccsc-0qk.10)
+//
+// Extracted from publish_manifest's replace sweep so the filter logic
+// is testable without a Slack WebClient mock. Proves: before a new
+// manifest is pinned, the handler finds (and only finds) the timestamps
+// of OUR OWN prior v1 manifests in the channel — never touches peer
+// pins, never touches file-kind pins, never touches our non-manifest
+// messages.
+// ---------------------------------------------------------------------------
+
+describe('findOurPriorManifestPins (31-B.10)', () => {
+  /** Fixture builder for a message-kind pin item carrying a given body
+   *  under a given bot identity. Matches the subset of Slack's
+   *  pins.list shape that the filter cares about. */
+  function messagePin(opts: {
+    text: string
+    botId?: string
+    user?: string
+    ts: string
+  }): import('./manifest.ts').PinItemLike {
+    return {
+      type: 'message',
+      message: {
+        text: opts.text,
+        bot_id: opts.botId,
+        user: opts.user,
+        ts: opts.ts,
+      },
+    }
+  }
+
+  const ourManifestText = JSON.stringify({
+    __claude_bot_manifest_v1__: true,
+    name: 'Example Bot',
+    vendor: 'Acme',
+    version: '1.0.0',
+    description: '',
+    tools: [],
+    publishedAt: '2026-01-01T00:00:00.000Z',
+  })
+
+  test('returns [] when identity has no botId AND no botUserId (fail-closed)', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    const pins = [messagePin({ text: ourManifestText, botId: 'B_US', ts: 'T1' })]
+    expect(findOurPriorManifestPins(pins, {})).toEqual([])
+    expect(findOurPriorManifestPins(pins, { botId: '', botUserId: '' })).toEqual([])
+  })
+
+  test('returns [] on an empty pin list', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    expect(findOurPriorManifestPins([], { botId: 'B_US' })).toEqual([])
+  })
+
+  test('matches OUR v1 manifest pin by bot_id', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    const pins = [messagePin({ text: ourManifestText, botId: 'B_US', ts: '100.0' })]
+    expect(findOurPriorManifestPins(pins, { botId: 'B_US' })).toEqual(['100.0'])
+  })
+
+  test('matches OUR v1 manifest pin by user (botUserId) when bot_id is absent', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    const pins = [messagePin({ text: ourManifestText, user: 'U_BOT', ts: '200.0' })]
+    expect(findOurPriorManifestPins(pins, { botUserId: 'U_BOT' })).toEqual(['200.0'])
+  })
+
+  test('skips file-kind pins (not messages)', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    const pins: ReadonlyArray<import('./manifest.ts').PinItemLike> = [
+      { type: 'file' }, // no message payload
+      { type: 'file_comment' },
+    ]
+    expect(findOurPriorManifestPins(pins, { botId: 'B_US' })).toEqual([])
+  })
+
+  test('skips peer-bot manifest pins (different bot_id AND different user)', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    // A perfectly valid manifest from another bot must NOT be unpinned —
+    // the replace sweep is scoped to our own prior publishes.
+    const pins = [
+      messagePin({ text: ourManifestText, botId: 'B_PEER', user: 'U_PEER', ts: '300.0' }),
+    ]
+    expect(
+      findOurPriorManifestPins(pins, { botId: 'B_US', botUserId: 'U_BOT' }),
+    ).toEqual([])
+  })
+
+  test('skips OUR non-manifest pins (missing magic header)', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    // We might pin non-manifest messages too (e.g., a pinned greeting).
+    // The replace sweep must not touch those.
+    const pins = [
+      messagePin({ text: 'Hello, team!', botId: 'B_US', ts: '400.0' }),
+      messagePin({
+        text: JSON.stringify({ kind: 'unrelated', payload: {} }),
+        botId: 'B_US',
+        ts: '401.0',
+      }),
+    ]
+    expect(findOurPriorManifestPins(pins, { botId: 'B_US' })).toEqual([])
+  })
+
+  test('returns multiple ts values in input order when multiple prior manifests exist', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    // Shouldn't happen in steady state (replace semantics guarantee one
+    // prior max), but if a prior publish crashed mid-flight leaving two
+    // pins, the sweep must clean them all up — not stop at the first.
+    const pins = [
+      messagePin({ text: ourManifestText, botId: 'B_US', ts: '500.0' }),
+      messagePin({ text: 'unrelated', botId: 'B_US', ts: '500.5' }),
+      messagePin({ text: ourManifestText, botId: 'B_US', ts: '501.0' }),
+    ]
+    expect(findOurPriorManifestPins(pins, { botId: 'B_US' })).toEqual(['500.0', '501.0'])
+  })
+
+  test('skips pins with missing ts (not actionable by pins.remove)', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    const pins: ReadonlyArray<import('./manifest.ts').PinItemLike> = [
+      {
+        type: 'message',
+        message: { text: ourManifestText, bot_id: 'B_US' /* no ts */ },
+      },
+    ]
+    expect(findOurPriorManifestPins(pins, { botId: 'B_US' })).toEqual([])
+  })
+
+  test('either identity match alone is sufficient (bot_id OR user)', async () => {
+    const { findOurPriorManifestPins } = await import('./manifest.ts')
+    // When both identity fields are configured, either signal alone
+    // identifies our pin. Some Slack responses include only bot_id and
+    // not user, or vice versa — we must catch both.
+    const pinsWithBotIdOnly = [
+      messagePin({ text: ourManifestText, botId: 'B_US', ts: '600.0' }),
+    ]
+    const pinsWithUserOnly = [
+      messagePin({ text: ourManifestText, user: 'U_BOT', ts: '601.0' }),
+    ]
+    const identity = { botId: 'B_US', botUserId: 'U_BOT' }
+    expect(findOurPriorManifestPins(pinsWithBotIdOnly, identity)).toEqual(['600.0'])
+    expect(findOurPriorManifestPins(pinsWithUserOnly, identity)).toEqual(['601.0'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Round-trip: publish-serialize → read-extract (Epic 31-B.7, ccsc-0qk.7)
+//
+// Proves that the bytes the publisher writes parse back to the same
+// manifest object the read path would produce — no information loss
+// across the publish/read boundary. Uses the pure helpers directly
+// (assertPublishSizeAndSerialize → extractManifests) so the test does
+// not need a Slack WebClient mock; what matters is the serialize /
+// deserialize equivalence, which happens entirely in these two
+// functions.
+// ---------------------------------------------------------------------------
+
+describe('publish → read round-trip (31-B.7)', () => {
+  test('a minimal published manifest round-trips byte-for-field', async () => {
+    const { assertPublishSizeAndSerialize, extractManifests } = await import(
+      './manifest.ts'
+    )
+    const original: import('./manifest.ts').ManifestV1 = {
+      __claude_bot_manifest_v1__: true,
+      name: 'RoundTrip Bot',
+      vendor: 'Acme Corp',
+      version: '1.2.3',
+      description: 'A minimal round-trip fixture.',
+      tools: [{ name: 'reply', description: 'Post a reply to a message.' }],
+      publishedAt: '2026-01-01T00:00:00.000Z',
+    }
+    // Publisher side: serialize for the Slack post body.
+    const body = assertPublishSizeAndSerialize(original)
+    // Reader side: feed the same body through the read-path
+    // extractor as if it had just been fetched from pins.list.
+    const extracted = extractManifests([body])
+    expect(extracted).toHaveLength(1)
+    expect(extracted[0]).toEqual(original)
+  })
+
+  test('a fully-populated manifest (every optional field) round-trips without loss', async () => {
+    const { assertPublishSizeAndSerialize, extractManifests } = await import(
+      './manifest.ts'
+    )
+    const original: import('./manifest.ts').ManifestV1 = {
+      __claude_bot_manifest_v1__: true,
+      name: 'Full Bot',
+      vendor: 'Acme Corp',
+      version: '1.2.3-rc.1',
+      description: 'A round-trip fixture covering every optional field.',
+      tools: [
+        { name: 'reply', description: 'Post a reply.' },
+        { name: 'react', description: 'Add an emoji reaction.' },
+      ],
+      channels: ['C01234ABCD', 'C56789EFGH'],
+      contact: 'ops@example.com',
+      publishedAt: '2026-01-01T00:00:00.000Z',
+      agentCard: {
+        endpoints: ['https://agent.example.com/a2a'],
+        schemas: { input: ['application/json'], output: ['application/json'] },
+        authentication: { schemes: ['bearer'] },
+        capabilities: { streaming: true, pushNotifications: false },
+      },
+    }
+    const body = assertPublishSizeAndSerialize(original)
+    const extracted = extractManifests([body])
+    expect(extracted).toHaveLength(1)
+    expect(extracted[0]).toEqual(original)
+  })
+
+  test('round-trip survives the read-path 40 KB cap headroom (8 KB body ≪ 40 KB)', async () => {
+    const {
+      assertPublishSizeAndSerialize,
+      extractManifests,
+      MAX_MANIFEST_BYTES,
+      MAX_PUBLISH_MANIFEST_BYTES,
+    } = await import('./manifest.ts')
+    // A manifest that fits the publish cap MUST also fit the read cap,
+    // otherwise publish would succeed and every subsequent read would
+    // silently drop it (the Postel-Law safety margin). Pin this
+    // arithmetic so a future cap-tweak can't silently invert it.
+    expect(MAX_PUBLISH_MANIFEST_BYTES).toBeLessThan(MAX_MANIFEST_BYTES)
+    const original: import('./manifest.ts').ManifestV1 = {
+      __claude_bot_manifest_v1__: true,
+      name: 'Big Bot',
+      vendor: 'Acme',
+      version: '1.0.0',
+      description: 'x'.repeat(1000), // max description
+      tools: [],
+      publishedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const body = assertPublishSizeAndSerialize(original)
+    // Bytes must be between read-cap headroom and publish cap.
+    expect(new TextEncoder().encode(body).length).toBeLessThanOrEqual(
+      MAX_PUBLISH_MANIFEST_BYTES,
+    )
+    const extracted = extractManifests([body])
+    expect(extracted).toHaveLength(1)
+    expect(extracted[0]?.description).toBe('x'.repeat(1000))
+  })
+})
+
+// ---------------------------------------------------------------------------
 // assertPublishSizeAndSerialize — publish-side 8 KB cap (Epic 31-B.2, ccsc-0qk.2)
 //
 // Postel's Law: stricter than the 40 KB read cap because a publisher
