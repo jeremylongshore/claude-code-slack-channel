@@ -295,6 +295,39 @@ A2A libraries or expects an HTTPS fetch. It exists so operators and
 reviewers can reason about this protocol using A2A terminology when
 that's useful.
 
+### Optional `agentCard` field
+
+A2A agent-card fields that have no Slack-side equivalent
+(`endpoints`, `schemas`, `authentication`, `capabilities`) live under
+an optional `agentCard` object on the manifest (Epic 31-B.6, bead
+`ccsc-0qk.6`). Shape:
+
+```ts
+agentCard?: {
+  endpoints?:      string[]               // HTTPS URLs the agent also serves, ≤ 10
+  schemas?: {
+    input?:        string[]               // MIME types / schema URIs, ≤ 20
+    output?:       string[]               // MIME types / schema URIs, ≤ 20
+  }
+  authentication?: { schemes: string[] }  // 'bearer', 'apiKey', …
+  capabilities?: {
+    streaming?:          boolean
+    pushNotifications?:  boolean
+  }
+}
+```
+
+Consumer contract: the field is metadata. The Slack read path
+(`extractManifests`) accepts and Zod-validates it but does nothing
+with the content. A peer that signals HTTP capabilities here does
+not thereby earn any additional trust — advertisements are not
+grants (§91-109), same as every other manifest field.
+
+Unknown keys inside `agentCard` are *stripped* (Zod's default
+`z.object` posture), not rejected. This is deliberate forward-
+compatibility: a future v2 publisher can include new sub-fields
+without breaking v1 readers.
+
 ---
 
 ## References
