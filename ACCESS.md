@@ -172,14 +172,23 @@ A **policy** decides whether an MCP tool call proceeds, is denied, or requires a
 type PolicyRule =
   | { id: string; effect: 'auto_approve';     match: MatchSpec; priority?: number }
   | { id: string; effect: 'deny';             match: MatchSpec; priority?: number; reason: string }
-  | { id: string; effect: 'require_approval'; match: MatchSpec; priority?: number; ttlMs?: number }
+  | { id: string; effect: 'require_approval'; match: MatchSpec; priority?: number; ttlMs?: number; approvers?: number }
 ```
 
 - **`id`** — stable, human-readable. Shows up in the audit journal and any error surfaced to Claude. Duplicate ids are a load-time error.
-- **`effect`** — one of three: `auto_approve` (allow without prompting), `deny` (refuse with a non-sensitive reason string), `require_approval` (hold until a human approver responds on Slack within `ttlMs`).
+- **`effect`** — one of three: `auto_approve` (allow without prompting), `deny` (refuse with a non-sensitive reason string), `require_approval` (hold until human approver(s) respond on Slack within `ttlMs`).
 - **`priority`** — default `100`. Position in the policy array is the *primary* sort key (first-applicable). `priority` is a tie-breaker *within effect* when two rules would otherwise be equivalent — not a global sort.
 - **`reason`** (deny only) — 1–200 chars, surfaced to Claude so the model knows why the call was rejected. Keep non-sensitive.
 - **`ttlMs`** (require_approval only) — approval freshness window. Default 5 minutes, hard ceiling 24 hours. Once granted, an approval auto-approves subsequent matching calls in the same `(rule, sessionKey)` until expiry.
+- **`approvers`** (require_approval only) — quorum threshold. Default `1` (single-approver). Accepts 1–10. When ≥2, votes accumulate with NIST two-person integrity: the server dedups on verified Slack `user_id` (never display name) so the same human cannot double-satisfy quorum. A single `deny` vote from any allowlisted user rejects the request immediately regardless of the quorum count — one "no" overrides any number of "yes" answers.
+
+#### Boot-time linters
+
+The loader runs three checks at boot; all are warn-not-block except parse errors:
+
+1. **Duplicate-id detection** — fatal at boot. Two rules sharing an `id` cannot coexist.
+2. **Shadow detection** — warning. Flags later rules made unreachable by an earlier, less-specific rule. Operators may intentionally author unreachable rules (placeholders during refactors) so this is informational.
+3. **Broad-auto-approve linter** (ccsc-me6.7) — warning. Flags `auto_approve` rules whose `match` lacks both `tool` and `pathPrefix`. Without one of those, the rule auto-approves *any* tool call within its scope — almost always a misconfiguration. Narrow the rule or convert to `require_approval`.
 
 ### MatchSpec
 
