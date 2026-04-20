@@ -3764,6 +3764,174 @@ describe('extractManifests (31-A.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// assertPublishSizeAndSerialize — publish-side 8 KB cap (Epic 31-B.2, ccsc-0qk.2)
+//
+// Postel's Law: stricter than the 40 KB read cap because a publisher
+// writes what it controls. Serializes + measures UTF-8 bytes in one
+// function so the bytes we validate are exactly the bytes that go on
+// the wire. Errors name both actual and cap so an operator debugging
+// a rejected publish sees which field to shrink.
+// ---------------------------------------------------------------------------
+
+describe('assertPublishSizeAndSerialize (31-B.2)', () => {
+  /** Minimal valid manifest. Small enough to always pass the cap
+   *  (serializes to ~170 bytes), so tests can pad upward from here. */
+  function minimalManifest(): import('./manifest.ts').ManifestV1 {
+    return {
+      __claude_bot_manifest_v1__: true,
+      name: 'Tiny',
+      vendor: 'Acme',
+      version: '1.0.0',
+      description: '',
+      tools: [],
+      publishedAt: '2026-01-01T00:00:00.000Z',
+    }
+  }
+
+  test('exports MAX_PUBLISH_MANIFEST_BYTES = 8 KB', async () => {
+    const { MAX_PUBLISH_MANIFEST_BYTES } = await import('./manifest.ts')
+    expect(MAX_PUBLISH_MANIFEST_BYTES).toBe(8 * 1024)
+  })
+
+  test('cap is stricter than the read-side cap (Postel\'s Law)', async () => {
+    const { MAX_PUBLISH_MANIFEST_BYTES, MAX_MANIFEST_BYTES } = await import(
+      './manifest.ts'
+    )
+    expect(MAX_PUBLISH_MANIFEST_BYTES).toBeLessThan(MAX_MANIFEST_BYTES)
+  })
+
+  test('returns the serialized JSON for a manifest well under cap', async () => {
+    const { assertPublishSizeAndSerialize } = await import('./manifest.ts')
+    const body = assertPublishSizeAndSerialize(minimalManifest())
+    // Round-trip parseability is the invariant a caller relies on.
+    expect(() => JSON.parse(body)).not.toThrow()
+    expect(JSON.parse(body).__claude_bot_manifest_v1__).toBe(true)
+  })
+
+  test('accepts a manifest tuned to land just under the 8 KB cap', async () => {
+    const { assertPublishSizeAndSerialize, MAX_PUBLISH_MANIFEST_BYTES } = await import(
+      './manifest.ts'
+    )
+    // A well-formed v1 manifest CAN reach the cap if an operator packs
+    // the optional channels[] array, since the regex doesn't bound
+    // per-channel string length. Pad channel IDs with enough trailing
+    // alnum so the serialized body lands at (cap - 1). That proves the
+    // cap is inclusive on the passing side.
+    const enc = new TextEncoder()
+    const encodeSize = (m: import('./manifest.ts').ManifestV1) =>
+      enc.encode(JSON.stringify(m, null, 2)).length
+    const base = minimalManifest()
+    // Build one channel long enough that a single entry pushes us near
+    // the cap; binary-search the suffix length.
+    let lo = 1
+    let hi = MAX_PUBLISH_MANIFEST_BYTES
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi + 1) / 2)
+      const candidate: import('./manifest.ts').ManifestV1 = {
+        ...base,
+        channels: [`C${'A'.repeat(mid)}`],
+      }
+      if (encodeSize(candidate) <= MAX_PUBLISH_MANIFEST_BYTES) {
+        lo = mid
+      } else {
+        hi = mid - 1
+      }
+    }
+    const nearCap: import('./manifest.ts').ManifestV1 = {
+      ...base,
+      channels: [`C${'A'.repeat(lo)}`],
+    }
+    const bytes = encodeSize(nearCap)
+    // Within one character of the cap — that's as tight as the search
+    // can get at byte granularity.
+    expect(bytes).toBeLessThanOrEqual(MAX_PUBLISH_MANIFEST_BYTES)
+    expect(bytes).toBeGreaterThan(MAX_PUBLISH_MANIFEST_BYTES - 2)
+    const body = assertPublishSizeAndSerialize(nearCap)
+    expect(JSON.parse(body)).toEqual(nearCap)
+  })
+
+  test('rejects a manifest one byte over the cap', async () => {
+    const { assertPublishSizeAndSerialize, MAX_PUBLISH_MANIFEST_BYTES } = await import(
+      './manifest.ts'
+    )
+    const enc = new TextEncoder()
+    const base = minimalManifest()
+    // Grow a single channel suffix one byte at a time until the encoded
+    // body exceeds the cap — first payload that exceeds is our "one
+    // over" witness.
+    let suffix = 1
+    let candidate: import('./manifest.ts').ManifestV1 = {
+      ...base,
+      channels: [`C${'A'.repeat(suffix)}`],
+    }
+    while (enc.encode(JSON.stringify(candidate, null, 2)).length <= MAX_PUBLISH_MANIFEST_BYTES) {
+      suffix += 1
+      candidate = { ...base, channels: [`C${'A'.repeat(suffix)}`] }
+    }
+    expect(
+      enc.encode(JSON.stringify(candidate, null, 2)).length,
+    ).toBeGreaterThan(MAX_PUBLISH_MANIFEST_BYTES)
+    expect(() => assertPublishSizeAndSerialize(candidate)).toThrow(/Publish size/)
+  })
+
+  test('rejects a manifest that serializes above the cap with a clear error', async () => {
+    const { assertPublishSizeAndSerialize, MAX_PUBLISH_MANIFEST_BYTES } = await import(
+      './manifest.ts'
+    )
+    // Max out every array: 50 tools × {name 80 chars, description 400 chars}.
+    // Per tool ≈ 520 bytes after JSON formatting. 50 × 520 ≈ 26 KB — well
+    // above the 8 KB cap.
+    const huge: import('./manifest.ts').ManifestV1 = {
+      ...minimalManifest(),
+      tools: Array.from({ length: 50 }, (_, i) => ({
+        name: `tool_${i.toString().padStart(5, '0')}_${'n'.repeat(50)}`,
+        description: 'd'.repeat(400),
+      })),
+    }
+    const expectedBytes = new TextEncoder().encode(JSON.stringify(huge, null, 2)).length
+    expect(expectedBytes).toBeGreaterThan(MAX_PUBLISH_MANIFEST_BYTES)
+
+    let caught: Error | undefined
+    try {
+      assertPublishSizeAndSerialize(huge)
+    } catch (err) {
+      caught = err instanceof Error ? err : new Error(String(err))
+    }
+    expect(caught).toBeDefined()
+    expect(caught?.message).toMatch(/Publish size/)
+    expect(caught?.message).toMatch(String(expectedBytes))
+    expect(caught?.message).toMatch(String(MAX_PUBLISH_MANIFEST_BYTES))
+    // Message points at the fields an operator can actually shrink so
+    // a rejection is actionable without doc-diving.
+    expect(caught?.message).toMatch(/tools|channels|description/)
+  })
+
+  test('cap is measured in UTF-8 bytes, not string length (multi-byte safe)', async () => {
+    const { assertPublishSizeAndSerialize, MAX_PUBLISH_MANIFEST_BYTES } = await import(
+      './manifest.ts'
+    )
+    // Same posture as the read-side cap test: emoji are 4 UTF-8 bytes
+    // but 2 UTF-16 code units. A string-length-based cap would under-
+    // report by half; the TextEncoder path must catch it. Use tools[]
+    // entries padded with emoji to push byte count over cap while
+    // keeping string length well under.
+    const emoji = '🔥' // 4 UTF-8 bytes, 2 UTF-16 units
+    const huge: import('./manifest.ts').ManifestV1 = {
+      ...minimalManifest(),
+      tools: Array.from({ length: 50 }, (_, i) => ({
+        name: `tool_${i}`,
+        description: emoji.repeat(80), // 320 bytes, 160 UTF-16 units
+      })),
+    }
+    const body = JSON.stringify(huge, null, 2)
+    const bytes = new TextEncoder().encode(body).length
+    expect(bytes).toBeGreaterThan(MAX_PUBLISH_MANIFEST_BYTES)
+    expect(body.length).toBeLessThan(bytes) // multi-byte distinction
+    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(/Publish size/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // createManifestCache — per-channel read cache (Epic 31-A.5, ccsc-s53.5)
 //
 // Doubles as the rate limit on `read_peer_manifests`: within the 5-minute

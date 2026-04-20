@@ -67,6 +67,7 @@ import {
   createManifestCache,
   ManifestV1,
   MANIFEST_V1_MAGIC_KEY,
+  assertPublishSizeAndSerialize,
 } from './manifest.ts'
 import {
   parsePolicyRules,
@@ -1375,6 +1376,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         input: { channel, caller_user_id: callerUserId },
       })
 
+      // Gate 3 (ccsc-0qk.2): 8 KB serialized-body cap. Runs after the
+      // auth gates so an unauthorised caller gets the auth error, not
+      // a size error (no info leak about payload contents). Serialize
+      // once here and reuse the string below so the bytes we measured
+      // are exactly the bytes that go on the wire.
+      let serialized: string
+      try {
+        serialized = assertPublishSizeAndSerialize(manifest)
+      } catch (sizeErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'publish_manifest',
+          input: { channel, caller_user_id: callerUserId },
+          reason: sizeErr instanceof Error ? sizeErr.message : String(sizeErr),
+        })
+        throw sizeErr
+      }
+
       // Replace semantics: unpin any prior manifest this bot posted in
       // this channel before posting the new one. Best-effort — if the
       // pins.list or a pins.remove fails, log and continue so a flaky
@@ -1426,7 +1446,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       // semantics contract is pinned-message only). Fail loud here.
       const postRes = await web.chat.postMessage({
         channel,
-        text: JSON.stringify(manifest, null, 2),
+        text: serialized,
         unfurl_links: false,
         unfurl_media: false,
       })
