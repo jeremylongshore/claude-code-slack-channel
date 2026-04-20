@@ -3891,19 +3891,19 @@ describe('assertPublishSizeAndSerialize (31-B.2)', () => {
     const expectedBytes = new TextEncoder().encode(JSON.stringify(huge, null, 2)).length
     expect(expectedBytes).toBeGreaterThan(MAX_PUBLISH_MANIFEST_BYTES)
 
-    let caught: Error | undefined
-    try {
-      assertPublishSizeAndSerialize(huge)
-    } catch (err) {
-      caught = err instanceof Error ? err : new Error(String(err))
-    }
-    expect(caught).toBeDefined()
-    expect(caught?.message).toMatch(/Publish size/)
-    expect(caught?.message).toMatch(String(expectedBytes))
-    expect(caught?.message).toMatch(String(MAX_PUBLISH_MANIFEST_BYTES))
+    // Consistent with the rest of the suite: chain multiple toThrow()
+    // regex matchers on the same call. Each regex must match the same
+    // error message, so we pin four distinct facets of the diagnostic
+    // (prefix, actual bytes, cap, shrinkable-fields hint) without the
+    // ceremony of a try/catch + captured-variable pattern.
+    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(/Publish size/)
+    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(String(expectedBytes))
+    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(
+      String(MAX_PUBLISH_MANIFEST_BYTES),
+    )
     // Message points at the fields an operator can actually shrink so
     // a rejection is actionable without doc-diving.
-    expect(caught?.message).toMatch(/tools|channels|description/)
+    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(/tools|channels|description/)
   })
 
   test('cap is measured in UTF-8 bytes, not string length (multi-byte safe)', async () => {

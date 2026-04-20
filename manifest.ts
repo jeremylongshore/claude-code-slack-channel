@@ -330,8 +330,8 @@ export function createManifestCache(
  * directly. Keeping serialization and size-check in one function
  * guarantees the bytes we measure are the bytes we post — a split
  * signature (`assertPublishSize(manifest)` + separate
- * `JSON.stringify` in the caller) would leave room for a formatter
- * drift to silently raise the effective cap.
+ * `JSON.stringify` in the caller) would leave room for formatting
+ * differences to silently raise the effective cap.
  *
  * Stricter than the 40 KB read-side cap (Postel's Law — strict on
  * output, liberal on input). See `MAX_PUBLISH_MANIFEST_BYTES` for the
