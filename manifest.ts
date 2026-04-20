@@ -63,6 +63,63 @@ const CHANNEL_ID_RE = /^C[A-Z0-9]+$/
  * silently"). This file only encodes the *shape*; the dropping happens in
  * the read tool (ccsc-s53.2) and the size-cap layer (ccsc-s53.3).
  */
+/**
+ * Optional A2A agent-card subset (Epic 31-B.6, bead ccsc-0qk.6).
+ *
+ * Shape-aligned with Google's Agent-to-Agent protocol
+ * (/.well-known/agent-card.json) so a future HTTP-transport publish
+ * path can reuse this field verbatim without a schema migration. The
+ * fields here are deliberately a subset — the top-level ManifestV1
+ * fields (name, vendor, version, description, tools) already carry
+ * the overlap documented in bot-manifest-protocol.md's "Alignment
+ * with Google A2A" section; agentCard carries the A2A-specific
+ * metadata that has no Slack-side equivalent.
+ *
+ * Consumer contract: this field is metadata. The Slack read path
+ * (extractManifests) accepts it but does nothing with it beyond
+ * Zod validation. A peer that signals HTTP capabilities here does
+ * not thereby get any additional trust — advertisements are not
+ * grants, same as every other manifest field (§91-109).
+ *
+ * Sizes are conservative so an agentCard-bearing manifest comfortably
+ * fits under the 8 KB publish cap.
+ */
+const AgentCard = z.object({
+  /** HTTPS endpoints where the agent is also reachable. Optional —
+   *  Slack-only bots omit. Capped at 10 entries; each entry is a
+   *  fully-qualified URL. */
+  endpoints: z.array(z.string().url()).max(10).optional(),
+
+  /** Input/output content types the agent accepts/produces. Maps to
+   *  A2A's defaultInputModes / defaultOutputModes. Values are MIME
+   *  types (e.g. 'application/json') or schema URIs. */
+  schemas: z
+    .object({
+      input: z.array(z.string().min(1).max(200)).max(20).optional(),
+      output: z.array(z.string().min(1).max(200)).max(20).optional(),
+    })
+    .optional(),
+
+  /** Authentication schemes the HTTPS surface expects. Public or
+   *  Slack-only bots omit. Example values: 'bearer', 'apiKey',
+   *  'oauth2'. */
+  authentication: z
+    .object({
+      schemes: z.array(z.string().min(1).max(40)).max(10),
+    })
+    .optional(),
+
+  /** Capability flags — A2A's defaults. Additional flags can land in a
+   *  v2 agentCard schema without breaking existing readers (Zod strips
+   *  unknown keys by default on z.object). */
+  capabilities: z
+    .object({
+      streaming: z.boolean().optional(),
+      pushNotifications: z.boolean().optional(),
+    })
+    .optional(),
+})
+
 export const ManifestV1 = z.object({
   __claude_bot_manifest_v1__: z.literal(true),
   name: z.string().min(1).max(80),
@@ -80,6 +137,11 @@ export const ManifestV1 = z.object({
   channels: z.array(z.string().regex(CHANNEL_ID_RE)).max(50).optional(),
   contact: z.string().email().optional(),
   publishedAt: z.string().datetime(),
+  /** Optional A2A agent-card subset. See `AgentCard` above for the
+   *  shape and rationale. A manifest without this field is a
+   *  Slack-only bot; a manifest with it advertises additional
+   *  HTTP-level surface area for future interop. */
+  agentCard: AgentCard.optional(),
 })
 
 /** Inferred type for a validated manifest payload. */
