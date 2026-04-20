@@ -93,6 +93,23 @@ This is a prompt injection vector. Five defense layers:
 
 Any change to `gate()`, `assertSendable()`, or `assertOutboundAllowed()` is security-critical.
 
+## Audit: projection vs. authoritative log
+
+Two distinct surfaces, often confused:
+
+- **Authoritative log** (Epic 30-A) — `~/.claude/channels/slack/audit.log`. Hash-chained, tamper-evident, redacted per fixed rules. Every tool-call decision (`policy.allow` / `policy.deny` / `policy.require` / `policy.approved`) is written here regardless of any Slack state. Verify with `bun server.ts --verify-audit-log <path>`. This is the record.
+
+- **Projection** (Epic 30-B) — best-effort Slack-thread mirror of selected journal events. Controlled per-channel via `ChannelPolicy.audit` (`'off'` | `'compact'` | `'full'`). Posts receipts into the originating thread so operators can see what Claude is doing without leaving Slack. **Not** authoritative: Slack API errors, rate limits, missing messages, or lost events in the stream all mean a projected event may never appear. Operators who need ground truth read the local log.
+
+Invariants (enforced in code; see [`000-docs/audit-journal-architecture.md`](000-docs/audit-journal-architecture.md) for the design rationale):
+
+1. The projection may never block tool execution. A failed `chat.postMessage` is logged to stderr and swallowed.
+2. The projection may never write to the authoritative log. One-way flow: journal → projection.
+3. Self-echoes of projected receipts are dropped by the inbound gate's triple-check (locked in by Epic 30-B.8 tests) even when the channel has `allowBotIds` configured for multi-agent coordination.
+4. `'full'` mode projects redacted `input_preview` only; anything the 30-A redactor scrubs (API keys, tokens) is scrubbed in the projection too.
+
+When investigating an incident, start with the authoritative log. Use the projection for context on *when operators knew what*, not for what *actually happened*.
+
 ## State
 
 All state lives in `~/.claude/channels/slack/` (files `0o600`, directories `0o700`, single-writer):
