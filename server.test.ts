@@ -449,6 +449,105 @@ describe('gate', () => {
     // because U_PEER is not in access.allowFrom. This test verifies the
     // belt-and-suspenders gate-level check catches it first.
   })
+
+  // -- Epic 30-B.8: audit-receipt self-echo regression --
+  //
+  // dhh.2 posts audit receipts into the originating channel when
+  // ChannelPolicy.audit is 'compact'|'full'. If that channel ALSO has
+  // allowBotIds configured (multi-agent coordination + audit projection
+  // both on), the receipt comes back to *us* as an inbound bot message
+  // event. The self-echo triple-check from PR #33 (v0.4.0) must still
+  // fire — otherwise every receipt would be treated as a peer-bot
+  // message and echo-loop through delivery. These tests construct the
+  // exact event shape a projected receipt would generate and assert
+  // gate() drops it on each of the three self-echo signals.
+
+  test('30-B.8: drops audit-receipt self-echo via bot_id + user match', async () => {
+    const access = makeAccess({
+      channels: {
+        C_AUDITED: {
+          requireMention: false,
+          allowFrom: ['U_BOT', 'U_HUMAN'],
+          allowBotIds: ['U_BOT'],
+          audit: 'compact',
+        },
+      },
+    })
+    const receipt = buildAuditReceiptMessage('Bash', 'abc123xy')
+    const result = await gate(
+      {
+        bot_id: 'B_BOT',
+        user: 'U_BOT',
+        bot_profile: { app_id: 'A_BOT' },
+        channel: 'C_AUDITED',
+        channel_type: 'channel',
+        text: receipt.text,
+        blocks: receipt.blocks,
+      },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('30-B.8: drops audit-receipt self-echo when only bot_profile.app_id matches', async () => {
+    // Some Slack payload variants (bot-posted-via-webhook, chat.postMessage
+    // with as_user=false) omit `user` on the inbound event. The self-echo
+    // check must still fire via bot_profile.app_id. Regression guard: if
+    // a future Slack change stops populating bot_id too, the projection
+    // still can't loop through allowBotIds.
+    const access = makeAccess({
+      channels: {
+        C_AUDITED: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_UNKNOWN'],
+          audit: 'full',
+        },
+      },
+    })
+    const receipt = buildAuditReceiptMessage('Write', 'xy98abcd')
+    const result = await gate(
+      {
+        bot_profile: { app_id: 'A_BOT' },
+        channel: 'C_AUDITED',
+        channel_type: 'channel',
+        text: receipt.text,
+        blocks: receipt.blocks,
+      },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('30-B.8: receipt echo still dropped when operator misconfigures allowBotIds with own bot ID', async () => {
+    // An operator who adds their own bot's user ID to allowBotIds (either
+    // by copy-paste mistake or in a symmetric "everyone-can-talk-to-
+    // everyone" setup) would produce the exact self-echo the receipt
+    // projection triggers. The gate must hold.
+    const access = makeAccess({
+      channels: {
+        C_MISCONFIG: {
+          requireMention: false,
+          allowFrom: ['U_BOT'],
+          allowBotIds: ['U_BOT'],
+          audit: 'compact',
+        },
+      },
+    })
+    const receipt = buildAuditReceiptMessage('Read', 'selfecho1')
+    const result = await gate(
+      {
+        bot_id: 'B_BOT',
+        user: 'U_BOT',
+        channel: 'C_MISCONFIG',
+        channel_type: 'channel',
+        text: receipt.text,
+        blocks: receipt.blocks,
+      },
+      makeOpts({ access }),
+    )
+    expect(result.action).toBe('drop')
+  })
 })
 
 // ---------------------------------------------------------------------------
