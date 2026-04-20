@@ -976,6 +976,34 @@ export function assertOutboundAllowed(
 }
 
 /**
+ * Assert that a given user_id may publish a manifest (Epic 31-B.5).
+ *
+ * `publish_manifest` is an outbound act performed on behalf of the session
+ * owner. Only users in `access.allowFrom` — the top-level DM allowlist —
+ * may publish, giving operators one consistent authorization surface:
+ * the same list that gates DMs gates publishing.
+ *
+ * Throws on rejection so MCP tool handlers surface a clear failure to
+ * Claude and, via journal, to the operator. Default-safe: `allowFrom` of
+ * `[]` (the hardened default in `defaultAccess()`) rejects all callers.
+ *
+ * Epic 31-B ships conditionally on a stronger identity primitive than
+ * Slack's `bot_id`, so the `publish_manifest` MCP tool does not exist
+ * yet. This gate lands ahead of the tool so the authorization surface
+ * is fixed before any publish code is written — symmetric to the 31-A.4
+ * "manifest never reaches evaluate()" invariant on the read side.
+ *
+ * See bead ccsc-0qk.5 and the 31-B sub-epic ccsc-0qk.14.
+ */
+export function assertPublishAllowed(ownerId: string, access: Access): void {
+  if (access.allowFrom.includes(ownerId)) return
+  throw new Error(
+    `Publish gate: user_id '${ownerId}' is not in access.allowFrom — ` +
+      `only allowlisted users may publish a manifest.`,
+  )
+}
+
+/**
  * Returns true if `url` is a well-formed https URL on files.slack.com.
  *
  * Used before attaching the bot token to a fetch() of a Slack file URL.
