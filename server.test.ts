@@ -26,10 +26,15 @@ import {
   MAX_PAIRING_REPLIES,
   PAIRING_EXPIRY_MS,
   SessionSchema,
+  escMrkdwn,
+  generateCorrelationId,
+  shouldPostAuditReceipt,
+  buildAuditReceiptMessage,
   type Access,
   type GateOptions,
   type Session,
   type SessionKey,
+  type ChannelPolicy,
 } from './lib.ts'
 import { createSessionSupervisor } from './supervisor.ts'
 import {
@@ -7346,5 +7351,82 @@ describe('Journal event wiring (ccsc-3fo)', () => {
     // Session file must have been created on disk.
     const { sessionPath: sPath } = await import('./lib.ts')
     expect(existsSync(sPath(rawRoot, key))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Epic 30-B.2 — audit receipt helpers
+// ---------------------------------------------------------------------------
+
+describe('escMrkdwn (lib move)', () => {
+  test('escapes &, <, > used in Slack mrkdwn injection', () => {
+    expect(escMrkdwn('<script>alert(1)</script>')).toBe('&lt;script&gt;alert(1)&lt;/script&gt;')
+    expect(escMrkdwn('A & B')).toBe('A &amp; B')
+  })
+  test('passes through unaffected characters', () => {
+    expect(escMrkdwn('simple text')).toBe('simple text')
+    expect(escMrkdwn('backtick `code`')).toBe('backtick `code`')
+  })
+})
+
+describe('generateCorrelationId (30-B.2)', () => {
+  test('returns a non-empty URL-safe string', () => {
+    const cid = generateCorrelationId()
+    expect(typeof cid).toBe('string')
+    expect(cid.length).toBeGreaterThan(0)
+    expect(cid).toMatch(/^[A-Za-z0-9_-]+$/)
+  })
+  test('produces unique IDs across successive calls', () => {
+    const ids = new Set<string>()
+    for (let i = 0; i < 1000; i++) ids.add(generateCorrelationId())
+    expect(ids.size).toBe(1000)
+  })
+})
+
+describe('shouldPostAuditReceipt (30-B.2)', () => {
+  const base: ChannelPolicy = { requireMention: false, allowFrom: [] }
+
+  test('returns false when policy is undefined (default-safe)', () => {
+    expect(shouldPostAuditReceipt(undefined)).toBe(false)
+  })
+  test('returns false when audit is absent', () => {
+    expect(shouldPostAuditReceipt(base)).toBe(false)
+  })
+  test("returns false when audit is 'off'", () => {
+    expect(shouldPostAuditReceipt({ ...base, audit: 'off' })).toBe(false)
+  })
+  test("returns true when audit is 'compact'", () => {
+    expect(shouldPostAuditReceipt({ ...base, audit: 'compact' })).toBe(true)
+  })
+  test("returns true when audit is 'full'", () => {
+    expect(shouldPostAuditReceipt({ ...base, audit: 'full' })).toBe(true)
+  })
+})
+
+describe('buildAuditReceiptMessage (30-B.2)', () => {
+  test('includes tool name and correlation ID in a context block', () => {
+    const msg = buildAuditReceiptMessage('Bash', 'abc123xy')
+    expect(msg.text).toContain('Bash')
+    expect(msg.text).toContain('abc123xy')
+    expect(msg.blocks).toHaveLength(1)
+    const block = msg.blocks[0] as { type: string; elements: Array<{ type: string; text: string }> }
+    expect(block.type).toBe('context')
+    expect(block.elements[0]!.type).toBe('mrkdwn')
+    expect(block.elements[0]!.text).toContain('Bash')
+    expect(block.elements[0]!.text).toContain('abc123xy')
+    expect(block.elements[0]!.text).toContain(':receipt:')
+  })
+  test('escapes mrkdwn in attacker-controlled tool names (injection defense)', () => {
+    const msg = buildAuditReceiptMessage('<script>x</script>', 'cid1')
+    const block = msg.blocks[0] as { elements: Array<{ text: string }> }
+    expect(block.elements[0]!.text).not.toContain('<script>')
+    expect(block.elements[0]!.text).toContain('&lt;script&gt;')
+  })
+  test('escapes mrkdwn in correlation ID (defense in depth — even though RNG output is safe)', () => {
+    // A future cid scheme changing to include >/< would not compromise output.
+    const msg = buildAuditReceiptMessage('tool', '<evil>')
+    const block = msg.blocks[0] as { elements: Array<{ text: string }> }
+    expect(block.elements[0]!.text).not.toContain('<evil>')
+    expect(block.elements[0]!.text).toContain('&lt;evil&gt;')
   })
 })
