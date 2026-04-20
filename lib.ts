@@ -1500,6 +1500,16 @@ export function shouldPostAuditReceipt(policy: ChannelPolicy | undefined): boole
   return mode === 'compact' || mode === 'full'
 }
 
+/** Structural shape for a Slack Block Kit context block carrying a
+ *  single mrkdwn element. Declared here rather than importing from
+ *  `@slack/web-api` so `lib.ts` stays decoupled from the Slack SDK —
+ *  structural typing lets the Slack client accept this at the call
+ *  site in `server.ts` without an `as any` / `as never` escape. */
+export interface AuditReceiptContextBlock {
+  type: 'context'
+  elements: Array<{ type: 'mrkdwn'; text: string }>
+}
+
 /** Slack Block Kit context-block payload for the pre-execution receipt.
  *  Intentionally minimal: `:receipt:` emoji + tool name (escaped) +
  *  correlation ID. Kept pure so server.ts and tests share one builder.
@@ -1510,7 +1520,7 @@ export function shouldPostAuditReceipt(policy: ChannelPolicy | undefined): boole
 export function buildAuditReceiptMessage(
   tool: string,
   correlationId: string,
-): { text: string; blocks: readonly unknown[] } {
+): { text: string; blocks: AuditReceiptContextBlock[] } {
   const safeTool = escMrkdwn(tool)
   const safeCid = escMrkdwn(correlationId)
   return {

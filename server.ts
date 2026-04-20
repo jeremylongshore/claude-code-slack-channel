@@ -323,7 +323,7 @@ async function postAuditReceiptIfEnabled(
       channel,
       thread_ts: thread,
       text,
-      blocks: blocks as never,
+      blocks,
       unfurl_links: false,
       unfurl_media: false,
     })
