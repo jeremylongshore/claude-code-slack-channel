@@ -12,7 +12,8 @@ The Slack channel uses `~/.claude/channels/slack/access.json` to control who can
     "C12345678": {
       "requireMention": true,
       "allowFrom": ["U12345678"],
-      "allowBotIds": []
+      "allowBotIds": [],
+      "audit": "off"
     }
   },
   "pending": {
@@ -68,6 +69,7 @@ Map of channel IDs to policies. Only channels listed here are monitored.
 - `requireMention`: If true, only messages that @mention the bot are delivered
 - `allowFrom`: If non-empty, only these user IDs are delivered from this channel
 - `allowBotIds`: Opt-in list of bot user IDs allowed to deliver messages in this channel. Absent or empty (default) = all bot messages dropped. See "Multi-agent coordination" below.
+- `audit`: Audit-log projection mode for this channel. See "Audit projection (`audit`)" below. Absent or `'off'` (default) = no projection. Values: `'off'` | `'compact'` | `'full'`.
 
 ### Multi-agent coordination (`allowBotIds`)
 
@@ -91,6 +93,39 @@ Only bot user IDs explicitly listed in `allowBotIds` can deliver bot messages. E
 - **DMs** are unaffected. `allowBotIds` is channel-scoped; bot messages in DM channels are always dropped.
 
 > **Security note:** Only add bot user IDs you operate or trust. A peer bot's messages reach Claude with the same effective trust as human messages, and a compromised peer bot can attempt prompt injection. The system prompt treats peer-bot content as untrusted, but that's a last-line defense — the first line is you being deliberate about what's in `allowBotIds`. Cross-bot delivery requires explicit opt-in precisely so operators have to think about this tradeoff before enabling it.
+
+### Audit projection (`audit`)
+
+Per-channel setting that controls whether tool-call decisions are mirrored into the Slack thread where they were issued. The **authoritative** audit record always lives in the hash-chained local journal at `~/.claude/channels/slack/audit.log` — see [`000-docs/audit-journal-architecture.md`](000-docs/audit-journal-architecture.md). The `audit` field here controls a *projection* of those journal events into Slack so operators can see what Claude is doing in the same thread they're reading.
+
+Three modes:
+
+| Mode | Projection | Content |
+|---|---|---|
+| `'off'` (default) | None. Zero Slack messages from the projection layer. | — |
+| `'compact'` | One threaded receipt per approved tool call. | `:receipt: <tool>` + correlation ID. No tool inputs. |
+| `'full'` | Same as compact plus a redacted preview of the tool's inputs. | `:receipt: <tool>` + `input_preview` (redacted per 30-A) + correlation ID. |
+
+Example:
+
+```json
+"channels": {
+  "C_DEPLOY": {
+    "requireMention": false,
+    "allowFrom": ["U_OPERATOR"],
+    "audit": "compact"
+  }
+}
+```
+
+**Invariants:**
+
+- **Default-safe.** Absent or `'off'` = no projection. No existing channel starts posting receipts on upgrade.
+- **Projection never blocks execution.** If Slack's API is flaky, rate-limited, or returns an error, the receipt post is skipped and the tool call still runs. Failures are logged to stderr only. The authoritative journal is unaffected.
+- **Receipt ≠ outcome.** A receipt means "this tool call passed policy and was allowed to run." Whether it *succeeded* is not something the bridge observes — MCP's permission relay carries no completion signal. For real outcomes, inspect the local journal with `bun server.ts --verify-audit-log <path>`.
+- **Self-echoes stay filtered.** If a channel opts into both `audit` and `allowBotIds`, the bot's own receipts don't loop through its own gate. Locked in by Epic 30-B.8.
+
+> **PII warning for `'full'` mode:** tool `input_preview` is a string representation of the first ~200 chars of whatever Claude passed the tool. For `Read`/`Write`/`Bash` calls this usually includes file paths or command fragments; for text-generation tools it can include arbitrary user-authored content. The 30-A redaction layer scrubs known token patterns (API keys, GitHub tokens, etc.) but cannot catch unstructured PII. Only enable `'full'` in channels where the expected content is acceptable for the audience of that channel.
 
 ### `pending`
 Active pairing codes. Auto-pruned on every gate check.
