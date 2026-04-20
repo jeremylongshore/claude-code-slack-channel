@@ -462,7 +462,7 @@ describe('gate', () => {
   // exact event shape a projected receipt would generate and assert
   // gate() drops it on each of the three self-echo signals.
 
-  test('30-B.8: drops audit-receipt self-echo via bot_id + user match', async () => {
+  test('drops audit-receipt self-echo via bot_id + user match', async () => {
     const access = makeAccess({
       channels: {
         C_AUDITED: {
@@ -489,7 +489,7 @@ describe('gate', () => {
     expect(result.action).toBe('drop')
   })
 
-  test('30-B.8: drops audit-receipt self-echo when only bot_profile.app_id matches', async () => {
+  test('drops audit-receipt self-echo when only bot_profile.app_id matches', async () => {
     // Some Slack payload variants (bot-posted-via-webhook, chat.postMessage
     // with as_user=false) omit `user` on the inbound event. The self-echo
     // check must still fire via bot_profile.app_id. Regression guard: if
@@ -519,7 +519,7 @@ describe('gate', () => {
     expect(result.action).toBe('drop')
   })
 
-  test('30-B.8: receipt echo still dropped when operator misconfigures allowBotIds with own bot ID', async () => {
+  test('receipt echo still dropped when operator misconfigures allowBotIds with own bot ID', async () => {
     // An operator who adds their own bot's user ID to allowBotIds (either
     // by copy-paste mistake or in a symmetric "everyone-can-talk-to-
     // everyone" setup) would produce the exact self-echo the receipt
