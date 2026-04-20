@@ -3224,8 +3224,223 @@ describe('31-A.4 invariant — manifest data never reaches evaluate()', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SessionSupervisor.activate — 000-docs/session-state-machine.md §221-267
+// ManifestV1 — peer-bot manifest schema (Epic 31-A.1, ccsc-s53.1)
+//
+// Design: 000-docs/bot-manifest-protocol.md §17-55. The schema encodes the
+// on-wire contract exactly; validation failures are silently dropped by the
+// consumer (ccsc-s53.13), not raised to callers. These tests pin the schema
+// against its frozen contract so any drift is caught before a peer's well-
+// formed v1 payload starts failing validation in the wild.
 // ---------------------------------------------------------------------------
+
+describe('ManifestV1 schema (31-A.1)', () => {
+  /** Minimal valid manifest used as the base for parameterised rejection
+   *  tests — each test mutates one field to verify that specific constraint. */
+  function validManifest(): unknown {
+    return {
+      __claude_bot_manifest_v1__: true,
+      name: 'Example Bot',
+      vendor: 'Acme Corp',
+      version: '1.2.3',
+      description: 'A minimal example manifest for tests.',
+      tools: [{ name: 'reply', description: 'Post a reply to a message.' }],
+      publishedAt: '2026-01-01T00:00:00.000Z',
+    }
+  }
+
+  test('accepts a minimal valid manifest and preserves every field', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    const parsed = ManifestV1.parse(validManifest())
+    expect(parsed.__claude_bot_manifest_v1__).toBe(true)
+    expect(parsed.name).toBe('Example Bot')
+    expect(parsed.vendor).toBe('Acme Corp')
+    expect(parsed.version).toBe('1.2.3')
+    expect(parsed.description).toBe('A minimal example manifest for tests.')
+    expect(parsed.tools).toHaveLength(1)
+    expect(parsed.tools[0]).toEqual({
+      name: 'reply',
+      description: 'Post a reply to a message.',
+    })
+    expect(parsed.channels).toBeUndefined()
+    expect(parsed.contact).toBeUndefined()
+    expect(parsed.publishedAt).toBe('2026-01-01T00:00:00.000Z')
+  })
+
+  test('accepts optional channels[] and contact when well-formed', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    const parsed = ManifestV1.parse({
+      ...(validManifest() as Record<string, unknown>),
+      channels: ['C01234ABCD', 'C56789EFGH'],
+      contact: 'ops@example.com',
+    })
+    expect(parsed.channels).toEqual(['C01234ABCD', 'C56789EFGH'])
+    expect(parsed.contact).toBe('ops@example.com')
+  })
+
+  // ── Magic-header discriminator ─────────────────────────────────────────
+
+  test('rejects when the magic header key is missing', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    const m = validManifest() as Record<string, unknown>
+    delete m.__claude_bot_manifest_v1__
+    expect(() => ManifestV1.parse(m)).toThrow()
+  })
+
+  test('rejects when the magic header is a truthy non-true value (presence is not enough)', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    // The doc requires a literal `true` — a string, 1, or other truthy
+    // value must not match, otherwise any peer could post a payload that
+    // *looks* like a manifest without committing to the shape.
+    for (const imposter of ['yes', 1, 'true', {}, []] as const) {
+      expect(() =>
+        ManifestV1.parse({
+          ...(validManifest() as Record<string, unknown>),
+          __claude_bot_manifest_v1__: imposter,
+        }),
+      ).toThrow()
+    }
+  })
+
+  test('exports MANIFEST_V1_MAGIC_KEY matching the schema literal key', async () => {
+    const { MANIFEST_V1_MAGIC_KEY } = await import('./manifest.ts')
+    expect(MANIFEST_V1_MAGIC_KEY).toBe('__claude_bot_manifest_v1__')
+  })
+
+  // ── String-length bounds ───────────────────────────────────────────────
+
+  test('rejects name shorter than 1 or longer than 80 chars', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    expect(() => ManifestV1.parse({ ...validManifest() as object, name: '' })).toThrow()
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, name: 'x'.repeat(81) }),
+    ).toThrow()
+  })
+
+  test('rejects vendor shorter than 1 or longer than 80 chars', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    expect(() => ManifestV1.parse({ ...validManifest() as object, vendor: '' })).toThrow()
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, vendor: 'v'.repeat(81) }),
+    ).toThrow()
+  })
+
+  test('rejects description longer than 1000 chars', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, description: 'd'.repeat(1001) }),
+    ).toThrow()
+    // Exactly 1000 is OK.
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, description: 'd'.repeat(1000) }),
+    ).not.toThrow()
+  })
+
+  // ── Version regex (SemVer subset) ──────────────────────────────────────
+
+  test('accepts SemVer MAJOR.MINOR.PATCH and MAJOR.MINOR.PATCH-prerelease', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    for (const v of ['0.0.1', '10.20.30', '1.2.3-beta', '1.2.3-rc.1', '1.0.0-alpha-1']) {
+      expect(() =>
+        ManifestV1.parse({ ...validManifest() as object, version: v }),
+      ).not.toThrow()
+    }
+  })
+
+  test('rejects versions that are not MAJOR.MINOR.PATCH', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    for (const v of ['1.2', '1', '1.2.3.4', 'v1.2.3', '1.2.3+build', '']) {
+      expect(() =>
+        ManifestV1.parse({ ...validManifest() as object, version: v }),
+      ).toThrow()
+    }
+  })
+
+  // ── tools[] bounds ─────────────────────────────────────────────────────
+
+  test('accepts an empty tools list and rejects more than 50 entries', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, tools: [] }),
+    ).not.toThrow()
+    const fifty = Array.from({ length: 50 }, (_, i) => ({
+      name: `t${i}`,
+      description: 'd',
+    }))
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, tools: fifty }),
+    ).not.toThrow()
+    expect(() =>
+      ManifestV1.parse({
+        ...validManifest() as object,
+        tools: [...fifty, { name: 't50', description: 'd' }],
+      }),
+    ).toThrow()
+  })
+
+  test('rejects a tool with empty name, oversized name, or oversized description', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    for (const bad of [
+      { name: '', description: 'd' },
+      { name: 'x'.repeat(81), description: 'd' },
+      { name: 'ok', description: 'd'.repeat(401) },
+    ]) {
+      expect(() =>
+        ManifestV1.parse({ ...validManifest() as object, tools: [bad] }),
+      ).toThrow()
+    }
+  })
+
+  // ── channels[] bounds and regex ────────────────────────────────────────
+
+  test('rejects DM (D...) and private-group (G...) IDs in channels[]', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    // Deliberate: a manifest is a public advertisement; DM and private-
+    // group participation is not something a peer should advertise here.
+    for (const bad of ['D01234ABCD', 'G01234ABCD', 'c01234abcd', 'CABCabc', '', 'C']) {
+      expect(() =>
+        ManifestV1.parse({ ...validManifest() as object, channels: [bad] }),
+      ).toThrow()
+    }
+  })
+
+  test('rejects more than 50 channels', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    const fifty = Array.from({ length: 50 }, (_, i) =>
+      `C${i.toString().padStart(5, '0')}AAAA`,
+    )
+    expect(() =>
+      ManifestV1.parse({ ...validManifest() as object, channels: fifty }),
+    ).not.toThrow()
+    expect(() =>
+      ManifestV1.parse({
+        ...validManifest() as object,
+        channels: [...fifty, 'C99999ZZZZ'],
+      }),
+    ).toThrow()
+  })
+
+  // ── contact email ──────────────────────────────────────────────────────
+
+  test('rejects a malformed email in contact', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    for (const bad of ['not-an-email', 'user@', '@example.com', 'user@example']) {
+      expect(() =>
+        ManifestV1.parse({ ...validManifest() as object, contact: bad }),
+      ).toThrow()
+    }
+  })
+
+  // ── publishedAt ────────────────────────────────────────────────────────
+
+  test('rejects publishedAt that is not an ISO-8601 datetime', async () => {
+    const { ManifestV1 } = await import('./manifest.ts')
+    for (const bad of ['2026-01-01', '01/01/2026', 'yesterday', '', '2026-01-01 00:00:00']) {
+      expect(() =>
+        ManifestV1.parse({ ...validManifest() as object, publishedAt: bad }),
+      ).toThrow()
+    }
+  })
+})
 
 describe('createSessionSupervisor.activate', () => {
   let rawRoot: string
