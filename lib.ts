@@ -1561,6 +1561,10 @@ export async function buildAndPostAuditReceipt(
   if (!shouldPostAuditReceipt(channelPolicy)) return undefined
   const correlationId = generateCorrelationId()
   const { text, blocks } = buildAuditReceiptMessage(tool, correlationId)
+  const reportError = (err: unknown): undefined => {
+    onError({ channel, tool, correlationId, err })
+    return undefined
+  }
   try {
     const posted = await post({
       channel,
@@ -1570,28 +1574,11 @@ export async function buildAndPostAuditReceipt(
       unfurl_links: false,
       unfurl_media: false,
     })
-    if (!posted.ok) {
-      onError({
-        channel,
-        tool,
-        correlationId,
-        err: posted.error || 'non-ok response',
-      })
-      return undefined
-    }
-    if (typeof posted.ts !== 'string') {
-      onError({
-        channel,
-        tool,
-        correlationId,
-        err: 'ok response missing ts',
-      })
-      return undefined
-    }
+    if (!posted.ok) return reportError(posted.error || 'non-ok response')
+    if (typeof posted.ts !== 'string') return reportError('ok response missing ts')
     return { correlationId, ts: posted.ts }
   } catch (err) {
-    onError({ channel, tool, correlationId, err })
-    return undefined
+    return reportError(err)
   }
 }
 
