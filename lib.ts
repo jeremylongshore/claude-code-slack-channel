@@ -998,8 +998,7 @@ export function assertOutboundAllowed(
 export function assertPublishAllowed(ownerId: string, access: Access): void {
   if (access.allowFrom.includes(ownerId)) return
   throw new Error(
-    `Publish gate: user_id '${ownerId}' is not in access.allowFrom — ` +
-      `only allowlisted users may publish a manifest.`,
+    `Publish gate: user_id '${ownerId}' is not in access.allowFrom — only allowlisted users may publish a manifest.`,
   )
 }
 
