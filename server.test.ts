@@ -7476,16 +7476,21 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result!.correlationId.length).toBeGreaterThan(0)
   })
 
-  test('audit: full — posts once, returns populated result', async () => {
-    const calls: unknown[] = []
+  test('audit: full — posts once with correct args and returns populated result', async () => {
+    const calls: Array<{ channel: string; thread_ts?: string; blocks: unknown[] }> = []
     const result = await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: 'ts1' } },
-      'C1', undefined, 'Read',
+      async (args) => { calls.push(args); return { ok: true, ts: 'ts_full' } },
+      'C_SEC', 'T_AUDIT', 'Read',
       { ...baseChannel, audit: 'full' },
-      () => {},
+      () => { throw new Error('onError should not fire on success') },
     )
     expect(calls).toHaveLength(1)
+    expect(calls[0]!.channel).toBe('C_SEC')
+    expect(calls[0]!.thread_ts).toBe('T_AUDIT')
+    expect(calls[0]!.blocks).toHaveLength(1)
     expect(result).toBeDefined()
+    expect(result!.ts).toBe('ts_full')
+    expect(result!.correlationId.length).toBeGreaterThan(0)
   })
 
   test('non-ok Slack response — onError fires with Slack error string, result undefined, no throw', async () => {
