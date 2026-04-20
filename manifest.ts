@@ -337,6 +337,103 @@ export function createManifestCache(
  * output, liberal on input). See `MAX_PUBLISH_MANIFEST_BYTES` for the
  * reasoning.
  */
+// ---------------------------------------------------------------------------
+// Publish rate limiter (Epic 31-B.4, bead ccsc-0qk.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * One publish per channel per hour. Prevents pin-spam if an operator
+ * (or a misbehaving automation) triggers repeated publishes. Not
+ * persisted — a process restart clears the window, which is the
+ * accepted tradeoff for keeping this purely in-memory (doc §166 has
+ * the same "restart clears" posture for the read cache).
+ */
+export const PUBLISH_RATE_LIMIT_MS = 60 * 60 * 1000
+
+export interface PublishRateLimiter {
+  /**
+   * Check whether `channelId` is currently in a cooldown window and,
+   * if not, record `now()` as the most-recent publish timestamp. The
+   * record happens BEFORE the caller's actual publish — reserving the
+   * slot — so a concurrent or retried call sees the cooldown even if
+   * the first call's publish is mid-flight or later fails. A rate
+   * limiter that rolls back on downstream failure is trivially
+   * bypassable (retry until success), which is not what we want here.
+   *
+   * Throws on a hit with an ID-bearing, time-bearing message naming
+   * both the channel and the approximate minutes remaining until the
+   * next publish is allowed.
+   */
+  checkAndRecord(channelId: string): void
+  /** Drop every entry. For tests and future operator commands. */
+  clear(): void
+  /** Current entry count. For tests and operator inspection. */
+  size(): number
+}
+
+export interface PublishRateLimiterOptions {
+  /** Time source. Defaults to `Date.now`. */
+  now?: () => number
+  /** Window length in ms. Defaults to `PUBLISH_RATE_LIMIT_MS`. */
+  windowMs?: number
+  /** Soft cap on distinct-channel entries. Default 256 — same bound
+   *  as the read cache; larger than any realistic workspace channel
+   *  count, small enough to cap memory. */
+  maxEntries?: number
+}
+
+/**
+ * Create an in-memory per-channel publish rate limiter. Symmetric to
+ * `createManifestCache` on the read side: plain-object factory, no
+ * `this` binding concerns, injected time source for testability,
+ * soft-LRU eviction when the entry cap would be breached.
+ */
+export function createPublishRateLimiter(
+  opts: PublishRateLimiterOptions = {},
+): PublishRateLimiter {
+  const now = opts.now ?? Date.now
+  const windowMs = opts.windowMs ?? PUBLISH_RATE_LIMIT_MS
+  const maxEntries = opts.maxEntries ?? 256
+  const store = new Map<string, number>()
+
+  return {
+    checkAndRecord(channelId) {
+      const currentMs = now()
+      const lastMs = store.get(channelId)
+      if (lastMs !== undefined && currentMs - lastMs < windowMs) {
+        const remainingMs = windowMs - (currentMs - lastMs)
+        const remainingMins = Math.max(1, Math.ceil(remainingMs / 60_000))
+        throw new Error(
+          `Publish rate limit: channel '${channelId}' was last published ` +
+            `${Math.floor((currentMs - lastMs) / 60_000)}m ago; 1-per-hour window. ` +
+            `Try again in ~${remainingMins}m.`,
+        )
+      }
+      // Soft-LRU eviction matches the read cache pattern — drop the
+      // entry with the smallest timestamp when we'd otherwise breach
+      // maxEntries on an insertion for a new channel.
+      if (store.size >= maxEntries && !store.has(channelId)) {
+        let oldestKey: string | undefined
+        let oldestAt = Infinity
+        for (const [k, v] of store) {
+          if (v < oldestAt) {
+            oldestAt = v
+            oldestKey = k
+          }
+        }
+        if (oldestKey !== undefined) store.delete(oldestKey)
+      }
+      store.set(channelId, currentMs)
+    },
+    clear() {
+      store.clear()
+    },
+    size() {
+      return store.size
+    },
+  }
+}
+
 export function assertPublishSizeAndSerialize(manifest: ManifestV1): string {
   const body = JSON.stringify(manifest, null, 2)
   const bytes = utf8ByteLength(body)

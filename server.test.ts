@@ -4079,6 +4079,143 @@ describe('createManifestCache (31-A.5)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// createPublishRateLimiter — 1-publish-per-channel-per-hour (Epic 31-B.4)
+//
+// In-memory Map<channelId, lastPublishAt> with injected time source so
+// the one-hour window can be exercised without wall-clock waits. Design
+// symmetric to the read-side cache (ccsc-s53.5): factory function, soft
+// LRU eviction at 256 entries, non-persisted (restart clears).
+// ---------------------------------------------------------------------------
+
+describe('createPublishRateLimiter (31-B.4)', () => {
+  test('exports PUBLISH_RATE_LIMIT_MS = 1 hour', async () => {
+    const { PUBLISH_RATE_LIMIT_MS } = await import('./manifest.ts')
+    expect(PUBLISH_RATE_LIMIT_MS).toBe(60 * 60 * 1000)
+  })
+
+  test('first publish for a channel passes without throwing', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    const limiter = createPublishRateLimiter({ now: () => 1_000 })
+    expect(() => limiter.checkAndRecord('C_A')).not.toThrow()
+    expect(limiter.size()).toBe(1)
+  })
+
+  test('second publish within the window throws with an ID- and time-bearing error', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({ now: () => nowValue, windowMs: 1000 })
+    nowValue = 100
+    limiter.checkAndRecord('C_A')
+    nowValue = 500 // 400 ms later; still within the 1000 ms window
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/Publish rate limit/)
+    expect(() => limiter.checkAndRecord('C_A')).toThrow('C_A')
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/1-per-hour window/)
+    // Still just the one entry — a failed check must not add another.
+    expect(limiter.size()).toBe(1)
+  })
+
+  test('publish at exactly windowMs from the last is allowed (boundary exclusive)', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({ now: () => nowValue, windowMs: 1000 })
+    nowValue = 100
+    limiter.checkAndRecord('C_A')
+    nowValue = 100 + 999
+    // 999 ms after the first publish — still inside the window.
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/Publish rate limit/)
+    nowValue = 100 + 1000
+    // Exactly windowMs elapsed — window is [0, windowMs) so this is out.
+    expect(() => limiter.checkAndRecord('C_A')).not.toThrow()
+  })
+
+  test('publish after the window succeeds and refreshes the stamp', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({ now: () => nowValue, windowMs: 1000 })
+    nowValue = 100
+    limiter.checkAndRecord('C_A')
+    nowValue = 100 + 5000 // well past the window
+    expect(() => limiter.checkAndRecord('C_A')).not.toThrow()
+    // A subsequent call within windowMs of the new stamp is rejected
+    // against the refreshed timestamp, proving the set() updated.
+    nowValue = 100 + 5000 + 500
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/Publish rate limit/)
+  })
+
+  test('channelId isolation — a cooldown on one channel does not affect another', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({ now: () => nowValue, windowMs: 1000 })
+    nowValue = 100
+    limiter.checkAndRecord('C_ALICE')
+    // Concurrent publish in a different channel is fine.
+    expect(() => limiter.checkAndRecord('C_BOB')).not.toThrow()
+    // But repeating C_ALICE within the window still rejects.
+    expect(() => limiter.checkAndRecord('C_ALICE')).toThrow(/C_ALICE/)
+    expect(limiter.size()).toBe(2)
+  })
+
+  test('clear drops every entry', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    const limiter = createPublishRateLimiter({ now: () => 0 })
+    limiter.checkAndRecord('C_A')
+    limiter.checkAndRecord('C_B')
+    expect(limiter.size()).toBe(2)
+    limiter.clear()
+    expect(limiter.size()).toBe(0)
+    // After clear, the previously-cooling-down channel can publish again.
+    expect(() => limiter.checkAndRecord('C_A')).not.toThrow()
+  })
+
+  test('soft-LRU eviction: inserting at the cap drops the oldest stamp', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({ now: () => nowValue, maxEntries: 2 })
+    nowValue = 10
+    limiter.checkAndRecord('C_A')
+    nowValue = 20
+    limiter.checkAndRecord('C_B')
+    nowValue = 30
+    limiter.checkAndRecord('C_C') // should evict C_A
+    expect(limiter.size()).toBe(2)
+    // C_A was evicted, so a fresh publish for C_A is allowed (it looks
+    // unknown to the limiter now). That IS the semantic: at the cap we
+    // accept some imprecision on long-tail channels to bound memory.
+    nowValue = 31
+    expect(() => limiter.checkAndRecord('C_A')).not.toThrow()
+  })
+
+  test('default window is 1 hour when opts.windowMs is omitted', async () => {
+    const { createPublishRateLimiter, PUBLISH_RATE_LIMIT_MS } = await import(
+      './manifest.ts'
+    )
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({ now: () => nowValue })
+    nowValue = 100
+    limiter.checkAndRecord('C_A')
+    nowValue = 100 + PUBLISH_RATE_LIMIT_MS - 1
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/Publish rate limit/)
+    nowValue = 100 + PUBLISH_RATE_LIMIT_MS
+    expect(() => limiter.checkAndRecord('C_A')).not.toThrow()
+  })
+
+  test('rejection message includes remaining-time estimate in minutes', async () => {
+    const { createPublishRateLimiter } = await import('./manifest.ts')
+    let nowValue = 0
+    const limiter = createPublishRateLimiter({
+      now: () => nowValue,
+      windowMs: 60 * 60 * 1000, // 1 hour
+    })
+    nowValue = 0
+    limiter.checkAndRecord('C_A')
+    // 10 minutes after the publish — 50 minutes remain.
+    nowValue = 10 * 60 * 1000
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/10m ago/)
+    expect(() => limiter.checkAndRecord('C_A')).toThrow(/~50m/)
+  })
+})
+
 describe('createSessionSupervisor.activate', () => {
   let rawRoot: string
   let tmpRoot: string

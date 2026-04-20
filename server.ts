@@ -65,6 +65,7 @@ import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
 import {
   extractManifests,
   createManifestCache,
+  createPublishRateLimiter,
   ManifestV1,
   MANIFEST_V1_MAGIC_KEY,
   assertPublishSizeAndSerialize,
@@ -474,6 +475,12 @@ const seenEvents = new Map<string, number>()
 // instead of re-hitting Slack. A process restart clears the cache by design
 // (000-docs/bot-manifest-protocol.md §166).
 const manifestCache = createManifestCache()
+
+// Per-channel publish rate limiter for `publish_manifest` (Epic 31-B.4).
+// One publish per channel per hour; prevents pin-spam. In-memory only, reset
+// on process restart (same posture as the read cache). Reservation happens
+// BEFORE the Slack round-trip so retries on failure don't bypass the limit.
+const publishRateLimiter = createPublishRateLimiter()
 
 // ---------------------------------------------------------------------------
 // Session supervisor — lifecycle authority for per-thread sessions
@@ -1393,6 +1400,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
           reason: sizeErr instanceof Error ? sizeErr.message : String(sizeErr),
         })
         throw sizeErr
+      }
+
+      // Gate 4 (ccsc-0qk.4): per-channel 1-per-hour rate limit. Last
+      // gate before any Slack round-trip, so an in-cooldown caller gets
+      // the rate-limit error without consuming any Slack API budget.
+      // The reservation is recorded here; if a downstream step fails,
+      // the slot is still taken — a retry-on-failure path would make
+      // the limiter trivially bypassable.
+      try {
+        publishRateLimiter.checkAndRecord(channel)
+      } catch (rateErr) {
+        journalWrite({
+          kind: 'gate.outbound.deny',
+          outcome: 'deny',
+          toolName: 'publish_manifest',
+          input: { channel, caller_user_id: callerUserId },
+          reason: rateErr instanceof Error ? rateErr.message : String(rateErr),
+        })
+        throw rateErr
       }
 
       // Replace semantics: unpin any prior manifest this bot posted in
