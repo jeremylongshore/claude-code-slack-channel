@@ -3112,8 +3112,9 @@ describe('31-A.9 invariant — evaluate() has no manifest surface', () => {
   test('evaluate() ignores manifest-shaped fields smuggled into ToolCall.input', async () => {
     const { evaluate } = await import('./policy.ts')
     // Worst case: a caller type-erases and forces manifest content into
-    // ToolCall.input. evaluate()'s MatchSpec has no key for
-    // name/vendor/version — the engine is blind to manifest semantics.
+    // `ToolCall.input`. `evaluate()`'s `MatchSpec` has no key for
+    // `name` / `vendor` / `version` — the engine is blind to manifest
+    // semantics.
     const call: import('./policy.ts').ToolCall = {
       tool: 'reply',
       input: {
