@@ -313,8 +313,10 @@ async function postAuditReceiptIfEnabled(
   tool: string,
 ): Promise<string | undefined> {
   const result = await buildAndPostAuditReceipt(
-    (args) =>
-      client.chat.postMessage(args) as Promise<{ ok: boolean; ts?: string }>,
+    async (args) => {
+      const res = await client.chat.postMessage(args)
+      return { ok: res.ok ?? false, ts: typeof res.ts === 'string' ? res.ts : undefined }
+    },
     channel,
     thread,
     tool,

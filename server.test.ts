@@ -7435,7 +7435,7 @@ describe('buildAuditReceiptMessage (30-B.2)', () => {
 describe('buildAndPostAuditReceipt (30-B.9)', () => {
   const baseChannel: ChannelPolicy = { requireMention: false, allowFrom: [] }
 
-  test("audit: undefined — no post, no onError, returns undefined", async () => {
+  test('audit: undefined — no post, no onError, returns undefined', async () => {
     const calls: unknown[] = []
     const errors: unknown[] = []
     const result = await buildAndPostAuditReceipt(
@@ -7448,7 +7448,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result).toBeUndefined()
   })
 
-  test("audit: 'off' — no post, no onError, returns undefined", async () => {
+  test('audit: off — no post, no onError, returns undefined', async () => {
     const calls: unknown[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
@@ -7460,7 +7460,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result).toBeUndefined()
   })
 
-  test("audit: 'compact' — posts once and returns correlationId + ts", async () => {
+  test('audit: compact — posts once and returns correlationId + ts', async () => {
     const calls: Array<{ channel: string; thread_ts?: string }> = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: '1700000000.000100' } },
@@ -7476,7 +7476,7 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     expect(result!.correlationId.length).toBeGreaterThan(0)
   })
 
-  test("audit: 'full' — posts once, returns populated result", async () => {
+  test('audit: full — posts once, returns populated result', async () => {
     const calls: unknown[] = []
     const result = await buildAndPostAuditReceipt(
       async (args) => { calls.push(args); return { ok: true, ts: 'ts1' } },
