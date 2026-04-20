@@ -79,6 +79,23 @@ function makeOpts(overrides: Partial<GateOptions> = {}): GateOptions {
   }
 }
 
+/** Extract every module specifier from a TypeScript source file.
+ *  Handles `import … from 'x'`, `import('x')`, `require('x')`, and
+ *  `export … from 'x'` (re-exports). Comments are stripped first so
+ *  prose mentioning a banned name (e.g. "manifest") does not false-
+ *  positive. Used by the 31-A.4 invariant test below and available
+ *  to any future import-graph lint in this suite. */
+function extractImportSpecifiers(src: string): string[] {
+  const stripped = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '')
+  const specs: string[] = []
+  const re = /(?:\bfrom|\bimport\s*\(|\brequire\s*\()\s*(['"])([^'"]+)\1/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(stripped)) !== null) specs.push(m[2]!)
+  return specs
+}
+
 // ---------------------------------------------------------------------------
 // gate()
 // ---------------------------------------------------------------------------
@@ -3114,21 +3131,6 @@ describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
 // ---------------------------------------------------------------------------
 
 describe('31-A.4 invariant — manifest data never reaches evaluate()', () => {
-  /** Extract every module specifier from a TypeScript source file.
-   *  Handles `import … from 'x'`, `import('x')`, `require('x')`, and
-   *  `export … from 'x'` (re-exports). Comments are stripped first so
-   *  prose mentioning "manifest" does not false-positive. */
-  function extractImportSpecifiers(src: string): string[] {
-    const stripped = src
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/\/\/[^\n]*/g, '')
-    const specs: string[] = []
-    const re = /(?:\bfrom|\bimport\s*\(|\brequire\s*\()\s*(['"])([^'"]+)\1/g
-    let m: RegExpExecArray | null
-    while ((m = re.exec(stripped)) !== null) specs.push(m[2]!)
-    return specs
-  }
-
   test('policy.ts imports no manifest-module specifier', () => {
     const src = readFileSync(join(import.meta.dir, 'policy.ts'), 'utf8')
     const specs = extractImportSpecifiers(src)
