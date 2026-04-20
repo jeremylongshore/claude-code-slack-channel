@@ -278,7 +278,8 @@ transport swap, not a schema rewrite:
 | `description`             | `description`              | ≤ 1000 chars |
 | `version`                 | `version`                  | SemVer subset |
 | `provider.organization`   | `vendor`                   | 1..80 chars |
-| `skills[].name/description` | `tools[].name/description` | ≤ 50 entries |
+| `skills[].name`           | `tools[].name`             | 1..80 chars; ≤ 50 entries on the outer array |
+| `skills[].description`    | `tools[].description`      | ≤ 400 chars |
 | `supportsAuthenticatedExtendedCard` | — (conditional gate) | A2A's signed-card extension is what our §112-134 "conditional on signing primitive" condition is waiting for |
 
 The intentional *divergences* are all in the transport, not the
