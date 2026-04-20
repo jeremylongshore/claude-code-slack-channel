@@ -135,6 +135,107 @@ Until then: the manifest consumer exists in specification only. Epic
 
 ---
 
+## Publisher side (Epic 31-B)
+
+The companion publisher is an MCP tool, `slack/publish_manifest`, that
+lets this bot post its own manifest into a channel. Shipped as code in
+v0.7.0 but held to the same signing-primitive condition as the read
+side — the tool exists, its tests pass, and its behaviour is wired
+end-to-end, but the path from "Claude calls publish_manifest" to "a
+peer bot trusts what it reads" still waits on the identity primitive
+documented in §112-134.
+
+### Input
+
+```ts
+publish_manifest({
+  channel:        'C01234ABCD',            // public channel id only
+  caller_user_id: 'U0ABCDEF',              // must be in access.allowFrom
+  manifest:       ManifestV1,              // full Zod-validated body
+})
+```
+
+### Gate chain
+
+Every publish runs four gates in order. The first that rejects wins,
+with a journal entry of `kind: 'gate.outbound.deny'` carrying the
+reason, and no Slack API call is made.
+
+1. **allowFrom gate** (bead `ccsc-0qk.5`) — `caller_user_id` must
+   appear in the workspace-level `access.allowFrom` list, the same
+   allowlist that governs DM access. Operators manage one list;
+   typos in `caller_user_id` fail loud. See `assertPublishAllowed` in
+   `lib.ts`.
+2. **Channel opt-in** (shared with `reply`, `read_peer_manifests`) —
+   `channel` must already be in `access.channels`. The publisher does
+   not open a new write path; it reuses the existing outbound gate.
+3. **Size cap** (bead `ccsc-0qk.2`) — the serialized manifest must be
+   ≤ 8 KB after UTF-8 encode. **Stricter than the 40 KB read cap**
+   (Postel's Law: conservative on output, liberal on input). The
+   cap is enforced on the exact bytes that will be posted — size
+   check and serialization live in one function
+   (`assertPublishSizeAndSerialize`) so there is no room for
+   formatting differences to silently raise the effective cap.
+4. **Rate limit** (bead `ccsc-0qk.4`) — one publish per channel per
+   hour. In-memory `Map<channelId, lastPublishAt>`, 256-entry soft
+   LRU, resets on process restart. The timestamp is recorded *before*
+   the Slack round-trip; a downstream failure does NOT roll back the
+   slot. A retry-on-failure limiter would be trivially bypassable.
+
+### Replace semantics
+
+After the gates pass, the handler performs a four-step flow so that
+at most one of our pinned manifests exists per channel at any time
+(bead `ccsc-0qk.3`):
+
+1. `pins.list(channel)` — fetch current pins.
+2. `findOurPriorManifestPins(items, identity)` — filter to
+   message-kind pins whose `bot_id` / `user` matches our identity AND
+   whose body carries the magic header. Peer manifests are deliberately
+   untouched; our non-manifest pins are deliberately untouched.
+3. `pins.remove` each prior manifest, best-effort. Per-pin failures
+   are logged and skipped — a flaky Slack call can leave an extra
+   pin around until the next publish sweeps it up, which is strictly
+   better than failing the whole publish.
+4. `chat.postMessage` (new body) → `pins.add` (new ts) → journal
+   `{ kind: 'manifest.publish', replaced: N }` so operators can see
+   how many prior pins were unpinned during the sweep.
+
+`pins.list` failing entirely (auth error, rate-limit bounce)
+causes the sweep to be skipped but NOT the publish — same rationale
+as per-pin failures. A skipped sweep means a duplicate pin until
+next publish, not a lost publish.
+
+### What NEVER gets published
+
+Manifests are pinned public messages. **Anything you put in a manifest
+is visible to every member of the channel, including future members,
+search, and any operator tooling that indexes pins.** The publisher
+MUST NOT carry:
+
+- API keys, tokens, or credentials of any kind.
+- Per-user data, telemetry, or analytics identifiers.
+- Hostname/IP of internal infrastructure.
+- Contents of past conversations with users.
+
+The `description` and `tools[].description` fields are good places to
+say "what I do." They are not a log file. An operator who pastes a
+production error stack or an environment-dump into a manifest has
+just pinned it to the channel permanently. (The replace sweep will
+eventually unpin it on the next publish, but Slack retains message
+history.) Treat every publish as a public press release.
+
+### Conditional-on-signing
+
+See §112-134. Epic 31-B ships conditionally on the same signing
+primitive as 31-A. Until that primitive lands: the tool exists, the
+gates enforce, the tests prove the invariants — but operators should
+treat successful publishes as "the bot *would* publish" rather than
+"a peer can trust what it reads." The read side has the symmetric
+condition; together they gate the protocol as a whole.
+
+---
+
 ## Sequence diagram
 
 ```mermaid
@@ -327,6 +428,42 @@ Unknown keys inside `agentCard` are *stripped* (Zod's default
 `z.object` posture), not rejected. This is deliberate forward-
 compatibility: a future v2 publisher can include new sub-fields
 without breaking v1 readers.
+
+### Migration path if A2A formalizes signed manifests
+
+A2A is moving toward signed agent-cards — the spec already reserves a
+`supportsAuthenticatedExtendedCard` flag for the mechanism. When that
+primitive reaches a version we can depend on, the migration looks
+like this:
+
+1. Define `ManifestV2` in `manifest.ts` with the magic key
+   `__claude_bot_manifest_v2__: true` and a required `signature`
+   field. The shape of the payload is otherwise a superset of v1.
+2. Extend the consumer (`extractManifests`) to accept either magic
+   key, Zod-validate against the matching schema, and for v2 verify
+   the signature over the canonicalized body. Failed signature
+   verification is a silent drop, same posture as the v1 validation
+   drops documented in §81.
+3. Extend the publisher (`publish_manifest`) to produce v2 payloads
+   when a signing-primitive context (key material, HSM handle, or a
+   remote signer endpoint) is configured; fall back to v1 otherwise
+   so mixed-version channels continue to work.
+4. Deprecate v1 reads after a transition window. `manifest.read`
+   journal events already carry enough context to measure v1
+   residual traffic before pulling the plug.
+
+Through that migration this document's invariants are unchanged:
+advertisements are still not grants, `policy.ts` still cannot import
+from the manifest module, `access.json` is still not mutated by any
+manifest code path. Signed manifests change the trust *surface* of
+the content (a peer's claim becomes verifiably attributable) without
+changing who has authority (the access store). The scope of Epic
+31-A.4 widens naturally: "manifest data never reaches `evaluate()`"
+continues to hold whether the data is v1 or v2.
+
+Actual signing work is deferred to a future epic — this note exists
+so reviewers of that future work can see the migration was planned
+for, not retrofitted as an afterthought.
 
 ---
 
