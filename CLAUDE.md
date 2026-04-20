@@ -62,11 +62,14 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 
 - `server.ts` — MCP server runtime: bootstrap, Slack clients, tools, event handling
 - `lib.ts` — pure functions: gate logic, security guards, text chunking, session types
-- `policy.ts` — PolicyRule Zod schema, `evaluate()` decision procedure, `detectShadowing` linter, `checkMonotonicity` (Epic 29-A closed)
-- `server.test.ts` — test suite covering security-critical functions (uses `bun:test`)
+- `policy.ts` — `PolicyRule` Zod schema, `evaluate()` decision procedure, `detectShadowing` linter, `checkMonotonicity`
+- `journal.ts` — hash-chained audit log: `JournalWriter`, `verifyJournal`, `EventKind`, redactor
+- `supervisor.ts` — `SessionSupervisor`: activate/deactivate/quiesce, idle reaper, quarantine tracking
+- `server.test.ts` — single-file test suite covering security-critical functions (uses `bun:test`); run a subset with `bun test --grep "<pattern>"`
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
 - `ACCESS.md` — access control schema documentation
+- `CHANGELOG.md` — Keep a Changelog format; every user-visible change lands with a PR entry
 
 ## Design Docs (load-bearing contracts)
 
@@ -87,7 +90,7 @@ This is a prompt injection vector. Five defense layers:
 
 1. **Inbound gate** (`gate()`) — drops ungated messages before MCP notification. Bot messages dropped by default; per-channel `allowBotIds` opts specific peer bots in. Self-echo detection matches on `bot_id` / `bot_profile.app_id` / `user === botUserId` to cover payload variants. `PERMISSION_REPLY_RE` is checked at the gate so peer bots cannot inject permission-reply text.
 2. **Outbound gate** (`assertOutboundAllowed()`) — replies only to delivered channels
-3. **File exfiltration guard** (`assertSendable()`) — blocks sending state dir files (`.env`, `access.json`, `sessions/`, future `audit.log`). State-dir layout and per-thread session files are specified in [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md) (Epic 32-A).
+3. **File exfiltration guard** (`assertSendable()`) — blocks sending state dir files (`.env`, `access.json`, `sessions/`, `audit.log`). State-dir layout and per-thread session files are specified in [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md) (Epic 32-A).
 4. **System prompt hardening** — instructions tell Claude to refuse pairing/access from messages. Peer-bot messages are flagged as carrying the same prompt-injection risk as human messages.
 5. **Token security** — `.env` chmod 0o600, atomic writes, never logged
 
