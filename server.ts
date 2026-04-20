@@ -1196,61 +1196,50 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
         input: { channel },
       })
 
-      // Cache hit within the 5-minute TTL: return the cached list
-      // without hitting Slack (Epic 31-A.5, doc §84). The journal still
-      // records a manifest.read.cached event so manifest activity is
-      // forensically visible even when served from cache (§165).
+      // Resolve manifests from the 5-minute per-channel cache (hit) or
+      // freshly from Slack (miss). Either way, both paths converge on a
+      // single journal write + return below so the serialization and
+      // event-emission contract stay identical. Doc §84, §165.
       const cached = manifestCache.get(channel)
+      let manifests: ReadonlyArray<import('./manifest.ts').ManifestV1>
+      let manifestEventKind: 'manifest.read' | 'manifest.read.cached'
       if (cached !== undefined) {
-        journalWrite({
-          kind: 'manifest.read.cached',
-          toolName: 'read_peer_manifests',
-          input: { channel, count: cached.length },
-        })
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                { channel, count: cached.length, manifests: cached },
-                null,
-                2,
-              ),
-            },
-          ],
+        manifests = cached
+        manifestEventKind = 'manifest.read.cached'
+      } else {
+        // Cache miss: fetch candidate message bodies from both sources
+        // the doc specifies (§79). Pin errors and history errors do not
+        // fail the tool — a peer that has pinned a valid manifest should
+        // surface even if the history call hiccups, and vice versa.
+        // Parallelised via allSettled so the tool's latency is
+        // max(pins, history) rather than pins + history.
+        const [pinsResult, historyResult] = await Promise.allSettled([
+          web.pins.list({ channel }),
+          web.conversations.history({ channel, limit: 50 }),
+        ])
+
+        const texts: Array<string | null | undefined> = []
+        if (pinsResult.status === 'fulfilled') {
+          for (const item of pinsResult.value.items ?? []) {
+            // pins.list returns {type: 'message', message: {...}} among
+            // other item kinds; only message items can carry manifests.
+            const msg = (item as { message?: { text?: string | null } }).message
+            if (msg) texts.push(msg.text ?? null)
+          }
         }
+        if (historyResult.status === 'fulfilled') {
+          for (const msg of historyResult.value.messages ?? []) {
+            texts.push((msg as { text?: string | null }).text ?? null)
+          }
+        }
+
+        manifests = extractManifests(texts)
+        manifestCache.set(channel, manifests)
+        manifestEventKind = 'manifest.read'
       }
 
-      // Cache miss: fetch candidate message bodies from both sources the
-      // doc specifies (§79). Pin errors and history errors do not fail
-      // the tool — a peer that has pinned a valid manifest should surface
-      // even if the history call hiccups, and vice versa. Parallelised
-      // via allSettled so the tool's latency is max(pins, history)
-      // rather than pins + history.
-      const [pinsResult, historyResult] = await Promise.allSettled([
-        web.pins.list({ channel }),
-        web.conversations.history({ channel, limit: 50 }),
-      ])
-
-      const texts: Array<string | null | undefined> = []
-      if (pinsResult.status === 'fulfilled') {
-        for (const item of pinsResult.value.items ?? []) {
-          // pins.list returns {type: 'message', message: {...}} among
-          // other item kinds; only message items can carry manifests.
-          const msg = (item as { message?: { text?: string | null } }).message
-          if (msg) texts.push(msg.text ?? null)
-        }
-      }
-      if (historyResult.status === 'fulfilled') {
-        for (const msg of historyResult.value.messages ?? []) {
-          texts.push((msg as { text?: string | null }).text ?? null)
-        }
-      }
-
-      const manifests = extractManifests(texts)
-      manifestCache.set(channel, manifests)
       journalWrite({
-        kind: 'manifest.read',
+        kind: manifestEventKind,
         toolName: 'read_peer_manifests',
         input: { channel, count: manifests.length },
       })
