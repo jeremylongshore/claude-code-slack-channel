@@ -1575,7 +1575,7 @@ export async function buildAndPostAuditReceipt(
         channel,
         tool,
         correlationId,
-        err: posted.error ?? 'non-ok response',
+        err: posted.error || 'non-ok response',
       })
       return undefined
     }
