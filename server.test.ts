@@ -3629,20 +3629,20 @@ describe('ManifestV1 schema (31-A.1)', () => {
     ).toThrow()
   })
 
-  test('rejects agentCard.authentication with an empty schemes list', async () => {
+  test('agentCard.authentication accepts empty schemes[] but rejects oversized scheme strings', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
-    // If the authentication object is present, it must name at least
-    // one scheme — an empty list is not a legitimate "public bot"
-    // signal (omit the authentication object entirely for that).
+    // An empty schemes list is odd but not forbidden — the canonical
+    // way to say "public bot" is to omit the authentication object
+    // entirely, so we don't need the schema to also reject empty
+    // lists. The real guard here is the per-string length bound:
+    // a scheme name over 40 chars is a typo or attack, not a real
+    // auth primitive.
     expect(() =>
       ManifestV1.parse({
         ...(validManifest() as Record<string, unknown>),
         agentCard: { authentication: { schemes: [] } },
       }),
     ).not.toThrow()
-    // Actually Zod default is min 0 — and the spec intent is "empty
-    // is odd but not forbidden." Change the assertion to reflect: a
-    // scheme over the per-string length cap is the real reject.
     expect(() =>
       ManifestV1.parse({
         ...(validManifest() as Record<string, unknown>),
