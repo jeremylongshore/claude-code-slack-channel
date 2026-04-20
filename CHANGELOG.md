@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-20
+
+### Added
+
+- **Declarative policy enforcement at the permission-relay boundary.** Operators author rules in `access.json.policy`; the server consults `evaluate()` on every tool-call permission request and routes to one of four outcomes: `auto_allow` (matched `auto_approve`, no human prompt), `deny` (posts reason to thread, no exec), `require_human` (quorum tracking), `default_human` (no rule, legacy Block Kit flow). See [`ACCESS.md`](ACCESS.md#policy-rules) for the schema and [`000-docs/policy-evaluation-flow.md`](000-docs/policy-evaluation-flow.md) for the decision procedure (#100).
+- **Multi-approver quorum with NIST two-person integrity** (#101). `require_approval` rules accept an optional `approvers` field (1–10, default 1). Votes accumulate on the verified Slack `user_id` — the same human cannot double-satisfy quorum regardless of display name. A single deny from any allowlisted user rejects the request immediately, regardless of quorum count. Block Kit message updates show progress (`N/M approvals`). Binding rationale tracked in issue #97.
+- **Four new journal EventKinds now emit at enforcement time:** `policy.allow`, `policy.deny`, `policy.require`, `policy.approved`. Declared in v0.5.0; now wired. Every enforcement decision produces a hash-chained audit record with rule id, session key, and (for `require`/`approved`) the verified approver `user_id`s.
+- **`thread_ts` predicate on `MatchSpec`.** Policies scope to a specific thread within a channel. Schema landed in #96 before the evaluator wiring so operators can ship thread-scoped rules against a stable v1 shape.
+- **Boot-time policy footgun linter** (`detectBroadAutoApprove`) (#101). Warns on `auto_approve` rules that lack both `tool` and `pathPrefix` — almost always a misconfiguration.
+- **`--verify-audit-log` CLI subcommand** (#98). `bun server.ts --verify-audit-log <path>` runs `verifyJournal()` before any state setup (no `.env`, no tokens needed). Exit codes 0/1/2 for ok / break / unexpected. Closes a design-doc gap where [`000-docs/audit-journal-architecture.md`](000-docs/audit-journal-architecture.md) specified the CLI but only the programmatic form shipped.
+- **Compile-time shape-drift guards** (#102). `lib.ts` duplicates `PolicyDecision` / `VerifyResult` shapes (`PolicyDecisionShape` / `VerifyResultShape`) to stay decoupled from `policy.ts` / `journal.ts`. Bidirectional `extends` checks in `policy.ts` and `journal.ts` break the build the moment either side drifts — already caught one real drift at review time.
+- **End-to-end contract tests for the policy enforcement chain** (#103). Seven integration tests covering `auto_approve` bypass, `deny` reason surfacing, `require:2` quorum with NIST `user_id` dedup, and the `default_human` fallback when no rule matches.
+- **Frozen [`000-docs/v0.6.0-release-plan.md`](000-docs/v0.6.0-release-plan.md)** (#99) — design-in-public commitment to what's in v0.6.0, what's out, and why.
+- **471 tests** — up from 430 in v0.5.1 (+41 covering policy enforcement, multi-approver quorum, NIST dedup, route mapping, boot-time linter, and the full end-to-end policy chain).
+
+### Changed
+
+- **Policy rules now load at boot.** A malformed `access.json.policy` field is fatal at boot — policy is safety-critical, silent degradation is not offered. Missing / empty policy is NOT an error (first-install path is preserved). Hot reload intentionally deferred per [release plan §R3](000-docs/v0.6.0-release-plan.md).
+- **Vote-handling DRY refactor** (#102). The Block Kit button handler and the text-reply handler now share a `processApprovalVote()` helper — the state transition (`recordApprovalVote` → `grantPolicyApproval` → `journalWrite`) lives in one place; per-resolver UX stays separate.
+
+### Known Limitations
+
+- `pairing.accepted` and `pairing.expired` EventKinds remain unwired (P3, [`ccsc-4an`](https://github.com/jeremylongshore/claude-code-slack-channel/issues) — tracked for v0.6.1). Current journal captures `pairing.issued` so the pairing lifecycle is reconstructible from `issued` + absence of `claim`.
+- No operator CLI for rule authoring; edit `access.json.policy` directly. A `/slack-channel:policy` skill is on the v0.6.1 roadmap.
+- Rules match on `tool`, `channel`, `thread_ts`, and `actor`; the `argEquals` / `pathPrefix` predicates in the schema do not yet match from `permission_request` notifications because the MCP surface carries `input_preview` (string) rather than structured tool args. Tracked as a v0.7.x evolution.
+
 ## [0.5.1] - 2026-04-19
 
 ### Added
