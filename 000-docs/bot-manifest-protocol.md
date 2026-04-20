@@ -262,6 +262,41 @@ Every 31-A PR is checked against these. A violation is a merge block.
 
 ---
 
+## Alignment with Google A2A
+
+The v1 manifest schema is deliberately shape-compatible with Google's
+Agent-to-Agent (A2A) protocol and its `/.well-known/agent-card.json`
+convention. That protocol ships agent identity over an HTTPS endpoint
+on the agent's own origin; ours ships the same *kind* of content as a
+pinned Slack message, because our deployment substrate is Slack rather
+than the public web. The fields line up so the upgrade path is a
+transport swap, not a schema rewrite:
+
+| A2A agent-card field      | Manifest v1 field          | Notes |
+|---------------------------|----------------------------|-------|
+| `name`                    | `name`                     | 1..80 chars |
+| `description`             | `description`              | ≤ 1000 chars |
+| `version`                 | `version`                  | SemVer subset |
+| `provider.organization`   | `vendor`                   | 1..80 chars |
+| `skills[].name`           | `tools[].name`             | 1..80 chars; ≤ 50 entries on the outer array |
+| `skills[].description`    | `tools[].description`      | ≤ 400 chars |
+| `supportsAuthenticatedExtendedCard` | — (conditional gate) | A2A's signed-card extension is what our §112-134 "conditional on signing primitive" condition is waiting for |
+
+The intentional *divergences* are all in the transport, not the
+payload: A2A assumes mutual-TLS or signed cards for identity; we wait
+for the same primitive before going live (see §124-134). A2A fetches
+over HTTPS; we read from Slack pins under an already-existing
+participation gate (§78). When an upstream signing primitive lands, a
+peer's A2A agent-card can be posted as a manifest with minimal
+transformation, and this document's invariants continue to hold.
+
+The A2A alignment is documentation-only: no code path here links to
+A2A libraries or expects an HTTPS fetch. It exists so operators and
+reviewers can reason about this protocol using A2A terminology when
+that's useful.
+
+---
+
 ## References
 
 - Miller, M. S. (2006). *Robust Composition: Towards a Unified Approach
@@ -275,6 +310,12 @@ Every 31-A PR is checked against these. A violation is a merge block.
   spoofing).
 - [`../ACCESS.md`](../ACCESS.md) — `allowBotIds` per-channel opt-in
   surface.
+- Google (2024+). *Agent-to-Agent (A2A) protocol.*
+  [`https://a2aproject.org`](https://a2aproject.org) — upstream spec
+  the v1 manifest schema is shape-compatible with; the
+  `/.well-known/agent-card.json` convention is the transport-side
+  equivalent of our pinned Slack message. See the "Alignment with
+  Google A2A" section above for the field-by-field mapping.
 - Bead **ccsc-npd** — this document. Blocks Epic 31-A (ccsc-s53).
 - Epic 31-A children (ccsc-s53.1 – ccsc-s53.10) — implementation
   beads, held pending the signing-primitive condition.
