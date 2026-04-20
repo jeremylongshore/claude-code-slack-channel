@@ -94,20 +94,20 @@ Author rules in `access.json.policy` to automate permission decisions for Claude
 {
   "policy": [
     {
-      "id": "safe-reads",
+      "id": "safe-reads-in-ops",
       "effect": "auto_approve",
-      "match": { "tool": "read_file", "pathPrefix": "/workspace/docs" }
+      "match": { "tool": "Read", "channel": "C_OPS_DOCS" }
     },
     {
       "id": "no-shell",
       "effect": "deny",
-      "match": { "tool": "run_shell" },
+      "match": { "tool": "Bash" },
       "reason": "Shell execution is not permitted."
     },
     {
-      "id": "dangerous-delete",
+      "id": "dangerous-writes",
       "effect": "require_approval",
-      "match": { "tool": "delete_project" },
+      "match": { "tool": "Write", "channel": "C_DEPLOY" },
       "approvers": 2,
       "ttlMs": 300000
     }
