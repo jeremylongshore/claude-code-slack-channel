@@ -3640,12 +3640,20 @@ describe('extractManifests (31-A.2)', () => {
     // UTF-16 length is much smaller: baseBytes + 1 + 2*emojisNeeded.
     expect(tooBig.length).toBeLessThan(totalBytes)
     const origDebug = console.debug
-    console.debug = () => {}
+    const debugCalls: unknown[][] = []
+    console.debug = (...args: unknown[]) => {
+      debugCalls.push(args)
+    }
     try {
       expect(extractManifests([tooBig])).toEqual([])
     } finally {
       console.debug = origDebug
     }
+    // Same consistency check as the single-byte oversize test: the log
+    // must name the oversize condition and cite the actual byte count.
+    expect(debugCalls).toHaveLength(1)
+    expect(String(debugCalls[0]?.[0])).toMatch(/oversized/i)
+    expect(String(debugCalls[0]?.[0])).toMatch(String(totalBytes))
   })
 })
 
