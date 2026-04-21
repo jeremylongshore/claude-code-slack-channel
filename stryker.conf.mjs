@@ -15,12 +15,14 @@
 
 /** @type {import('@stryker-mutator/api/core').PartialStrykerOptions} */
 export default {
-  // Baseline scope: lib.ts only. A full-scope run over lib.ts + policy.ts +
-  // manifest.ts (1427 mutants) projected ~24 min on this hardware — over the
-  // 20-min budget this PR's stop-if rule sets. Narrowing to lib.ts gives a
-  // meaningful first baseline of the security-critical gate/outbound/sendable
-  // guards. policy.ts and manifest.ts can be added in follow-up PRs.
-  mutate: ['lib.ts'],
+  // Expanded scope (ccsc-l5z): lib.ts + policy.ts + manifest.ts + journal.ts.
+  // Baseline runs now cover the four security-critical modules. server.ts and
+  // supervisor.ts remain out of scope — server.ts has boot-time side effects
+  // and module-load globals; supervisor.ts is well-covered by integration-
+  // style tests but its mutants regularly time out under the command runner's
+  // cold-spawn overhead. Per-file mutation scores are captured in
+  // 000-docs/MUTATION_REPORT.md after each run.
+  mutate: ['lib.ts', 'policy.ts', 'manifest.ts', 'journal.ts'],
   testRunner: 'command',
   commandRunner: {
     command: 'bun test --timeout 15000',

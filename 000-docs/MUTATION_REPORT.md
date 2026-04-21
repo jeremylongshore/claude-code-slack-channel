@@ -28,16 +28,25 @@ mutation-testing gap so severe that the baseline should be treated as a draft.
 
 ## Scope (and why it's narrow)
 
-Baseline run covered **`lib.ts` only** (1,770 lines, 913 mutants generated).
-`policy.ts` and `manifest.ts` are out of scope for this first run. The initial
-attempt over all three files (1,427 mutants) projected ~24 min on this hardware
-— over the 20-min budget set for the PR — so the config was narrowed. Opening
-the scope to `policy.ts` and `manifest.ts` is a reasonable follow-up once
-either (a) CI-free hardware is faster or (b) Stryker is wired to run the tests
-via a warm `bun test` runner rather than cold-spawning `bun test` per mutant.
+**Original baseline** (ccsc-ao9) covered **`lib.ts` only** (1,770 lines, 913 mutants) because the full-scope run projected ~24 min on this hardware — over the 20-min budget the PR had set.
 
-`server.ts`, `supervisor.ts`, and `journal.ts` were excluded by design:
-boot-time side effects and module-load globals confuse the mutator.
+**Expanded scope** (ccsc-l5z, this change): `stryker.conf.mjs` now mutates `lib.ts` + `policy.ts` + `manifest.ts` + `journal.ts` — the four security-critical pure modules. Observed mutant count on the expanded scope: **1 860** (up from 913), with an expected ~45-minute runtime on this workstation at `concurrency: 4`.
+
+`server.ts` and `supervisor.ts` remain out of scope: `server.ts` has boot-time side effects and module-load globals that confuse the mutator; `supervisor.ts` mutants routinely time out under the command runner's cold-spawn overhead.
+
+### Per-file baselines (expanded scope)
+
+A full re-run against the expanded config is captured separately as the run completes. Header numbers land here; per-file breakdowns land after:
+
+| File | Mutants | Killed | Survived | Timed out | Score |
+|---|---|---|---|---|---|
+| `lib.ts` | (run in progress) | — | — | — | — |
+| `policy.ts` | (run in progress) | — | — | — | — |
+| `manifest.ts` | (run in progress) | — | — | — | — |
+| `journal.ts` | (run in progress) | — | — | — | — |
+| **All files** | **1 860** | — | — | — | — |
+
+**Update trailer:** A follow-up commit to this same PR will replace the "in progress" rows with the final per-file numbers once the run completes. The intermediate y4e-only re-run on `lib.ts` landed at **84.45%** (up from 79.85% baseline) after the top-5 survivor-kill tests.
 
 ## Reproduce
 
