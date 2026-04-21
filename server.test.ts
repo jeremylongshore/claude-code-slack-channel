@@ -9297,3 +9297,228 @@ describe('enforceAuditReceiptCap (audit-receipt memory safety)', () => {
     expect(AUDIT_RECEIPTS_MAX).toBeLessThanOrEqual(10_000)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Stryker survivor kills — security primitives (ccsc-y4e)
+//
+// Each test below targets one mutant cluster that survived the lib.ts
+// baseline run documented in 000-docs/MUTATION_REPORT.md. Descriptions
+// name the mutant being killed so a future re-run can verify the kill.
+// ---------------------------------------------------------------------------
+
+describe('PERMISSION_REPLY_RE anchor + charset mutants (ccsc-y4e)', () => {
+  test('leading garbage is rejected — kills the "drop ^" mutant', () => {
+    // Mutant: /\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i (no leading anchor).
+    // The mutant would substring-match "y abcde" at the end of a longer
+    // string. The original anchors to start-of-string and rejects.
+    expect(PERMISSION_REPLY_RE.test('hey y abcde')).toBe(false)
+    expect(PERMISSION_REPLY_RE.test('ignore this yes abcde')).toBe(false)
+  })
+
+  test('trailing garbage is rejected — kills the "drop $" mutant', () => {
+    // Mutant: /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*/i (no trailing anchor).
+    // Substring-matches "y abcde" at the start and ignores whatever
+    // follows. Original anchors to end-of-string.
+    expect(PERMISSION_REPLY_RE.test('y abcde hey')).toBe(false)
+    expect(PERMISSION_REPLY_RE.test('yes abcde followed by more words')).toBe(false)
+  })
+
+  test('non-whitespace prefix is rejected — kills the "\\s* → \\S*" front mutant', () => {
+    // Mutant: /^\S*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i. Under the mutant,
+    // \S* can consume leading non-whitespace characters so "xy abcde"
+    // (= \S* matches "x", then "y abcde") becomes acceptable. Original
+    // /^\s*(...)/ would fail because "xy" has no initial whitespace run
+    // followed by y|yes|n|no at position 0.
+    expect(PERMISSION_REPLY_RE.test('xy abcde')).toBe(false)
+    expect(PERMISSION_REPLY_RE.test('zyes abcde')).toBe(false)
+    // Belt-and-suspenders: leading whitespace is legit under the original
+    // \s* but rejected under the \S* mutant.
+    expect(PERMISSION_REPLY_RE.test('   y abcde')).toBe(true)
+  })
+
+  test('two spaces between verdict and code are accepted — kills the "\\s+ → \\s" mutant', () => {
+    // Mutant: /^\s*(y|yes|n|no)\s([a-km-z]{5})\s*$/i. Under the mutant
+    // only one whitespace char is consumed between verdict and code,
+    // so "y  abcde" (double-space) fails because the second space lands
+    // where [a-km-z]{5} expects a letter. Original \s+ accepts ≥1.
+    expect(PERMISSION_REPLY_RE.test('y  abcde')).toBe(true)
+    expect(PERMISSION_REPLY_RE.test('yes\tabcde')).toBe(true)
+  })
+
+  test('trailing whitespace is accepted — kills the trailing "\\s* → \\S*" mutant', () => {
+    // Mutant: /^\s*(y|yes|n|no)\s+([a-km-z]{5})\S*$/i. Under the mutant
+    // the trailing \S* rejects "y abcde  " (trailing spaces) because \S
+    // doesn't match whitespace. Original \s* accepts.
+    expect(PERMISSION_REPLY_RE.test('y abcde   ')).toBe(true)
+    expect(PERMISSION_REPLY_RE.test('no xyzwq\n')).toBe(true)
+  })
+
+  test('no whitespace between verdict and code is rejected — defense in depth', () => {
+    // Not targeting a single mutant — this is just the \s+-required
+    // invariant documented on PERMISSION_REPLY_RE. "yesabcde" must fail.
+    expect(PERMISSION_REPLY_RE.test('yesabcde')).toBe(false)
+    expect(PERMISSION_REPLY_RE.test('yabcde')).toBe(false)
+  })
+})
+
+describe('SENDABLE_BASENAME_DENY per-entry (ccsc-y4e)', () => {
+  // Every entry on the list must individually cause a block — parameterized
+  // so that a mutation to any single regex (anchor strip, charset change)
+  // shows up as this test failing for the relevant fixture name.
+  let sbRoot: string
+  let sbInbox: string
+
+  beforeAll(() => {
+    sbRoot = mkdtempSync(join(tmpdir(), 'slack-deny-basename-'))
+    sbInbox = join(sbRoot, 'inbox')
+    mkdirSync(sbInbox, { recursive: true })
+  })
+
+  afterAll(() => {
+    rmSync(sbRoot, { recursive: true, force: true })
+  })
+
+  const deniedBasenames: string[] = [
+    '.env',
+    '.env.local',
+    '.env.production',
+    '.netrc',
+    '.npmrc',
+    '.pypirc',
+    'server.pem',
+    'tls.key',
+    'id_rsa',
+    'id_ecdsa',
+    'id_ed25519',
+    'id_dsa',
+    'id_rsa.pub',
+    'id_ed25519.pub',
+    'credentials',
+    'credentials.json',
+    '.git-credentials',
+  ]
+
+  for (const name of deniedBasenames) {
+    test(`denies ${name} by basename even under an allowlisted root`, () => {
+      const p = join(sbInbox, name)
+      writeFileSync(p, 'fixture')
+      expect(() => assertSendable(p, sbInbox, [])).toThrow('Blocked')
+    })
+  }
+
+  test('a regular file with no denylist hit is accepted', () => {
+    const p = join(sbInbox, 'photo.png')
+    writeFileSync(p, 'ok')
+    expect(() => assertSendable(p, sbInbox, [])).not.toThrow()
+  })
+})
+
+describe('SENDABLE_PARENT_DENY per-entry (ccsc-y4e)', () => {
+  let spRoot: string
+  let spInbox: string
+
+  beforeAll(() => {
+    spRoot = mkdtempSync(join(tmpdir(), 'slack-deny-parent-'))
+    spInbox = join(spRoot, 'inbox')
+    mkdirSync(spInbox, { recursive: true })
+  })
+
+  afterAll(() => {
+    rmSync(spRoot, { recursive: true, force: true })
+  })
+
+  // Single-component entries: any path that descends through one of these
+  // directories must block, regardless of the basename.
+  const singleParents: string[] = ['.ssh', '.aws', '.gnupg', '.git']
+  for (const parent of singleParents) {
+    test(`denies a benign file under ${parent}/`, () => {
+      const dir = join(spRoot, parent)
+      mkdirSync(dir, { recursive: true })
+      const p = join(dir, 'benign.txt')
+      writeFileSync(p, 'fixture')
+      expect(() => assertSendable(p, spInbox, [spRoot])).toThrow('Blocked')
+    })
+  }
+
+  // Adjacent-pair entries: a path descending through .config/<pair> blocks.
+  const pairs: Array<[string, string]> = [['.config', 'gcloud'], ['.config', 'gh']]
+  for (const [a, b] of pairs) {
+    test(`denies a benign file under ${a}/${b}/`, () => {
+      const dir = join(spRoot, a, b)
+      mkdirSync(dir, { recursive: true })
+      const p = join(dir, 'settings.yaml')
+      writeFileSync(p, 'fixture')
+      expect(() => assertSendable(p, spInbox, [spRoot])).toThrow('Blocked')
+    })
+  }
+
+  test('a path through .config without a banned pair is accepted', () => {
+    // .config alone is not on SINGLE; only .config/gcloud and .config/gh
+    // are banned. A file under .config/random/ should pass.
+    const dir = join(spRoot, '.config', 'random')
+    mkdirSync(dir, { recursive: true })
+    const p = join(dir, 'app.toml')
+    writeFileSync(p, 'fixture')
+    expect(() => assertSendable(p, spInbox, [spRoot])).not.toThrow()
+  })
+})
+
+describe('isDuplicateEvent TTL boundary (ccsc-y4e)', () => {
+  test('an entry expiring exactly at now is evicted — kills the "<=" → "<" mutant', () => {
+    // Mutant: pruneExpired branch swaps `expiresAt <= now` for `expiresAt < now`.
+    // Under the mutant, an entry whose expiresAt ties the current clock
+    // tick is RETAINED instead of evicted. We construct exactly that
+    // boundary: an entry with expiresAt === now. After a call to
+    // isDuplicateEvent, the original evicts the entry; the mutant doesn't.
+    const seen = new Map<string, number>()
+    seen.set('C_STALE:1.0', 1000) // expires at exactly now
+    // Call with an unrelated event key so we don't add noise.
+    isDuplicateEvent({ channel: 'C_FRESH', ts: '2.0' }, seen, 1000, 60_000)
+    expect(seen.has('C_STALE:1.0')).toBe(false)
+  })
+
+  test('an entry that has not yet expired is retained', () => {
+    // Sanity-anchor: expiresAt strictly greater than now must not be
+    // evicted. A mutant that flips the comparator to `>=` or `>` would
+    // evict live entries; this kills those mutants too.
+    const seen = new Map<string, number>()
+    seen.set('C_LIVE:1.0', 2000) // expires later than now (1000)
+    isDuplicateEvent({ channel: 'C_OTHER', ts: '2.0' }, seen, 1000, 60_000)
+    expect(seen.has('C_LIVE:1.0')).toBe(true)
+  })
+})
+
+describe('buildAndPostAuditReceipt unfurl flags (ccsc-y4e)', () => {
+  const baseChannel: ChannelPolicy = { requireMention: false, allowFrom: [] }
+
+  test('compact mode disables link + media unfurls — kills the "false → true" mutants', async () => {
+    // Mutant: `unfurl_links: false` → `unfurl_links: true` (and same for
+    // unfurl_media). The literal-type `false` on AuditReceiptPostArgs
+    // would catch this at typecheck, but Stryker skips the checker, so
+    // the mutation survives at runtime unless a test explicitly pins
+    // the flags. That's what this does.
+    const calls: AuditReceiptPostArgs[] = []
+    await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
+      'C_Y4E', 'T_Y4E', 'Bash',
+      { ...baseChannel, audit: 'compact' },
+      () => { throw new Error('onError should not fire on success') },
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.unfurl_links).toBe(false)
+    expect(calls[0]!.unfurl_media).toBe(false)
+  })
+
+  test('full mode disables link + media unfurls — kills the "false → true" mutants', async () => {
+    const calls: AuditReceiptPostArgs[] = []
+    await buildAndPostAuditReceipt(
+      async (args) => { calls.push(args); return { ok: true, ts: '2.002' } },
+      'C_Y4E', 'T_Y4E', 'Write',
+      { ...baseChannel, audit: 'full' },
+      () => { throw new Error('onError should not fire on success') },
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.unfurl_links).toBe(false)
+    expect(calls[0]!.unfurl_media).toBe(false)
+  })
+})
