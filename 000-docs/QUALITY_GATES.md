@@ -13,8 +13,8 @@ One row per Quality Gate category × per primary language (TypeScript, Bun runti
 | 5 | **Performance / load** | — | ⚪ N/A — single-process Socket Mode client, Slack rate limits are the ceiling | — | — | — |
 | 6 | **Mutation testing** | Stryker | 🔜 Baseline in parallel PR `feat(test): mutation testing setup` | `bun add -D @stryker-mutator/core` | manual per epic, not per-PR (CI-expensive) | P1 (parallel) |
 | 7a | **Types** | `tsc --strict --noEmit` | 🟢 Strict mode, required in CI | (built in) | `bun run typecheck` required | — |
-| 7b | **Lint** | — | 🔴 None configured. Biome installed dev-wide, not wired in repo. `bunx biome check .` shows 31 errors + 85 warnings + 133 infos (mostly style) | `bunx @biomejs/biome init` | would add as required step in `ci.yml` | P2 (Jeremy's call — see "Adopt Biome" bead) |
-| 7c | **Format** | — | 🔴 None. Biome would lint+format in one tool if §7b adopts it. | same as §7b | same as §7b | P2 (paired with §7b) |
+| 7b | **Lint** | Biome (initial, curated rules) | 🔴 → 🟡 `ccsc-dz8` lands Biome with a curated rule set known already passing: `correctness/noConstAssign`, `correctness/noUnreachable(Super)`, `correctness/noInvalidConstructorSuper`, `correctness/noGlobalObjectCalls`, `security/noGlobalEval`, `suspicious/noDebugger`, `suspicious/noFocusedTests`, `suspicious/noSkippedTests`, `suspicious/noDuplicate(Parameters\|Case)`, `suspicious/noConstEnum`, `complexity/noExtraBooleanCast`, `complexity/noUselessConstructor`. `recommended: false` as the baseline — tightening is opt-in per rule cluster. Formatter deliberately disabled for this initial PR (see §7c). | `bun add -D @biomejs/biome` (devDep) | `bunx @biomejs/biome check .` as a required CI step | — |
+| 7c | **Format** | Biome formatter | 🔴 → 🟡 Installed but `formatter.enabled: false` in `biome.json` for the initial adoption because enabling it produces a 16-file formatter diff that is out of scope for the first PR. Follow-up bd tracks turning the formatter on and running the one-time reformat pass. | same as §7b | paired with §7b once the reformat lands | — |
 | 7d | **Architecture** | `dependency-cruiser` | 🟡 → 🟢 Regex test in `server.test.ts` enforces 31-A.4. Parallel PR `feat(arch): formalize 31-A.4 invariant` adds formal `.dependency-cruiser.js` config. | `bun add -D dependency-cruiser` (in the Phase D PR) | new `depcruise` step in `ci.yml` (Phase D PR) | P1 (parallel) |
 | 8 | **Pre-commit** | lefthook / husky | 🔴 None; CI covers | `bun add -D lefthook` + `lefthook install` | local only | P3 (optional — CI is the authoritative gate) |
 | 8b | **CI depth** | GitHub Actions | 🟢 Typecheck (required), test, CodeQL, Gemini review, Scorecard, notify-marketplace | (existing) | `.github/workflows/*` | — |
@@ -42,7 +42,7 @@ One row per Quality Gate category × per primary language (TypeScript, Bun runti
 - Architecture rule formalization (Phase D PR)
 
 **P2 (filed as beads for Jeremy's call):**
-- §7b/§7c Adopt Biome repo-wide — biggest single improvement in static analysis coverage (bd `ccsc-dz8`)
+- ~~§7b Adopt Biome lint~~ — **shipped in `ccsc-dz8`** with a curated rule set; tightening tracked as follow-up bds
 - ~~§9c Wire gitleaks as a PR gate~~ — **shipped in `ccsc-bsz`**, see §9c above
 - ~~§9d Configure a Bun security scanner~~ — **shipped in `ccsc-8g6` via native `bun audit`**, see §9d above
 

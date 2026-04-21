@@ -27,6 +27,17 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Biome lint (Wall 7b — static analysis)
+        # Initial adoption with a curated rule set known to already pass on
+        # the repo: correctness (noConstAssign, noUnreachable, etc.), security
+        # (noGlobalEval), suspicious (noDebugger, noFocusedTests/noSkippedTests
+        # — catches .skip/.only regressions alongside the existing grep-based
+        # check), and complexity (noExtraBooleanCast, noUselessConstructor).
+        # Formatter is disabled to keep this PR a no-op on existing style.
+        # Tightening to recommended + specific style rules is tracked in
+        # follow-up bds (see 000-docs/QUALITY_GATES.md §7b for the roadmap).
+        run: bunx @biomejs/biome check .
+
       - name: Test
         run: bun test
 

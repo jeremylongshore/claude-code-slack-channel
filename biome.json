@@ -1,0 +1,60 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.12/schema.json",
+  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+  "files": {
+    "includes": [
+      "lib.ts",
+      "server.ts",
+      "policy.ts",
+      "journal.ts",
+      "manifest.ts",
+      "supervisor.ts",
+      "server.test.ts",
+      "features/**/*.ts",
+      "scripts/**/*.ts",
+      "!**/node_modules/**",
+      "!**/reports/**",
+      "!**/coverage/**",
+      "!**/.stryker-tmp/**"
+    ]
+  },
+  "formatter": {
+    "enabled": false
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "suspicious": {
+        "noDebugger": "error",
+        "noFocusedTests": "error",
+        "noSkippedTests": "error",
+        "noDuplicateParameters": "error",
+        "noDuplicateCase": "error",
+        "noConstEnum": "error"
+      },
+      "correctness": {
+        "noUnreachable": "error",
+        "noUnreachableSuper": "error",
+        "noConstAssign": "error",
+        "noInvalidConstructorSuper": "error",
+        "noGlobalObjectCalls": "error"
+      },
+      "security": {
+        "noGlobalEval": "error"
+      },
+      "complexity": {
+        "noExtraBooleanCast": "error",
+        "noUselessConstructor": "error"
+      }
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "off"
+      }
+    }
+  }
+}
