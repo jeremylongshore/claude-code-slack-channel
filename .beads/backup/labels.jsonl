@@ -38,6 +38,8 @@
 {"issue_id":"ccsc-19k","label":"release:v0.5.1"}
 {"issue_id":"ccsc-1gk","label":"phase:p0-prereq"}
 {"issue_id":"ccsc-1gk","label":"release:v0.5.0"}
+{"issue_id":"ccsc-363","label":"test-infra"}
+{"issue_id":"ccsc-363","label":"wall5"}
 {"issue_id":"ccsc-3fo","label":"release:v0.5.1"}
 {"issue_id":"ccsc-4an","label":"release:v0.6.0"}
 {"issue_id":"ccsc-4nm","label":"release:v0.7.x"}
@@ -194,6 +196,7 @@
 {"issue_id":"ccsc-npd","label":"release:v0.6.0"}
 {"issue_id":"ccsc-p26","label":"release:v0.5.1"}
 {"issue_id":"ccsc-rc1","label":"release:v0.6.1"}
+{"issue_id":"ccsc-rrj","label":"test-infra"}
 {"issue_id":"ccsc-s10","label":"audit-integrity"}
 {"issue_id":"ccsc-s53","label":"issue:#31"}
 {"issue_id":"ccsc-s53","label":"release:v0.7.0"}
