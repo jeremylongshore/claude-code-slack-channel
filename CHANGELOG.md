@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Deep `/audit-tests` pass** with deterministic evidence per Wall (`ccsc-ao9`). Rewrites `000-docs/TEST_AUDIT.md` with numbers verified against real tool output (594 tests, not the previously-claimed 549; 181 `.toThrow()` not 104; 2.28 assertion density not 2.47). Adds `000-docs/QUALITY_GATES.md` — the Step 5.5 Quality-Gate-Sweep artifact the prior audit skipped.
+- **`scripts/coverage-floor.sh`** — parses `bun test --coverage` output and fails CI if line or function coverage drops below 95%. Bun 1.2.23 does not enforce `coverageThreshold` via `bunfig.toml`, so we gate on stdout instead.
+- **CI step: Coverage floor (≥95%)** — wired after the existing `Test` step in `.github/workflows/ci.yml`. Current coverage is 98.37% line / 98.75% function; the 95% floor gives ~3 points of headroom for feature PRs with staged tests.
+
+### Fixed
+
+- **Flaky `verifyJournal 1000-event chain` test** (`ccsc-80e`) — per-test timeout bumped to 15 s via the bun:test 3rd-arg signature. The test runs in ~3 s in isolation but can exceed bun's default 5 s timeout under I/O contention when the full 594-test suite competes for disk.
+
 ## [0.7.0] - 2026-04-19
 
 ### Added

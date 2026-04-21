@@ -29,3 +29,6 @@ jobs:
 
       - name: Test
         run: bun test
+
+      - name: Coverage floor (≥95% line + function)
+        run: bash scripts/coverage-floor.sh 95
