@@ -57,3 +57,11 @@ jobs:
         # is a high-severity path-to-regexp finding inside @modelcontextprotocol/sdk
         # — unfixable from our side until the SDK ships an updated transitive.
         run: bun audit --audit-level=high --ignore=GHSA-j3q9-mxjg-w52f
+
+      - name: Cyclomatic complexity (Wall 5 — regression gate)
+        # TS-aware AST walker over production sources. Threshold set to 85 — the
+        # baseline ceiling observed on main (server.ts has one 84-complexity
+        # anonymous function). Prevents worsening; a follow-up bd tracks
+        # refactoring the four functions currently over the Wall 5 ideal (30)
+        # and tightening this threshold once that lands.
+        run: bun scripts/crap-score.ts --threshold 85
