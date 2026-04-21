@@ -18,11 +18,13 @@ This pass differs from the prior revision in that every Wall is backed by determ
 
 Coverage is 98.37% lines / 98.75% functions across `lib.ts`, `policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`. Zero `.skip`/`.only`/`.todo`. Bias rate: 1.37% `toBeDefined`/100 tests = LOW per the skill's grading. Escape-scan across the last 100 commits: REFUSE=0, CHALLENGE=0, FLAG=0. dependency-cruiser on the default ruleset: 0 violations across 2197 modules and 4054 dependencies. TruffleHog: 0 verified secrets (69 unverified, all in `node_modules/zod` test fixtures upstream — not our code).
 
+**Stryker baseline** (Phase E, now landed): **79.85% mutation score** on `lib.ts` (725 killed, 4 timed out, 184 survived of 913 mutants; 20 min 49 s runtime). Just under the `high` threshold (80%); no CI break wired. Top survivor cluster is on `PERMISSION_REPLY_RE` at `lib.ts:38` (5 anchor mutants survived) and the `SENDABLE_*_DENY` secret lists at `lib.ts:691–717` — security-critical surfaces that warrant a targeted test-strengthening pass. Full breakdown in [`000-docs/MUTATION_REPORT.md`](MUTATION_REPORT.md).
+
 **No P0 findings.** Real improvements are:
 1. Flaky `verifyJournal 1000-event chain` test — fix in this PR (timeout bump).
 2. Coverage floor in CI — adding parser-based enforcement in this PR (Bun 1.2.23 does not enforce `coverageThreshold` via bunfig; we parse text output instead).
-3. Formalize 31-A.4 as a `dependency-cruiser` rule alongside the existing regex test — parallel PR (`feat(arch): formalize 31-A.4 invariant`).
-4. Baseline mutation score via Stryker — parallel PR (`feat(test): mutation testing setup`).
+3. Formalize 31-A.4 as a `dependency-cruiser` rule alongside the existing regex test — landed as PR #126.
+4. Baseline mutation score via Stryker — landed as PR #128. 79.85% on `lib.ts`.
 
 Improvements that need Jeremy's call are filed as separate beads, not snuck into this audit's scope (Biome adoption, Stryker CI integration, pre-commit hooks).
 
@@ -37,7 +39,7 @@ All evidence paths are under `/tmp/audit-run-1776735120/` from the run that auth
 | 1 | Acceptance (Gherkin) | ⚪ N/A | No `features/` dir; the `000-docs/*.md` design docs serve as the acceptance-level contracts for this project. Skill permits this. |
 | 2 | Unit tests | ✅ Pass | `wall2-test.txt` → `594 pass · 0 fail · 1355 expect() calls · 3.65s` |
 | 3 | Coverage floor | 🟡 → 🟢 | `wall3-coverage.txt` → 98.37% line / 98.75% func. Floor added in this PR via `scripts/coverage-floor.sh` (see Phase C). |
-| 4 | Mutation kill-rate | ⚪ → 🔜 | Deferred to parallel PR (Phase E). Skill script runs as subagent in worktree. |
+| 4 | Mutation kill-rate | 🟢 Baseline | **79.85%** on `lib.ts` (PR #128, `stryker.conf.mjs`). 725 killed · 184 survived · 4 timed out of 913 mutants. Not wired into CI (~20 min per-PR cost). Full report in [`MUTATION_REPORT.md`](MUTATION_REPORT.md). Follow-up bead `ccsc-0mn` tracks CI integration after baseline stabilizes over 3 runs. |
 | 5 | CRAP (production) | ✅ Proxy | `complexity-proxy.txt`: per-file cyclomatic proxy 6.9–15.5 (branches+1 per func). Even with 98% cov → CRAP ≈ complexity, well under the 30 threshold. Full CRAP would need a TS-aware complexity tool; the skill's `crap-score.py` uses `complexity-report` which doesn't parse modern TS. |
 | 6 | CRAP (test) | ✅ Proxy | Same mechanism. Test code is straight-line `describe/test` — no deep nesting, no recursion. |
 | 7 | Architecture rules | ✅ + 🔜 | `wall7-arch.txt` → `arch-check.sh` reports `tool=none status=not-configured`. `depcruise-noconfig.txt` → 0 violations on default rules, 2197 modules / 4054 deps. 31-A.4 invariant remains enforced via the existing import-graph test in `server.test.ts`. Parallel PR (Phase D) adds `.dependency-cruiser.js` with the 31-A.4 rule as a second gate. |
