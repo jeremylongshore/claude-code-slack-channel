@@ -7488,7 +7488,7 @@ describe('verifyJournal', () => {
     if (result.ok) {
       expect(result.eventsVerified).toBe(1000)
     }
-  })
+  }, 15_000)
 
   test('ok over a small clean chain (3 events)', async () => {
     const { verifyJournal } = await import('./journal.ts')

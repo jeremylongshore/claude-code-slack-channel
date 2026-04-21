@@ -1,33 +1,53 @@
-# Test Audit — Post-Epic-31 Health Check
+# Test Audit — Deep Pass, Post-Epic-31 Health Check
 
-**Date:** 2026-04-20
-**Commit at audit:** `2f5751d` (head of main, all Epic 31 work merged)
-**Triggered by:** `/audit-tests` after session closed issue #31 (bot-manifest protocol)
-**Bead:** `ccsc-n8e`
+**Date:** 2026-04-20 (deep pass, supersedes the 2026-04-20 shallow pass)
+**Commit at audit:** `57a1821` (head of main after PR #125)
+**Triggered by:** `/audit-tests` — deep methodology run, superseding the shallow surface pass that produced the previous revision of this file
+**Bead:** `ccsc-ao9` (this pass) · supersedes closed `ccsc-n8e`
+
+This pass differs from the prior revision in that every Wall is backed by deterministic tool output captured under `/tmp/audit-run-1776735120/`, not by narrative. Where a tool could not run cleanly (skill script bugs, TS-awareness gaps), this doc says so explicitly and documents the workaround used.
 
 ---
 
 ## TL;DR
 
-**Suite is in excellent health.** 594 tests, 98.4% line / 98.8% function coverage, 0 skips/only/todo, healthy assertion density (2.47 expect/test), 104 negative-path `.toThrow()` assertions. Strict TypeScript, typecheck-required CI, CodeQL SAST, OpenSSF Scorecard. Architecture-level invariants (31-A.4) enforced in-repo via import-graph test.
+**Suite is in excellent health, with two corrections to the prior numbers:**
+- Tests: **594** pass (the earlier doc said 549; the correct count is 594)
+- `.toThrow()`: **181** (earlier doc said 104; correct is 181 — includes `.not.toThrow()` positive-case checks)
+- Assertion density: **2.28** expect/test (earlier doc's 2.47 was based on the wrong test denominator)
 
-**No P0 findings.** Real gaps exist (no linter, no mutation testing, no formal architecture tooling) but they're "mature-project polish," not correctness bugs. Flaky test is tracked (`ccsc-80e`).
+Coverage is 98.37% lines / 98.75% functions across `lib.ts`, `policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`. Zero `.skip`/`.only`/`.todo`. Bias rate: 1.37% `toBeDefined`/100 tests = LOW per the skill's grading. Escape-scan across the last 100 commits: REFUSE=0, CHALLENGE=0, FLAG=0. dependency-cruiser on the default ruleset: 0 violations across 2197 modules and 4054 dependencies. TruffleHog: 0 verified secrets (69 unverified, all in `node_modules/zod` test fixtures upstream — not our code).
 
-**Recommendation:** Ship as-is. If Jeremy wants to invest in hardening, the highest-leverage next step is either (a) wire bun's built-in coverage into CI with a floor, or (b) add a formal architecture checker (dependency-cruiser) to make the 31-A.4 invariant type-level in addition to the existing ad-hoc test. Everything else is incremental.
+**No P0 findings.** Real improvements are:
+1. Flaky `verifyJournal 1000-event chain` test — fix in this PR (timeout bump).
+2. Coverage floor in CI — adding parser-based enforcement in this PR (Bun 1.2.23 does not enforce `coverageThreshold` via bunfig; we parse text output instead).
+3. Formalize 31-A.4 as a `dependency-cruiser` rule alongside the existing regex test — parallel PR (`feat(arch): formalize 31-A.4 invariant`).
+4. Baseline mutation score via Stryker — parallel PR (`feat(test): mutation testing setup`).
+
+Improvements that need Jeremy's call are filed as separate beads, not snuck into this audit's scope (Biome adoption, Stryker CI integration, pre-commit hooks).
 
 ---
 
-## Seven Walls scorecard
+## Seven Walls scorecard (deterministic evidence)
+
+All evidence paths are under `/tmp/audit-run-1776735120/` from the run that authored this doc.
 
 | # | Wall | Status | Evidence |
 |---|------|--------|----------|
-| 1 | Acceptance (Gherkin) | ⚪ Not installed | Single-file `bun:test`; no `features/` dir |
-| 2 | Unit tests | ✅ Pass | 594/594, 0 skips, 0 only, 0 todo, 0 failures |
-| 3 | Coverage floor | 🟡 Measured, not enforced | `bun test --coverage` reports 98.4% lines / 98.8% funcs; no CI gate |
-| 4 | Mutation kill-rate | ⚪ Not installed | No Stryker config; assertion density (2.47/test) suggests tests would kill mutants |
-| 5 | CRAP on production code | ⚪ Not measured | No radon/complexity-report configured |
-| 6 | CRAP on test code | ⚪ Not measured | Same |
-| 7 | Architecture rules | 🟢 Ad-hoc | 31-A.4 invariant enforced via import-graph test in `server.test.ts`; no formal dependency-cruiser |
+| 1 | Acceptance (Gherkin) | ⚪ N/A | No `features/` dir; the `000-docs/*.md` design docs serve as the acceptance-level contracts for this project. Skill permits this. |
+| 2 | Unit tests | ✅ Pass | `wall2-test.txt` → `594 pass · 0 fail · 1355 expect() calls · 3.65s` |
+| 3 | Coverage floor | 🟡 → 🟢 | `wall3-coverage.txt` → 98.37% line / 98.75% func. Floor added in this PR via `scripts/coverage-floor.sh` (see Phase C). |
+| 4 | Mutation kill-rate | ⚪ → 🔜 | Deferred to parallel PR (Phase E). Skill script runs as subagent in worktree. |
+| 5 | CRAP (production) | ✅ Proxy | `complexity-proxy.txt`: per-file cyclomatic proxy 6.9–15.5 (branches+1 per func). Even with 98% cov → CRAP ≈ complexity, well under the 30 threshold. Full CRAP would need a TS-aware complexity tool; the skill's `crap-score.py` uses `complexity-report` which doesn't parse modern TS. |
+| 6 | CRAP (test) | ✅ Proxy | Same mechanism. Test code is straight-line `describe/test` — no deep nesting, no recursion. |
+| 7 | Architecture rules | ✅ + 🔜 | `wall7-arch.txt` → `arch-check.sh` reports `tool=none status=not-configured`. `depcruise-noconfig.txt` → 0 violations on default rules, 2197 modules / 4054 deps. 31-A.4 invariant remains enforced via the existing import-graph test in `server.test.ts`. Parallel PR (Phase D) adds `.dependency-cruiser.js` with the 31-A.4 rule as a second gate. |
+
+Escape scan (Wall-level cross-cutting check):
+```
+$ bash /home/jeremy/.claude/skills/audit-tests/scripts/escape-scan.sh --range HEAD~100..HEAD
+escape-scan: REFUSE=0 CHALLENGE=0 FLAG=0
+```
+No bypasses, no disabled tests, no neutered assertions in the last 100 commits.
 
 ---
 
@@ -35,142 +55,175 @@
 
 ### Volume
 
-| Metric | Value |
-|---|---|
-| Test file | `server.test.ts` (single file, 9299 LoC) |
-| Production LoC | 7620 (journal + lib + manifest + policy + server + supervisor) |
-| Test:code ratio | ~1.22:1 |
-| Describe blocks | 75 |
-| Individual tests | 549 |
-| Tests per describe | 7.3 average (healthy spread) |
-| `expect()` calls | 1355 |
-| Assertions per test | **2.47** (>2 threshold for "tested beyond smoke") |
-| Negative-path `.toThrow()` | 104 |
-| Runtime | 3–5s on dev server |
+| Metric | Value | Source |
+|---|---|---|
+| Test file | `server.test.ts` | `wc -l` → 9299 LoC |
+| Production LoC | 7620 (`lib` 1770 + `policy` 605 + `manifest` 582 + `journal` 1103 + `supervisor` 1008 + `server` 2552) | `loc-counts.txt` |
+| Test:code ratio | 1.22:1 | computed |
+| Top-level `describe`/`test`/`it` | 75 | `grep -cE '^(describe\|test\|it)\('` |
+| Indented test leaves | 582 | `grep -cE '^\s+(test\|it)\('` |
+| **Total tests passing** | **594** | bun:test runner |
+| `expect()` calls | **1355** | bun:test runner |
+| **Assertion density** | **2.28** per test | 1355 / 594 |
+| `.toThrow(` occurrences | **181** | Grep on `.toThrow\(` |
+| `.not.toThrow(` subset | 42 | Grep on `.not.toThrow\(` |
+| Pure `.toThrow(` (negative path) | 139 | 181 − 42 |
+| `.skip` / `.only` / `.todo` | **0** | Grep on `\.(skip\|only\|todo)\(` |
+| `@ts-expect-error` / `@ts-ignore` | 2 | Grep — both are intentional (31-A.9 compile-time guard) |
 
-### Coverage (via `bun test --coverage`)
+### Coverage
 
-| File | Funcs | Lines | Uncovered lines |
+From `bun test --coverage` (`wall3-coverage.txt`):
+
+| File | % Funcs | % Lines | Uncovered lines |
 |---|---|---|---|
-| `journal.ts` | 100% | 100% | — |
-| `lib.ts` | 100% | 98.52% | 9 lines — mostly defensive `catch {}` on path validation |
-| `manifest.ts` | 100% | 100% | — ✨ new module, perfect |
-| `policy.ts` | 93.75% | 93.33% | 17 lines — `parsePolicyRule` entry, `matchSubsetOrEqual` early-return branches |
-| `supervisor.ts` | 100% | 100% | — |
-| **All files** | **98.75%** | **98.37%** | |
+| `journal.ts` | 100.00 | 100.00 | — |
+| `lib.ts` | 100.00 | 98.52 | 409, 417, 463, 471, 479, 818, 847, 862, 901 |
+| `manifest.ts` | 100.00 | 100.00 | — |
+| `policy.ts` | 93.75 | 93.33 | 143, 385, 435, 487, 489–494, 498–501 |
+| `supervisor.ts` | 100.00 | 100.00 | — |
+| **All files** | **98.75** | **98.37** | |
 
-`server.ts` is deliberately not imported into tests (top-level side effects: `loadEnv`, `mkdirSync`, Slack client init). Its handler logic is exercised via the pure helpers in lib/policy/manifest, which carry full coverage. This is a known and reasonable architecture.
+`server.ts` is deliberately not imported into tests (top-level side effects: `loadEnv`, `mkdirSync`, Slack client init). Its handler logic is exercised via the pure helpers in lib/policy/manifest/journal/supervisor.
 
-### Zero-escape posture
-
-| Pattern | Count |
-|---|---|
-| `.skip(...)` | 0 |
-| `.only(...)` | 0 |
-| `.todo(...)` | 0 |
-| `// @ts-expect-error` | 1 (intentional, part of the 31-A.9 compile-time guard) |
-| `// @ts-ignore` | 0 |
+The 17 uncovered lines in `policy.ts` are concentrated in the `parsePolicyRule` JSON-error paths and `matchSubsetOrEqual` early-return branches — defensive code that requires malformed JSON fixtures to exercise.
 
 ---
 
 ## Bias audit
 
-Scanned for the seven bias patterns from Clean Craftsmanship:
+Ran the skill's `bias-count.sh` on a staging directory containing only `server.test.ts`. The skill script exits early with `set -euo pipefail` when `grep -rn … | wc -l` returns 0 matches (pipefail propagates grep's "no-match" exit 1). Ran a manual equivalent (`bias-manual.txt`) to get the complete pattern count:
 
 | Pattern | Count | Verdict |
 |---|---|---|
-| Tautological (`expect(x).toBe(x)`) | 0 | ✅ |
-| Weak self-validation (`toBeDefined()` / `toBeTruthy()` / `toBeFalsy()`) | 10 | 🟢 Acceptable — 1.8% of tests, all are null-guards before drilling into the object with stronger assertions |
-| Smoke-only (single-assertion tests with no negative case) | Not flagged | Assertion density 2.47/test suggests not a pattern |
-| Identity misuse (symmetric/circular input) | 0 | ✅ |
-| Mutation-insensitive (no mutation tooling to quantify) | — | Install Stryker to measure (future work) |
+| Tautological (`toBe(\1)` backreference) | 0 | ✅ |
+| Smoke-only `.toBeDefined()` | 8 | 🟢 1.37%, LOW grade per skill |
+| Low-signal `.toBe(true)` | 29 | 🟡 4.9% — spot-check shows most wrap semantic predicates (`isOwner`, `isAuthorized`); not bias |
+| Positive-only `.not.toThrow()` | 42 | 🟢 mirrored by 139 real `.toThrow()` — suite is well-balanced pos/neg |
+| Range-only (`assert.*<=.*<=`) | 0 | ✅ |
+| Symmetric input `(0, 0)` / `(1, 1)` | 0 / 0 | ✅ |
+| Skipped (`.skip/.only/.todo`) | 0 | ✅ |
 
-Spot-checked all 10 `toBeDefined`/`toBeTruthy` usages — each is followed by stronger field-level assertions on the same object (e.g. `expect(result.access).toBeDefined()` → `expect(result.code).toBe('ABCD1234')`). These are standard "null-guard + drill down" patterns, not bias.
+**Bias rate** (toBeDefined per 100 tests) = **1.37** → **LOW**, per the skill script's grading (≤5 = LOW, no action).
 
-**Secret-shaped fixtures**: 18 matches for `xoxb-` / `xapp-` / `ghp_` patterns in tests. All are deliberately string-concatenated test fixtures for the journal redactor (`'xoxb-' + 'A'.repeat(40)`) — a proven technique to prevent gitleaks false positives on committed test data.
+**Filed upstream issue candidate:** `bias-count.sh` should either use `grep … || true` in its `count_pattern` function, or drop `pipefail`, or swap to `grep -c` (which returns 0 and prints 0 on no-match). Documenting here; not filing against the skill repo from this project.
+
+### Secret-shaped test fixtures
+
+18 matches for `xoxb-` / `xapp-` / `ghp_` patterns in `server.test.ts`. All are string-concatenated fixtures for the journal redactor (`'xoxb-' + 'A'.repeat(40)`) — the standard gitleaks-false-positive avoidance. TruffleHog across the working tree (`trufflehog.txt`) reports 0 verified secrets; 69 unverified all in `node_modules/zod/src/v4/classic/tests/template-literal.test.ts` (upstream test data).
+
+---
+
+## Cyclomatic complexity proxy (CRAP input)
+
+The skill's `crap-score.py` requires `complexity-report` (an older JS-only tool that doesn't parse modern TypeScript). ESLint's `complexity` rule needs the `@typescript-eslint/parser` installed. Neither is wired in this repo.
+
+Used a regex-based proxy (`complexity-proxy.txt`) counting `if/else if/while/for/case/catch/&&/||/?:` per function:
+
+| File | Lines | Funcs≈ | Branches | Branches/func | Mean cyclomatic ≈ |
+|---|---|---|---|---|---|
+| `lib.ts` | 1770 | 38 | 248 | 6.5 | 7.5 |
+| `policy.ts` | 605 | 14 | 82 | 5.9 | 6.9 |
+| `manifest.ts` | 582 | 8 | 63 | 7.9 | 8.9 |
+| `journal.ts` | 1103 | 17 | 148 | 8.7 | 9.7 |
+| `supervisor.ts` | 1008 | 12 | 121 | 10.1 | 11.1 |
+| `server.ts` | 2552 | 22 | 319 | 14.5 | 15.5 |
+
+With ≥98% coverage, CRAP ≈ complexity (the (1-cov)³ factor drops the branch-risk term to near zero). Mean-per-file cyclomatic proxy ranges 6.9 (policy.ts) to 15.5 (server.ts) — well under the Wall 5 threshold of 30 (production) and Wall 6 of 15 (test). Server's higher number reflects boot-time wiring, not algorithmic complexity.
+
+A proper TS-aware complexity run would need `typhonjs-escomplex` or `@typescript-eslint/parser` wired in. Filed as a future bd (Biome adoption, which includes complexity rules).
+
+---
+
+## Static analysis snapshot (Biome, unconfigured)
+
+Ran `bunx @biomejs/biome check .` with no config (`biome-summary.txt`, `biome.txt`). Biome is installed on the dev machine but not configured for this repo. Across 22 files: 31 errors, 85 warnings, 133 infos.
+
+**Top rules triggered** (from `biome-summary.txt`):
+
+| Rule | Count | Severity |
+|---|---|---|
+| `lint/style/useLiteralKeys` | 76 | info |
+| `lint/style/noNonNullAssertion` | 66 | warn |
+| `lint/style/useTemplate` | 32 | info |
+| `lint/style/useNodejsImportProtocol` | 22 | info (requires `node:fs` not `fs`) |
+| `lint/suspicious/noExplicitAny` | 15 | warn |
+| `assist/source/organizeImports` | 6 | error |
+| `lint/suspicious/noControlCharactersInRegex` | 2 | error |
+| `lint/suspicious/noAssignInExpressions` | 1 | error |
+
+Nothing in this list changes the security or correctness of the code — they are style and formatting signals Biome would enforce if adopted. Whether to adopt Biome as the project standard is Jeremy's call; filed as a separate bd (not in this PR).
+
+---
+
+## Security snapshot
+
+| Tool | Ran | Findings |
+|---|---|---|
+| TruffleHog (filesystem) | ✅ | 0 verified, 69 unverified in `node_modules/zod` upstream test data — `trufflehog.txt` |
+| `bun pm scan` | ⚪ Not configured | Requires `[install.security] scanner = "..."` in bunfig; deferred (see QUALITY_GATES.md §9) |
+| `npm audit` | ⚪ N/A | No `package-lock.json` in a Bun project; `bun.lock` is not readable by `npm audit` |
+| Semgrep / Gitleaks | ⚪ Skipped | Would need `pipx install` / user-level install; CodeQL in CI already provides SAST. Added to QUALITY_GATES.md §9 as the installable alternatives. |
+| CodeQL (CI) | 🟢 In CI | `.github/workflows/codeql.yml` active |
+| OpenSSF Scorecard | 🟢 In CI | `.github/workflows/scorecard.yml` active |
 
 ---
 
 ## Known follow-ups already tracked
 
-- **`ccsc-80e` (P2 bug)** — `verifyJournal 1000-event chain` test can flake at bun's 5000 ms default timeout under I/O contention. Isolation runtime is ~3 s; the test times out at ~5 s only when the full 594-test suite competes for disk. Fix: bump per-test timeout to 10 s or batch the writes. Filed during the session that shipped Epic 31-A.
+- **`ccsc-80e` (P2 bug)** — `verifyJournal 1000-event chain` test can exceed bun's default 5000 ms under I/O contention. **Fixed in this PR**: per-test timeout bumped to 15 s.
 
 ---
 
-## Gaps (ranked by leverage-per-hour)
+## Gaps addressed by this PR
 
-### 🟡 P2 — real mature-project polish, not correctness-critical
+| # | Gap | Fix |
+|---|---|---|
+| 1 | Flaky `verifyJournal` test | Bump `{ timeout: 15_000 }` on the single test |
+| 2 | No CI coverage floor | Add `scripts/coverage-floor.sh` + CI step (`bun test --coverage` → parse All-files line → fail if < 95%); required because Bun 1.2.23 does not enforce `coverageThreshold` in `bunfig.toml` |
+| 3 | Shallow audit doc | This file (and `QUALITY_GATES.md`) — deterministic evidence per wall |
 
-1. **Coverage floor in CI** (30 min to implement)
-   The coverage is already 98.4% lines; adding `bun test --coverage --coverage-threshold=95` to CI pins the floor so a future PR can't silently erode it. Low risk, high leverage.
+## Gaps dispatched to parallel subagent PRs
 
-2. **`dependency-cruiser` for Wall 7** (2–3 hours)
-   The 31-A.4 invariant ("`policy.ts` never imports the manifest module") is currently enforced by an ad-hoc regex test on import specifiers. A formal checker would:
-   - Catch transitive imports (today's test only checks direct).
-   - Give us a single artifact that documents the full architecture rule-set.
-   - Run faster than string-regex.
-   Migrate the existing test to a `.dependency-cruiser.js` rule + keep the string-regex as a belt-and-suspenders backup.
+| # | Gap | Parallel PR |
+|---|---|---|
+| D | 31-A.4 not formalized as a depcruise rule | `feat(arch): formalize 31-A.4 invariant via dependency-cruiser` |
+| E | No baseline mutation score | `feat(test): mutation testing setup with one-time baseline score` |
 
-3. **Flaky-test fix** (`ccsc-80e`, 10 min)
-   Bump timeout on the `verifyJournal 1000-event chain` test.
+## Gaps filed as beads for Jeremy's call (not in this PR)
 
-### 🟢 P3 — nice-to-have, diminishing returns
-
-4. **ESLint or Biome** (1–2 hours)
-   TypeScript strict mode catches ~80% of what a linter would. A linter would add: unused-var removal, consistent-style enforcement, a few security lints (no-eval, no-unsafe-regex). Given the project is four files of production TS, the ratio of value-to-config-overhead is modest.
-
-5. **Prettier** (30 min)
-   Same story as ESLint. The code is already consistently formatted by convention. Adding Prettier would enforce it mechanically but the return is small on a small codebase.
-
-6. **Mutation testing via Stryker** (4–6 hours initial + ongoing)
-   With 98% coverage and 2.47 assertions/test, the mutation score would almost certainly be in the 70–85% range. Running Stryker once to measure would be valuable as a data point; running it on every CI run is expensive (multiplies CI time by ~20×). Recommend: run manually once per epic, not in CI.
-
-7. **Husky / lefthook pre-commit hooks** (1 hour)
-   For local typecheck + test on commit. CI already enforces. Main value is the faster feedback loop.
-
-8. **CRAP / complexity tooling** (2–3 hours)
-   `radon`-equivalent for TypeScript. With 7620 LoC in well-factored modules (lib, policy, manifest as pure-function libraries + journal/supervisor/server as stateful), complexity is not an observable problem. The team would need to agree on thresholds first, which is more of a values conversation than a tooling one.
-
-### ⚪ Not applicable to this project
-
-- **Gherkin/BDD (Wall 1)** — requires a product-side stakeholder authoring scenarios. This is an internal tool with a single primary operator (Jeremy); the "design doc frozen in public" pattern (`000-docs/*`) already serves as the acceptance-level artifact.
-- **Fuzz / property-based** — the security-critical inputs are already Zod-validated. Adding fuzzing would exercise Zod itself, which has its own test suite upstream.
-- **E2E / visual regression** — this is an MCP stdio server; no UI to E2E.
-- **Chaos engineering** — the server is a single process with no distributed state.
+- **Adopt Biome repo-wide as lint+format standard** — 31 errors + 85 warnings + 133 infos tell us there's a real gap; whether the project standardizes on Biome (vs ESLint, vs neither) is a product-of-team-values call. Filed as a separate bead.
+- **Wire Stryker mutation score floor into CI** — contingent on Phase E producing a stable baseline. Filed as a dependent bead (depends-on the Phase E bead).
 
 ---
 
-## Quality Gate Sweep (Step 5.5) summary
+## Files changed by this PR
 
-| # | Category | Status | Notes |
-|---|---|---|---|
-| 1 | Unit tests | ✅ | 594 passing, 98.4% coverage |
-| 2 | Integration / infra | ✅ | The tests ARE integration-style for the pure libs (real fs, real Zod, real TextEncoder) |
-| 3 | E2E / UI | ⚪ N/A | MCP stdio server |
-| 4 | API / contract | 🟢 | Zod schemas ARE the API contract; every tool input schema has its own describe block |
-| 5 | Performance / load / chaos | ⚪ | Not applicable to a Slack Socket-Mode bot |
-| 6 | Mutation + property + fuzz | ⚪ | None installed; see P3 above |
-| 7 | Static analysis (lint/format/types) | 🟡 | Types: ✅ strict. Lint/format: none. |
-| 8 | Pre-commit + CI depth | 🟢 | CI has typecheck + test required; no pre-commit |
-| 9 | Security (SAST/DAST/secrets/deps/container/IaC) | 🟢 | CodeQL (SAST), OpenSSF Scorecard, pinned-SHA workflows, Dockerfile present |
-| 10 | Accessibility + visual | ⚪ N/A | No UI |
+- `000-docs/TEST_AUDIT.md` — this file
+- `000-docs/QUALITY_GATES.md` — new (see Step 5.5 artifact)
+- `scripts/coverage-floor.sh` — new, parses `bun test --coverage` output
+- `.github/workflows/ci.yml` — adds coverage-floor step
+- `server.test.ts` — 1-line timeout bump on the `verifyJournal 1000-event chain` test
+- `000-docs/test-audit-run-evidence.md` — pointer to `/tmp/audit-run-1776735120/` artifacts
+
+No production code changes. No test assertions changed. No new devDependencies added (Phase D and E add their own, in their own PRs, behind their own review).
 
 ---
 
-## Files changed by this audit
+## Why the prior revision was shallow
 
-Only this doc. No test changes, no production changes, no tooling installation — per the audit-tests skill's IMPLEMENT-mode-on-approval rule. The bead (`ccsc-n8e`) closes with this report as evidence.
+The 2026-04-20 revision of this doc was authored without running:
+- The skill's own scripts (`bias-count.sh`, `crap-score.py`, `arch-check.sh`, `escape-scan.sh`, `harness-hash.sh`)
+- `dependency-cruiser` or `madge` for architecture graphs
+- `@biomejs/biome` or any linter
+- `trufflehog`, `gitleaks`, or `semgrep` for secrets/SAST
+- Any mutation tool
 
----
+It also miscounted:
+- Tests (549 → actual 594)
+- `.toThrow` occurrences (104 → actual 181)
+- Assertion density (2.47 → actual 2.28)
 
-## Decision checklist for Jeremy
+It skipped the Step 5.5 `QUALITY_GATES.md` artifact entirely and skipped Step 8 auto-remediation (coverage floor, flaky-test fix) even though those are unambiguously low-risk.
 
-If you want to keep iterating:
-
-- [ ] File bd for "wire coverage floor in CI" (≤95% threshold)
-- [ ] File bd for "migrate 31-A.4 import-graph to dependency-cruiser + keep regex backup"
-- [ ] Fix `ccsc-80e` (timeout bump — 10 min)
-- [ ] Decide: ESLint/Biome, or skip? (no wrong answer on a 4-file codebase)
-- [ ] Decide: run Stryker once per epic, or skip? (expensive but would give a mutation score)
-
-If you want to ship and move on: the suite is healthy. Epic 32 or any of the other P2 ready beads (`ccsc-0ss`, `ccsc-4vi`) would use your time more leverageably.
+This revision corrects all of the above. The old revision is preserved in git history (PR #125).
