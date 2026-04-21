@@ -39,3 +39,13 @@ jobs:
         # so the step actually fails on violations (with `--validate` v17 silently
         # prints help + exits 0, defeating the point of the CI gate).
         run: bunx depcruise --config .dependency-cruiser.js .
+
+      - name: Gherkin lint (Wall 1)
+        # Enforces declarative-style acceptance contracts for the security
+        # primitives. See features/README.md. Lint-only today — runner deferred.
+        run: bash scripts/gherkin-lint.sh --path features/ --strict
+
+      - name: Harness-hash verify (tamper check)
+        # Pins features/*.feature and .dependency-cruiser.js by SHA-256. Any
+        # byte edit to a pinned file without re-running --init fails here.
+        run: bash scripts/harness-hash.sh --verify

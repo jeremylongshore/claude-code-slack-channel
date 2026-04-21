@@ -36,7 +36,7 @@ All evidence paths are under `/tmp/audit-run-1776735120/` from the run that auth
 
 | # | Wall | Status | Evidence |
 |---|------|--------|----------|
-| 1 | Acceptance (Gherkin) | ⚪ N/A | No `features/` dir; the `000-docs/*.md` design docs serve as the acceptance-level contracts for this project. Skill permits this. |
+| 1 | Acceptance (Gherkin) | 🟢 Lint-gated | `features/` has 5 `.feature` files covering the five security primitives (`gate()`, `assertSendable()`, `assertOutboundAllowed()`, `evaluate()`, `verifyJournal()`). `gherkin-lint --strict` runs in CI. Runner (step definitions + scenario execution) is bd `ccsc-tr7` follow-up — lint-only today. See "Integrity note" below for why the initial ⚪ N/A was wrong. |
 | 2 | Unit tests | ✅ Pass | `wall2-test.txt` → `594 pass · 0 fail · 1355 expect() calls · 3.65s` |
 | 3 | Coverage floor | 🟡 → 🟢 | `wall3-coverage.txt` → 98.37% line / 98.75% func. Floor added in this PR via `scripts/coverage-floor.sh` (see Phase C). |
 | 4 | Mutation kill-rate | 🟢 Baseline | **79.85%** on `lib.ts` (PR #128, `stryker.conf.mjs`). 725 killed · 184 survived · 4 timed out of 913 mutants. Not wired into CI (~20 min per-PR cost). Full report in [`MUTATION_REPORT.md`](MUTATION_REPORT.md). Follow-up bead `ccsc-0mn` tracks CI integration after baseline stabilizes over 3 runs. |
@@ -209,6 +209,37 @@ Nothing in this list changes the security or correctness of the code — they ar
 - `000-docs/test-audit-run-evidence.md` — pointer to `/tmp/audit-run-1776735120/` artifacts
 
 No production code changes. No test assertions changed. No new devDependencies added (Phase D and E add their own, in their own PRs, behind their own review).
+
+---
+
+## Post-audit follow-up (filed bds)
+
+The deep audit pass (`ccsc-ao9`) shipped what it could but left some integrity gaps against the `/audit-tests` skill's own rubric. A second PR — the integrity closeout — closed Wall 1 + harness-hash and filed the remaining work as tracked bds. Every item below has a bd so anyone can pick up the trail.
+
+| bd | Status | Title |
+|---|---|---|
+| `ccsc-tr7` | ✅ Closed (integrity PR) | Wall 1: Scaffold `features/` for security primitives + lint in CI |
+| `ccsc-s10` | ✅ Closed (integrity PR) | Initialize `harness-hash` manifest + `--verify` CI step |
+| `ccsc-mjw` | 🟡 Open (P2) | Wire a Gherkin runner to make `features/*.feature` scenarios executable |
+| `ccsc-y4e` | 🟡 Open (P1) | Kill top-5 Stryker survivors on security primitives |
+| `ccsc-l5z` | 🟡 Open (P3, blocked on `ccsc-y4e`) | Expand Stryker scope to `policy.ts` + `manifest.ts` + `journal.ts` |
+| `ccsc-8g6` | 🟡 Open (P2) | Configure `bun pm scan` security scanner |
+| `ccsc-bsz` | 🟡 Open (P2) | Wire `gitleaks` or `trufflehog` as a PR gate |
+| `ccsc-g1d` | 🟡 Open (P3) | Upstream fix for `audit-tests bias-count.sh` pipefail+grep-no-match bug |
+| `ccsc-gh0` | 🟡 Open (P3, blocked on `ccsc-dz8`) | TS-aware CRAP / cyclomatic-complexity tool for Walls 5 and 6 |
+| `ccsc-71v` | 🟡 Open (P3, blocked on `ccsc-mjw` + `ccsc-y4e`) | Run Step 8 auto-remediation pass on the current test suite |
+
+Two bds from the original deep pass remain relevant here:
+- `ccsc-dz8` — Adopt Biome as repo-wide lint+format standard (already open, blocks `ccsc-gh0`)
+- `ccsc-0mn` — Wire Stryker mutation-score floor into CI (already open, per-PR gate)
+
+---
+
+## Integrity note
+
+The first deep `/audit-tests` pass (PR #127) marked Wall 1 (Acceptance/Gherkin) as ⚪ N/A with the rationale that `000-docs/*.md` design docs served as the acceptance-level contracts. **The skill does not honor N/A on Wall 1** — it ships `gherkin-lint.sh` precisely because acceptance contracts in executable form are the minimum bar. The integrity closeout PR reverses that call: `features/` now holds one declarative `.feature` file per security primitive, lint-gated in CI, pinned by `.harness-hash`. The previous audit also skipped `harness-hash.sh --init` entirely, meaning the pinned-file tamper guard never armed. Both gaps are closed in the integrity PR.
+
+This note exists so future audits have a readable trail of why Wall 1 went from ⚪ → 🟢 without any rescan of the test suite itself: the suite was already strong, the doc was just miscalibrated against the skill's rubric.
 
 ---
 
