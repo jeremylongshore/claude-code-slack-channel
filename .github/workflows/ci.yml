@@ -49,3 +49,11 @@ jobs:
         # Pins features/*.feature and .dependency-cruiser.js by SHA-256. Any
         # byte edit to a pinned file without re-running --init fails here.
         run: bash scripts/harness-hash.sh --verify
+
+      - name: Dependency vulnerability audit (bun audit)
+        # Native bun gate against the GitHub Advisory Database. Only fails on
+        # NEW high/critical advisories; known moderates in transitive deps are
+        # tracked separately (see bd ccsc-<follow-up>). The ignored advisory
+        # is a high-severity path-to-regexp finding inside @modelcontextprotocol/sdk
+        # — unfixable from our side until the SDK ships an updated transitive.
+        run: bun audit --audit-level=high --ignore=GHSA-j3q9-mxjg-w52f

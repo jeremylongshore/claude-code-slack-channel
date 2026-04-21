@@ -1,0 +1,13 @@
+# bunfig.toml — Bun runtime + install configuration.
+#
+# The live gate is `bun audit --audit-level=high` wired in `.github/workflows/ci.yml`.
+# That command queries the GitHub Advisory Database and is zero-config.
+#
+# The `[install.security]` stanza below is a documented placeholder for when
+# a third-party supply-chain scanner (Aikido, Socket, Snyk, Sandworm) is
+# picked. Scanner packages export a `scan()` that runs on every `bun install`
+# and can block with advisories the advisory DB doesn't carry yet. Picking
+# a scanner is a scope decision tracked in bd ccsc-8g6 follow-up (if any).
+#
+# [install.security]
+# scanner = "<package-name>"
