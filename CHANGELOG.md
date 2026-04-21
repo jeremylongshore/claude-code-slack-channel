@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Baseline mutation score via Stryker; configuration in `stryker.conf.mjs`; manual-run only (not in CI); baseline documented in `000-docs/MUTATION_REPORT.md`. Score: 79.85% on `lib.ts` (725 killed, 4 timed out, 184 survived of 913 mutants). `policy.ts` and `manifest.ts` are reserved for follow-up runs (`ccsc-ao9`).
 - Formal 31-A.4 architecture invariant via `dependency-cruiser` + `.dependency-cruiser.js` config; CI-enforced; the existing regex test in `server.test.ts` remains as a belt-and-suspenders guard.
 
 ## [0.7.0] - 2026-04-19
