@@ -1092,92 +1092,98 @@ export interface GateOptions {
   selfAppId: string
 }
 
-export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
-  const ev = event as Record<string, unknown>
+/**
+ * Block 1 helper — self-echo detection, per-channel allowBotIds opt-in, and
+ * permission-relay blocking for bot events.
+ *
+ * Returns a GateResult when the event should be dropped.
+ * Returns null when the bot event should fall through to the normal
+ * access-control checks (blocks 2–5).
+ */
+function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateResult | null {
+  // Self-echo: drop if ANY identifier matches our own bot. Covers payload
+  // variants where user is missing, bot_id differs from user, or app posts
+  // via chat.postMessage with as_user=false across workspaces.
+  const botProfile = (ev.bot_profile as Record<string, unknown>) || {}
+  const isSelfEcho =
+    (opts.selfBotId && ev.bot_id === opts.selfBotId) ||
+    (opts.selfAppId && botProfile.app_id === opts.selfAppId) ||
+    (ev.user && ev.user === opts.botUserId)
+  if (isSelfEcho) return { action: 'drop' }
 
-  // 1. Bot message handling — self-echo detection + per-channel opt-in
-  if (ev.bot_id) {
-    // Self-echo: drop if ANY identifier matches our own bot. Covers payload
-    // variants where user is missing, bot_id differs from user, or app posts
-    // via chat.postMessage with as_user=false across workspaces.
-    const botProfile = (ev.bot_profile as Record<string, unknown>) || {}
-    const isSelfEcho =
-      (opts.selfBotId && ev.bot_id === opts.selfBotId) ||
-      (opts.selfAppId && botProfile.app_id === opts.selfAppId) ||
-      (ev.user && ev.user === opts.botUserId)
-    if (isSelfEcho) return { action: 'drop' }
-
-    // Per-channel opt-in: only deliver if the channel explicitly lists this
-    // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
-    const channel = ev.channel as string
-    const policy = opts.access.channels[channel]
-    const botUser = ev.user as string | undefined
-    if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
-      return { action: 'drop' }
-    }
-
-    // Belt-and-suspenders: drop peer-bot messages that look like permission
-    // relay replies. The global allowFrom check at server.ts already blocks
-    // peer bots from approving tool calls, but this gate-level check prevents
-    // regression if that guard is ever loosened.
-    const text = ((ev.text as string) || '').trim()
-    if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
-
-    // Fall through to normal access-control checks (subtype, allowFrom,
-    // requireMention). The channel policy's allowFrom and requireMention
-    // still apply to bot messages — allowBotIds only gets them past step 1.
+  // Per-channel opt-in: only deliver if the channel explicitly lists this
+  // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
+  const channel = ev.channel as string
+  const policy = opts.access.channels[channel]
+  const botUser = ev.user as string | undefined
+  if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
+    return { action: 'drop' }
   }
 
-  // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop' }
+  // Belt-and-suspenders: drop peer-bot messages that look like permission
+  // relay replies. The global allowFrom check at server.ts already blocks
+  // peer bots from approving tool calls, but this gate-level check prevents
+  // regression if that guard is ever loosened.
+  const text = ((ev.text as string) || '').trim()
+  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
 
-  // 3. No user ID = drop
-  if (!ev.user) return { action: 'drop' }
+  // Fall through to normal access-control checks (subtype, allowFrom,
+  // requireMention). The channel policy's allowFrom and requireMention
+  // still apply to bot messages — allowBotIds only gets them past step 1.
+  return null
+}
 
-  const { access, staticMode, saveAccess, botUserId } = opts
+/**
+ * Block 4 helper — DM allowlist check, dmPolicy branch, pairing code lookup
+ * and issuance, and DoS guards (MAX_PAIRING_REPLIES + MAX_PENDING caps).
+ */
+async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Promise<GateResult> {
+  const { access, staticMode, saveAccess } = opts
+  const userId = ev.user as string
 
-  // 4. DM handling
-  if (ev.channel_type === 'im') {
-    const userId = ev.user as string
+  if (access.allowFrom.includes(userId)) {
+    return { action: 'deliver', access }
+  }
+  if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
+    return { action: 'drop' }
+  }
 
-    if (access.allowFrom.includes(userId)) {
-      return { action: 'deliver', access }
-    }
-    if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
-      return { action: 'drop' }
-    }
-
-    // Pairing mode — check if there's already a pending code for this user
-    for (const [code, entry] of Object.entries(access.pending)) {
-      if (entry.senderId === userId) {
-        if (entry.replies < MAX_PAIRING_REPLIES) {
-          entry.replies++
-          if (!staticMode) saveAccess(access)
-          return { action: 'pair', code, isResend: true }
-        }
-        return { action: 'drop' } // Hit reply cap
+  // Pairing mode — check if there's already a pending code for this user
+  for (const [code, entry] of Object.entries(access.pending)) {
+    if (entry.senderId === userId) {
+      if (entry.replies < MAX_PAIRING_REPLIES) {
+        entry.replies++
+        if (!staticMode) saveAccess(access)
+        return { action: 'pair', code, isResend: true }
       }
+      return { action: 'drop' } // Hit reply cap
     }
-
-    // Cap total pending
-    if (Object.keys(access.pending).length >= MAX_PENDING) {
-      return { action: 'drop' }
-    }
-
-    // Generate new pairing code
-    const code = generateCode()
-    access.pending[code] = {
-      senderId: userId,
-      chatId: ev.channel as string,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + PAIRING_EXPIRY_MS,
-      replies: 1,
-    }
-    if (!staticMode) saveAccess(access)
-    return { action: 'pair', code, isResend: false }
   }
 
-  // 5. Channel handling — opt-in per channel ID
+  // Cap total pending
+  if (Object.keys(access.pending).length >= MAX_PENDING) {
+    return { action: 'drop' }
+  }
+
+  // Generate new pairing code
+  const code = generateCode()
+  access.pending[code] = {
+    senderId: userId,
+    chatId: ev.channel as string,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + PAIRING_EXPIRY_MS,
+    replies: 1,
+  }
+  if (!staticMode) saveAccess(access)
+  return { action: 'pair', code, isResend: false }
+}
+
+/**
+ * Block 5 helper — channel opt-in check, allowFrom filter, and requireMention
+ * guard.
+ */
+function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): GateResult {
+  const { access, botUserId } = opts
   const channel = ev.channel as string
   const policy = access.channels[channel]
   if (!policy) return { action: 'drop' }
@@ -1191,6 +1197,28 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   }
 
   return { action: 'deliver', access }
+}
+
+export async function gate(event: unknown, opts: GateOptions): Promise<GateResult> {
+  const ev = event as Record<string, unknown>
+
+  // 1. Bot message handling — self-echo detection + per-channel opt-in
+  if (ev.bot_id) {
+    const botResult = handleBotEvent(ev, opts)
+    if (botResult) return botResult
+  }
+
+  // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
+  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop' }
+
+  // 3. No user ID = drop
+  if (!ev.user) return { action: 'drop' }
+
+  // 4. DM handling
+  if (ev.channel_type === 'im') return handleDmEvent(ev, opts)
+
+  // 5. Channel handling — opt-in per channel ID
+  return handleChannelEvent(ev, opts)
 }
 
 function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
