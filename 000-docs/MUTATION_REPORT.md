@@ -34,19 +34,25 @@ mutation-testing gap so severe that the baseline should be treated as a draft.
 
 `server.ts` and `supervisor.ts` remain out of scope: `server.ts` has boot-time side effects and module-load globals that confuse the mutator; `supervisor.ts` mutants routinely time out under the command runner's cold-spawn overhead.
 
-### Per-file baselines (expanded scope)
+### Per-file baselines (expanded scope — 2026-04-21)
 
-A full re-run against the expanded config is captured separately as the run completes. Header numbers land here; per-file breakdowns land after:
+Full 42-minute run against the four-file scope after `ccsc-y4e`'s survivor-kill tests landed. Final numbers:
 
-| File | Mutants | Killed | Survived | Timed out | Score |
+| File | Mutants | Killed | Timed out | Survived | Score |
 |---|---|---|---|---|---|
-| `lib.ts` | (run in progress) | — | — | — | — |
-| `policy.ts` | (run in progress) | — | — | — | — |
-| `manifest.ts` | (run in progress) | — | — | — | — |
-| `journal.ts` | (run in progress) | — | — | — | — |
-| **All files** | **1 860** | — | — | — | — |
+| `journal.ts` | 433 | 378 | 2 | 53 | **87.76%** |
+| `lib.ts` | 913 | 770 | 4 | 139 | **84.78%** |
+| `manifest.ts` | 214 | 197 | 0 | 17 | **92.06%** |
+| `policy.ts` | 300 | 233 | 1 | 66 | **78.00%** |
+| **All files** | **1 860** | **1 578** | **7** | **275** | **85.22%** |
 
-**Update trailer:** A follow-up commit to this same PR will replace the "in progress" rows with the final per-file numbers once the run completes. The intermediate y4e-only re-run on `lib.ts` landed at **84.45%** (up from 79.85% baseline) after the top-5 survivor-kill tests.
+Overall **85.22%** — above the `high: 80` threshold in `stryker.conf.mjs`.
+
+`manifest.ts` leads at 92.06% — Epic 31-B's Zod schema + strict subset validation produces easily-killable mutants. `journal.ts` second at 87.76%. `lib.ts` at 84.78% matches the post-y4e intermediate run within noise. `policy.ts` is the outlier at 78.00% — below `high` but above `low: 60`. The surviving mutants cluster on error-string literals inside `detectShadowing` / `detectBroadAutoApprove` warnings — the behavior (warn on shadow / footgun) is fully exercised, but the exact warning text isn't asserted bit-for-bit.
+
+**Follow-up:** strengthening `policy.ts` warning-message assertions is a reasonable P3 follow-up — the primitive is exercised, the text isn't. Not urgent; the mutation score is above the `low` threshold and the behavior coverage is strong.
+
+Runtime: **42 minutes 43 seconds** at `concurrency: 4` on this workstation. HTML report written to `reports/mutation/mutation.html` (gitignored).
 
 ## Reproduce
 
