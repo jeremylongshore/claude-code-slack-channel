@@ -17,9 +17,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { realpathSync } from 'node:fs'
+import { resolve, sep } from 'node:path'
 import { z } from 'zod'
-import { realpathSync } from 'fs'
-import { resolve, sep } from 'path'
 
 // ---------------------------------------------------------------------------
 // MatchSpec — which tool calls a rule applies to.
@@ -206,6 +206,7 @@ export type PolicyDecision =
 // `satisfies` casts break the build the moment either side drifts —
 // without forcing a runtime import or a third shared module.
 import type { PolicyDecisionShape } from './lib.ts'
+
 type _PolicyDecisionForward = PolicyDecision extends PolicyDecisionShape ? true : never
 type _PolicyDecisionBackward = PolicyDecisionShape extends PolicyDecision ? true : never
 const _decisionShapeForward: _PolicyDecisionForward = true
@@ -404,7 +405,7 @@ function matchApplies(match: MatchSpec, call: ToolCall): boolean {
   if (match.actor !== undefined && match.actor !== call.actor) return false
 
   if (match.pathPrefix !== undefined) {
-    const raw = call.input['path']
+    const raw = call.input.path
     if (typeof raw !== 'string') return false
     try {
       const resolvedPrefix = canonicalizeRulePathPrefix(match.pathPrefix)

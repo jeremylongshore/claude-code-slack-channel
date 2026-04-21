@@ -36,9 +36,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import ts from 'typescript'
-import { readFileSync } from 'fs'
-import { join } from 'path'
 
 // Production sources the audit tracks. New files added to the repo at top level
 // should be added here if they contain runtime logic.

@@ -8,10 +8,10 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { resolve, sep, basename, join } from 'path'
-import { realpathSync, mkdirSync, readdirSync, readFileSync, statSync, existsSync } from 'fs'
-import { writeFile, chmod, rename, unlink, readFile } from 'fs/promises'
-import { randomBytes } from 'crypto'
+import { randomBytes } from 'node:crypto'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { basename, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1056,7 @@ export function chunkText(text: string, limit: number, mode: 'length' | 'newline
 // ---------------------------------------------------------------------------
 
 export function sanitizeFilename(name: string): string {
-  return name.replace(/[\[\]\n\r;]/g, '_').replace(/\.\./g, '_')
+  return name.replace(/[[\]\n\r;]/g, '_').replace(/\.\./g, '_')
 }
 
 /**
@@ -1079,7 +1079,7 @@ export function sanitizeFilename(name: string): string {
 export function sanitizeDisplayName(raw: unknown): string {
   if (typeof raw !== 'string') return 'unknown'
   const cleaned = raw
-    // eslint-disable-next-line no-control-regex
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — strip C0/C1 control chars from untrusted Slack display names before rendering
     .replace(/[\u0000-\u001f\u007f]/g, '')
     .replace(/[<>"'`]/g, '')
     .replace(/\s+/g, ' ')
@@ -1114,22 +1114,22 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   const ev = event as Record<string, unknown>
 
   // 1. Bot message handling — self-echo detection + per-channel opt-in
-  if (ev['bot_id']) {
+  if (ev.bot_id) {
     // Self-echo: drop if ANY identifier matches our own bot. Covers payload
     // variants where user is missing, bot_id differs from user, or app posts
     // via chat.postMessage with as_user=false across workspaces.
-    const botProfile = (ev['bot_profile'] as Record<string, unknown>) || {}
+    const botProfile = (ev.bot_profile as Record<string, unknown>) || {}
     const isSelfEcho =
-      (opts.selfBotId && ev['bot_id'] === opts.selfBotId) ||
-      (opts.selfAppId && botProfile['app_id'] === opts.selfAppId) ||
-      (ev['user'] && ev['user'] === opts.botUserId)
+      (opts.selfBotId && ev.bot_id === opts.selfBotId) ||
+      (opts.selfAppId && botProfile.app_id === opts.selfAppId) ||
+      (ev.user && ev.user === opts.botUserId)
     if (isSelfEcho) return { action: 'drop' }
 
     // Per-channel opt-in: only deliver if the channel explicitly lists this
     // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
-    const channel = ev['channel'] as string
+    const channel = ev.channel as string
     const policy = opts.access.channels[channel]
-    const botUser = ev['user'] as string | undefined
+    const botUser = ev.user as string | undefined
     if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
       return { action: 'drop' }
     }
@@ -1138,7 +1138,7 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
     // relay replies. The global allowFrom check at server.ts already blocks
     // peer bots from approving tool calls, but this gate-level check prevents
     // regression if that guard is ever loosened.
-    const text = ((ev['text'] as string) || '').trim()
+    const text = ((ev.text as string) || '').trim()
     if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
 
     // Fall through to normal access-control checks (subtype, allowFrom,
@@ -1147,16 +1147,16 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   }
 
   // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (ev['subtype'] && ev['subtype'] !== 'file_share') return { action: 'drop' }
+  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop' }
 
   // 3. No user ID = drop
-  if (!ev['user']) return { action: 'drop' }
+  if (!ev.user) return { action: 'drop' }
 
   const { access, staticMode, saveAccess, botUserId } = opts
 
   // 4. DM handling
-  if (ev['channel_type'] === 'im') {
-    const userId = ev['user'] as string
+  if (ev.channel_type === 'im') {
+    const userId = ev.user as string
 
     if (access.allowFrom.includes(userId)) {
       return { action: 'deliver', access }
@@ -1186,7 +1186,7 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
     const code = generateCode()
     access.pending[code] = {
       senderId: userId,
-      chatId: ev['channel'] as string,
+      chatId: ev.channel as string,
       createdAt: Date.now(),
       expiresAt: Date.now() + PAIRING_EXPIRY_MS,
       replies: 1,
@@ -1196,11 +1196,11 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   }
 
   // 5. Channel handling — opt-in per channel ID
-  const channel = ev['channel'] as string
+  const channel = ev.channel as string
   const policy = access.channels[channel]
   if (!policy) return { action: 'drop' }
 
-  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev['user'] as string)) {
+  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
     return { action: 'drop' }
   }
 
@@ -1213,7 +1213,7 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
 
 function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
   if (!botUserId) return false
-  const text = (event['text'] as string | undefined) || ''
+  const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
 }
 
@@ -1252,8 +1252,8 @@ export function isDuplicateEvent(
     if (expiresAt <= now) seen.delete(key)
   }
 
-  const channel = event['channel']
-  const ts = event['ts']
+  const channel = event.channel
+  const ts = event.ts
   if (typeof channel !== 'string' || typeof ts !== 'string') {
     return false
   }
@@ -1330,11 +1330,10 @@ export function resolveJournalPath(
       if (val.length > 0) {
         return { path: val, source: 'flag' }
       }
-      continue
     }
   }
 
-  const envPath = env['SLACK_AUDIT_LOG']
+  const envPath = env.SLACK_AUDIT_LOG
   if (typeof envPath === 'string' && envPath.length > 0) {
     return { path: envPath, source: 'env' }
   }
@@ -1710,7 +1709,6 @@ export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
       if (val.length > 0) {
         return val
       }
-      continue
     }
   }
   return null

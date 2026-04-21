@@ -9,15 +9,15 @@
 
 import { expect } from 'bun:test'
 import {
-  evaluate,
+  type ApprovalKey,
   approvalKey,
   DEFAULT_REQUIRE_AUTHORED_POLICY,
+  evaluate,
+  type PolicyDecision,
   type PolicyRule,
   type ToolCall,
-  type PolicyDecision,
-  type ApprovalKey,
 } from '../../policy.ts'
-import type { Context, StepRegistry } from '../runner.ts'
+import type { StepRegistry } from '../runner.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -62,15 +62,15 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'a tool call addressed at a session with a known channel and actor',
     (ctx) => {
-      ctx['call'] = { ...BASE_CALL }
-      ctx['now'] = Date.now()
+      ctx.call = { ...BASE_CALL }
+      ctx.now = Date.now()
     },
   )
 
   registry.register(
     'an approvals map seeded for this session',
     (ctx) => {
-      ctx['approvals'] = new Map<ApprovalKey, { ttlExpires: number }>()
+      ctx.approvals = new Map<ApprovalKey, { ttlExpires: number }>()
     },
   )
 
@@ -81,25 +81,25 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'a rule list whose first matching rule has an auto_approve effect',
     (ctx) => {
-      ctx['rules'] = [makeAutoApproveRule('r-allow')]
+      ctx.rules = [makeAutoApproveRule('r-allow')]
     },
   )
 
   registry.register(
     'the evaluator processes a matching tool call',
     (ctx) => {
-      const call = ctx['call'] as ToolCall
-      const rules = ctx['rules'] as PolicyRule[]
-      const now = ctx['now'] as number
-      const approvals = ctx['approvals'] as Map<ApprovalKey, { ttlExpires: number }>
-      ctx['decision'] = evaluate(call, rules, now, { approvals })
+      const call = ctx.call as ToolCall
+      const rules = ctx.rules as PolicyRule[]
+      const now = ctx.now as number
+      const approvals = ctx.approvals as Map<ApprovalKey, { ttlExpires: number }>
+      ctx.decision = evaluate(call, rules, now, { approvals })
     },
   )
 
   registry.register(
     'the decision is allow',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('allow')
     },
   )
@@ -107,7 +107,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'the decision cites the matched rule id',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('allow')
       if (decision.kind === 'allow') {
         expect(decision.rule).toBeDefined()
@@ -122,14 +122,14 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'a rule list whose first matching rule has a deny effect',
     (ctx) => {
-      ctx['rules'] = [makeDenyRule('r-deny', 'tool is forbidden')]
+      ctx.rules = [makeDenyRule('r-deny', 'tool is forbidden')]
     },
   )
 
   registry.register(
     'the decision is deny',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('deny')
     },
   )
@@ -137,7 +137,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'the decision carries the authored reason string',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('deny')
       if (decision.kind === 'deny') {
         expect(decision.reason).toBe('tool is forbidden')
@@ -152,7 +152,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'a rule list whose first matching rule requires human approval',
     (ctx) => {
-      ctx['rules'] = [makeRequireRule('r-require', 5 * 60 * 1000)]
+      ctx.rules = [makeRequireRule('r-require', 5 * 60 * 1000)]
     },
   )
 
@@ -160,7 +160,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
     'no approval is recorded for the rule and session key',
     (ctx) => {
       // approvals map already empty from background
-      const approvals = ctx['approvals'] as Map<ApprovalKey, { ttlExpires: number }>
+      const approvals = ctx.approvals as Map<ApprovalKey, { ttlExpires: number }>
       expect(approvals.size).toBe(0)
     },
   )
@@ -168,7 +168,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'the decision is require',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('require')
     },
   )
@@ -176,7 +176,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'the decision carries the configured approval TTL',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('require')
       if (decision.kind === 'require') {
         expect(decision.ttlMs).toBe(5 * 60 * 1000)
@@ -191,11 +191,11 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'a live approval is recorded for the rule and session key',
     (ctx) => {
-      const rules = ctx['rules'] as PolicyRule[]
+      const rules = ctx.rules as PolicyRule[]
       const ruleId = rules[0]!.id
-      const now = ctx['now'] as number
+      const now = ctx.now as number
       const key = approvalKey(ruleId, SESSION)
-      const approvals = ctx['approvals'] as Map<ApprovalKey, { ttlExpires: number }>
+      const approvals = ctx.approvals as Map<ApprovalKey, { ttlExpires: number }>
       // TTL expires in the future
       approvals.set(key, { ttlExpires: now + 5 * 60 * 1000 })
     },
@@ -208,11 +208,11 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'an expired approval is recorded for the rule and session key',
     (ctx) => {
-      const rules = ctx['rules'] as PolicyRule[]
+      const rules = ctx.rules as PolicyRule[]
       const ruleId = rules[0]!.id
-      const now = ctx['now'] as number
+      const now = ctx.now as number
       const key = approvalKey(ruleId, SESSION)
-      const approvals = ctx['approvals'] as Map<ApprovalKey, { ttlExpires: number }>
+      const approvals = ctx.approvals as Map<ApprovalKey, { ttlExpires: number }>
       // TTL already expired
       approvals.set(key, { ttlExpires: now - 1 })
     },
@@ -221,19 +221,19 @@ export function registerPolicySteps(registry: StepRegistry): void {
   registry.register(
     'the evaluator processes a matching tool call at a later time',
     (ctx) => {
-      const call = ctx['call'] as ToolCall
-      const rules = ctx['rules'] as PolicyRule[]
-      const now = ctx['now'] as number
-      const approvals = ctx['approvals'] as Map<ApprovalKey, { ttlExpires: number }>
+      const call = ctx.call as ToolCall
+      const rules = ctx.rules as PolicyRule[]
+      const now = ctx.now as number
+      const approvals = ctx.approvals as Map<ApprovalKey, { ttlExpires: number }>
       // Evaluate at `now` — the approval already expired before `now`
-      ctx['decision'] = evaluate(call, rules, now, { approvals })
+      ctx.decision = evaluate(call, rules, now, { approvals })
     },
   )
 
   registry.register(
     'the expired approval does not satisfy the check',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('require')
     },
   )
@@ -246,7 +246,7 @@ export function registerPolicySteps(registry: StepRegistry): void {
     'a rule list where no rule matches the tool call',
     (ctx) => {
       // Rule on a completely different tool — will never match BASE_CALL
-      ctx['rules'] = [
+      ctx.rules = [
         {
           id: 'r-nomatch',
           priority: 100,
@@ -262,19 +262,19 @@ export function registerPolicySteps(registry: StepRegistry): void {
     'the require-authored-policy set does not contain the tool name',
     (ctx) => {
       // BASE_CALL.tool is 'read_file'; DEFAULT set only has 'upload_file'
-      ctx['requireAuthoredPolicy'] = DEFAULT_REQUIRE_AUTHORED_POLICY
+      ctx.requireAuthoredPolicy = DEFAULT_REQUIRE_AUTHORED_POLICY
     },
   )
 
   registry.register(
     'the evaluator processes the tool call',
     (ctx) => {
-      const call = ctx['call'] as ToolCall
-      const rules = ctx['rules'] as PolicyRule[]
-      const now = ctx['now'] as number
-      const approvals = ctx['approvals'] as Map<ApprovalKey, { ttlExpires: number }>
-      const requireAuthoredPolicy = ctx['requireAuthoredPolicy'] as ReadonlySet<string> | undefined
-      ctx['decision'] = evaluate(call, rules, now, {
+      const call = ctx.call as ToolCall
+      const rules = ctx.rules as PolicyRule[]
+      const now = ctx.now as number
+      const approvals = ctx.approvals as Map<ApprovalKey, { ttlExpires: number }>
+      const requireAuthoredPolicy = ctx.requireAuthoredPolicy as ReadonlySet<string> | undefined
+      ctx.decision = evaluate(call, rules, now, {
         approvals,
         requireAuthoredPolicy,
       })
@@ -289,14 +289,14 @@ export function registerPolicySteps(registry: StepRegistry): void {
     'the require-authored-policy set contains the tool name',
     (ctx) => {
       // Use the call tool name 'read_file' in the set
-      ctx['requireAuthoredPolicy'] = new Set(['read_file'])
+      ctx.requireAuthoredPolicy = new Set(['read_file'])
     },
   )
 
   registry.register(
     'the decision reason names the default-deny branch',
     (ctx) => {
-      const decision = ctx['decision'] as PolicyDecision
+      const decision = ctx.decision as PolicyDecision
       expect(decision.kind).toBe('deny')
       if (decision.kind === 'deny') {
         expect(decision.rule).toBe('default')

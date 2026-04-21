@@ -461,7 +461,7 @@ export function findOurPriorManifestPins(
   return items.flatMap((item) => {
     if (item.type !== 'message') return []
     const msg = item.message
-    if (!msg || !msg.ts) return []
+    if (!msg?.ts) return []
     const isOurs =
       (!!selfBotId && msg.bot_id === selfBotId) ||
       (!!botUserId && msg.user === botUserId)

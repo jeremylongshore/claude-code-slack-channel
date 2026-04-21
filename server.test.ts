@@ -1,63 +1,62 @@
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test'
-import { z } from 'zod'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import {
-  gate,
-  assertSendable,
-  parseSendableRoots,
-  validateSendableRoots,
-  assertOutboundAllowed,
-  isSlackFileUrl,
-  chunkText,
-  sanitizeFilename,
-  sanitizeDisplayName,
-  defaultAccess,
-  pruneExpired,
-  generateCode,
-  isDuplicateEvent,
-  resolveJournalPath,
-  sessionPath,
-  saveSession,
-  loadSession,
-  migrateFlatSessions,
-  MIGRATED_DEFAULT_THREAD,
-  EVENT_DEDUP_TTL_MS,
-  PERMISSION_REPLY_RE,
-  MAX_PENDING,
-  MAX_PAIRING_REPLIES,
-  PAIRING_EXPIRY_MS,
-  SessionSchema,
-  escMrkdwn,
-  generateCorrelationId,
-  shouldPostAuditReceipt,
-  buildAuditReceiptMessage,
-  buildAndPostAuditReceipt,
-  enforceAuditReceiptCap,
-  AUDIT_RECEIPTS_MAX,
-  type Access,
-  type AuditReceiptPostArgs,
-  type AuditReceiptPostError,
-  type GateOptions,
-  type Session,
-  type SessionKey,
-  type ChannelPolicy,
-} from './lib.ts'
-import { createSessionSupervisor } from './supervisor.ts'
-import {
-  mkdtempSync,
+  existsSync,
   mkdirSync,
-  writeFileSync,
+  mkdtempSync,
+  readdirSync,
   readFileSync,
-  symlinkSync,
-  rmSync,
-  statSync,
   readlinkSync,
   realpathSync,
-  existsSync,
-  readdirSync,
-} from 'fs'
-import { writeFile } from 'fs/promises'
-import { tmpdir } from 'os'
-import { join, sep } from 'path'
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, sep } from 'node:path'
+import { z } from 'zod'
+import {
+  type Access,
+  AUDIT_RECEIPTS_MAX,
+  type AuditReceiptPostArgs,
+  type AuditReceiptPostError,
+  assertOutboundAllowed,
+  assertSendable,
+  buildAndPostAuditReceipt,
+  buildAuditReceiptMessage,
+  type ChannelPolicy,
+  chunkText,
+  defaultAccess,
+  EVENT_DEDUP_TTL_MS,
+  enforceAuditReceiptCap,
+  escMrkdwn,
+  type GateOptions,
+  gate,
+  generateCode,
+  generateCorrelationId,
+  isDuplicateEvent,
+  isSlackFileUrl,
+  loadSession,
+  MAX_PAIRING_REPLIES,
+  MAX_PENDING,
+  MIGRATED_DEFAULT_THREAD,
+  migrateFlatSessions,
+  PAIRING_EXPIRY_MS,
+  PERMISSION_REPLY_RE,
+  parseSendableRoots,
+  pruneExpired,
+  resolveJournalPath,
+  type Session,
+  type SessionKey,
+  sanitizeDisplayName,
+  sanitizeFilename,
+  saveSession,
+  sessionPath,
+  shouldPostAuditReceipt,
+  validateSendableRoots,
+} from './lib.ts'
+import { createSessionSupervisor } from './supervisor.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -91,8 +90,7 @@ function extractImportSpecifiers(src: string): string[] {
     .replace(/\/\/[^\n]*/g, '')
   const specs: string[] = []
   const re = /(?:\bfrom|\bimport\s*\(|\brequire\s*\()\s*(['"])([^'"]+)\1/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(stripped)) !== null) specs.push(m[2]!)
+  for (const m of stripped.matchAll(re)) specs.push(m[2]!)
   return specs
 }
 
@@ -648,7 +646,7 @@ describe('assertSendable', () => {
     // Symlink may not have been created on exotic FSes; tolerate that.
     try {
       // Sanity: ensure the symlink exists
-      require('fs').lstatSync(join(inbox, 'innocent-looking.txt'))
+      require('node:fs').lstatSync(join(inbox, 'innocent-looking.txt'))
     } catch {
       return
     }
@@ -661,7 +659,7 @@ describe('assertSendable', () => {
     // join() collapses ".." at build time, so pass a raw string to exercise
     // the pre-resolve check.
     expect(() =>
-      assertSendable(inbox + '/../.env', inbox, [root]),
+      assertSendable(`${inbox}/../.env`, inbox, [root]),
     ).toThrow('..')
   })
 
@@ -756,7 +754,7 @@ describe('assertSendable — state-root denylist', () => {
 
   test('blocks a symlink OUTSIDE the state dir that points INTO it', () => {
     try {
-      require('fs').lstatSync(join(sibling, 'innocent.txt'))
+      require('node:fs').lstatSync(join(sibling, 'innocent.txt'))
     } catch {
       return
     }
@@ -1336,8 +1334,8 @@ describe('pruneExpired', () => {
       },
     })
     pruneExpired(access)
-    expect(access.pending['OLD']).toBeUndefined()
-    expect(access.pending['FRESH']).toBeDefined()
+    expect(access.pending.OLD).toBeUndefined()
+    expect(access.pending.FRESH).toBeDefined()
   })
 
   test('handles empty pending', () => {
@@ -1994,7 +1992,7 @@ describe('listSessions', () => {
     expect(row.ownerId).toBe('U_ALICE')
     // Body field MUST NOT be surfaced — the sensitive-data invariant.
     expect(Object.keys(row)).not.toContain('data')
-    expect((row as unknown as Record<string, unknown>)['data']).toBeUndefined()
+    expect((row as unknown as Record<string, unknown>).data).toBeUndefined()
   })
 
   test('sorts by lastActiveAt descending', async () => {
@@ -3863,7 +3861,7 @@ describe('extractManifests (31-A.2)', () => {
     // JSON.parse fail on the trailing junk. That's fine — even before
     // JSON.parse is attempted the size cap must reject. Proves the cap
     // is measured in bytes, not characters.
-    const tooBig = body + ' ' + emoji.repeat(emojisNeeded)
+    const tooBig = `${body} ${emoji.repeat(emojisNeeded)}`
     const totalBytes = new TextEncoder().encode(tooBig).length
     expect(totalBytes).toBeGreaterThan(MAX_MANIFEST_BYTES)
     // UTF-16 length is much smaller: baseBytes + 1 + 2*emojisNeeded.
@@ -5214,7 +5212,7 @@ describe('createSessionSupervisor.reapIdle', () => {
 
     const reapTicks = logged.filter((l) => l.event === 'session.reap_tick')
     expect(reapTicks).toHaveLength(1)
-    expect(reapTicks[0]!.fields['candidates']).toBe(3)
+    expect(reapTicks[0]!.fields.candidates).toBe(3)
   })
 
   test('honors a custom idleMs (short window for tests)', async () => {
@@ -5719,7 +5717,7 @@ describe('JournalWriter', () => {
       prevHash: stableAnchor,
       hash: 'f'.repeat(64),
     }
-    writeFileSync(logPath, JSON.stringify(existingEvent) + '\n', {
+    writeFileSync(logPath, `${JSON.stringify(existingEvent)}\n`, {
       mode: 0o600,
     })
     const before = readFileSync(logPath, 'utf8')
@@ -5939,7 +5937,7 @@ describe('redact', () => {
 
   test('redacts Anthropic keys (sk-*)', async () => {
     const { redact } = await import('./journal.ts')
-    const secret = 'sk-ant-api03-' + 'a'.repeat(30)
+    const secret = `sk-ant-api03-${'a'.repeat(30)}`
     expect(redact(`key is ${secret}`)).toBe('key is [REDACTED:anthropic]')
   })
 
@@ -5955,13 +5953,13 @@ describe('redact', () => {
 
   test('redacts Slack app tokens (xapp-*)', async () => {
     const { redact } = await import('./journal.ts')
-    const fake = 'xapp' + '-' + '1' + '-' + 'A0ABC123DEF' + '-' + '1234567890123' + '-' + 'a'.repeat(32)
+    const fake = `xapp-1-A0ABC123DEF-1234567890123-${'a'.repeat(32)}`
     expect(redact(fake)).toBe('[REDACTED:slack_app]')
   })
 
   test('redacts GitHub PATs (ghp_*)', async () => {
     const { redact } = await import('./journal.ts')
-    expect(redact('token=ghp_' + 'A'.repeat(36))).toBe(
+    expect(redact(`token=ghp_${'A'.repeat(36)}`)).toBe(
       'token=[REDACTED:github]',
     )
   })
@@ -5988,7 +5986,7 @@ describe('redact', () => {
 
   test('recurses into arrays', async () => {
     const { redact } = await import('./journal.ts')
-    const result = redact(['safe', `bad=${'ghp_' + 'A'.repeat(36)}`, 42])
+    const result = redact(['safe', `bad=${`ghp_${'A'.repeat(36)}`}`, 42])
     expect(result).toEqual(['safe', 'bad=[REDACTED:github]', 42])
   })
 
@@ -5996,7 +5994,7 @@ describe('redact', () => {
     const { redact } = await import('./journal.ts')
     const input = {
       env: {
-        ANTHROPIC_API_KEY: 'sk-ant-' + 'x'.repeat(30),
+        ANTHROPIC_API_KEY: `sk-ant-${'x'.repeat(30)}`,
         SAFE_VAR: 'ok',
       },
       argv: ['--key=AKIAIOSFODNN7EXAMPLE'],
@@ -6012,7 +6010,7 @@ describe('redact', () => {
 
   test('pure: does not mutate its argument', async () => {
     const { redact } = await import('./journal.ts')
-    const input = { k: 'sk-ant-' + 'a'.repeat(30) }
+    const input = { k: `sk-ant-${'a'.repeat(30)}` }
     const snapshot = JSON.stringify(input)
     redact(input)
     expect(JSON.stringify(input)).toBe(snapshot)
@@ -6054,8 +6052,8 @@ describe('redact — documented pattern table', () => {
   const xapp =
     'xapp' + '-' + '1' + '-' + 'A0B1C2D3E4F' + '-' + '1234567890123' + '-' +
     'a'.repeat(32)
-  const ghp = 'ghp_' + 'A'.repeat(36)
-  const sk = 'sk-ant-api03-' + 'z'.repeat(30)
+  const ghp = `ghp_${'A'.repeat(36)}`
+  const sk = `sk-ant-api03-${'z'.repeat(30)}`
   const akia = 'AKIAIOSFODNN7EXAMPLE'
   const jwt =
     'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.abc-_DEF123'
@@ -6127,11 +6125,11 @@ describe('redact — documented pattern table', () => {
   const negativeCases: ReadonlyArray<{ label: string; input: string }> = [
     {
       label: 'random 40-char hex (git SHA-like) is not a token',
-      input: 'commit ' + 'a1b2c3d4'.repeat(5),
+      input: `commit ${'a1b2c3d4'.repeat(5)}`,
     },
     {
       label: 'ghp_ prefix with too few chars (35, not 36) stays',
-      input: 'ghp_' + 'A'.repeat(35),
+      input: `ghp_${'A'.repeat(35)}`,
     },
     {
       label: 'AKIA prefix with lowercase body stays (pattern requires [0-9A-Z])',
@@ -6260,7 +6258,7 @@ describe('JournalWriter redaction integration', () => {
       initialPrevHash: stableAnchor,
     })
     try {
-      const secret = 'sk-ant-' + 'z'.repeat(30)
+      const secret = `sk-ant-${'z'.repeat(30)}`
       const ev = await w.writeEvent({
         kind: 'policy.deny',
         input: { env: { ANTHROPIC_API_KEY: secret } },
@@ -6287,7 +6285,7 @@ describe('JournalWriter redaction integration', () => {
       initialPrevHash: stableAnchor,
     })
     try {
-      const secret = 'ghp_' + 'A'.repeat(36)
+      const secret = `ghp_${'A'.repeat(36)}`
       const ev = await w.writeEvent({
         kind: 'gate.inbound.drop',
         reason: `peer bot tried to post key ${secret}`,
@@ -6312,7 +6310,7 @@ describe('JournalWriter redaction integration', () => {
       // Even if a caller stuffs a token-shaped string into ruleId, the
       // writer deliberately does NOT redact it — operators want that
       // loud signal, per audit-journal-architecture.md §183-184.
-      const tokenShaped = 'ghp_' + 'A'.repeat(36)
+      const tokenShaped = `ghp_${'A'.repeat(36)}`
       const ev = await w.writeEvent({
         kind: 'policy.deny',
         toolName: 'reply',
@@ -6372,7 +6370,7 @@ describe('truncate', () => {
   test('truncates long strings with an inline [... truncated N chars] marker', async () => {
     const { truncate } = await import('./journal.ts')
     const long = 'a'.repeat(3000)
-    const expected = 'a'.repeat(100) + '[... truncated 2900 chars]'
+    const expected = `${'a'.repeat(100)}[... truncated 2900 chars]`
     expect(truncate(long, 100)).toBe(expected)
   })
 
@@ -6533,7 +6531,7 @@ describe('JournalWriter truncation integration', () => {
       // could cut a token mid-string and leave partial secret bytes
       // on disk. Doc §206 calls this out explicitly.
       const prefix = 'x'.repeat(2040)
-      const token = 'sk-ant' + '-' + 'a'.repeat(30)
+      const token = `sk-ant-${'a'.repeat(30)}`
       const big = prefix + token // crosses the 2048 boundary mid-token
       const ev = await w.writeEvent({
         kind: 'policy.deny',
@@ -7506,7 +7504,7 @@ describe('verifyJournal', () => {
     const target = lines[41]! // 0-indexed → seq 42 since writer starts at seq 1
     const tampered = target.replace('"req-41"', '"req-ZZ"')
     lines[41] = tampered
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7531,7 +7529,7 @@ describe('verifyJournal', () => {
     )
     parsed.hash = badHash
     lines[4] = JSON.stringify(parsed)
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7552,7 +7550,7 @@ describe('verifyJournal', () => {
     const parsed = JSON.parse(lines[2]!) as Record<string, unknown>
     parsed.prevHash = 'd'.repeat(64)
     lines[2] = JSON.stringify(parsed)
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7571,7 +7569,7 @@ describe('verifyJournal', () => {
     const lines = content.split('\n').filter(Boolean)
     // Swap lines 2 and 3.
     ;[lines[1], lines[2]] = [lines[2]!, lines[1]!]
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7589,7 +7587,7 @@ describe('verifyJournal', () => {
     // Remove seq=3 entry. The next line has seq=4 but prevHash
     // points to seq=3's hash, which no longer chains from seq=2.
     lines.splice(2, 1)
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7607,7 +7605,7 @@ describe('verifyJournal', () => {
     const content = readFileSync(logPath, 'utf8')
     const lines = content.split('\n').filter(Boolean)
     lines[1] = 'NOT VALID JSON AT ALL'
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7626,7 +7624,7 @@ describe('verifyJournal', () => {
     const parsed = JSON.parse(lines[0]!) as Record<string, unknown>
     parsed.kind = 'not.a.real.kind'
     lines[0] = JSON.stringify(parsed)
-    writeFileSync(logPath, lines.join('\n') + '\n', { mode: 0o600 })
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
 
     const result = await verifyJournal(logPath)
     expect(result.ok).toBe(false)
@@ -7851,7 +7849,7 @@ describe('SessionSupervisor quarantine (S6)', () => {
   afterEach(() => {
     // Restore permissions before cleanup so rmSync can remove the tree.
     try {
-      const { chmodSync } = require('fs')
+      const { chmodSync } = require('node:fs')
       chmodSync(channelDir, 0o700)
     } catch { /* best-effort */ }
     rmSync(rawRoot, { recursive: true, force: true })
@@ -7876,7 +7874,7 @@ describe('SessionSupervisor quarantine (S6)', () => {
     // Make the channel dir unwritable so the atomic tmp-write inside
     // saveSession() fails with EACCES. This simulates a real filesystem
     // permission failure without requiring root or a mock.
-    const { chmodSync } = require('fs')
+    const { chmodSync } = require('node:fs')
     chmodSync(channelDir, 0o000)
 
     // deactivate() should throw and the key should land in quarantine.
@@ -7986,7 +7984,7 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
 
   afterEach(() => {
     try {
-      const { chmodSync } = require('fs')
+      const { chmodSync } = require('node:fs')
       chmodSync(channelDir, 0o700)
     } catch { /* best-effort */ }
     rmSync(rawRoot, { recursive: true, force: true })
@@ -8031,7 +8029,7 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
     // Use a safe increment helper that avoids the `as number` cast and
     // defaults gracefully if the field is absent (per Gemini review).
     const increment = (s: Session): Session => {
-      const current = typeof s.data['count'] === 'number' ? s.data['count'] : 0
+      const current = typeof s.data.count === 'number' ? s.data.count : 0
       return { ...s, data: { ...s.data, count: current + 1 } }
     }
     const p1 = handle.update(increment)
@@ -8039,12 +8037,12 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
     const p3 = handle.update(increment)
     await Promise.all([p1, p2, p3])
 
-    expect(handle.session.data['count']).toBe(3)
+    expect(handle.session.data.count).toBe(3)
 
     // Disk must also reflect the final value.
     const path = sessionPath(stateRoot, KEY)
     const fromDisk = await loadSession(stateRoot, path)
-    expect(fromDisk.data['count']).toBe(3)
+    expect(fromDisk.data.count).toBe(3)
   })
 
   // 3. Concurrent update + deactivate serialize — final state must be
@@ -8097,7 +8095,7 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
 
     // Make the channel dir unwritable so saveSession()'s tmp-write fails
     // with EACCES — same chmod trick used in S6.
-    const { chmodSync } = require('fs')
+    const { chmodSync } = require('node:fs')
     chmodSync(channelDir, 0o000)
 
     let caught: unknown
@@ -8683,8 +8681,8 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
     expect(logLines.length).toBeGreaterThan(0)
     const activateLog = logLines.find((l) => l.msg.includes('supervisor.activate failed'))
     expect(activateLog).toBeTruthy()
-    expect(activateLog!.fields['channel']).toBe(key.channel)
-    expect(activateLog!.fields['thread']).toBe(key.thread)
+    expect(activateLog!.fields.channel).toBe(key.channel)
+    expect(activateLog!.fields.thread).toBe(key.thread)
   })
 
   // -------------------------------------------------------------------------
@@ -9520,8 +9518,8 @@ describe('pruneExpired Access-pending boundary (ccsc-y4e)', () => {
         },
       })
       pruneExpired(access)
-      expect(access.pending['TIE']).toBeUndefined()
-      expect(access.pending['LIVE']).toBeDefined()
+      expect(access.pending.TIE).toBeUndefined()
+      expect(access.pending.LIVE).toBeDefined()
     } finally {
       Date.now = originalNow
     }

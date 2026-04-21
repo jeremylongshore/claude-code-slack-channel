@@ -9,18 +9,17 @@
  */
 
 import { expect } from 'bun:test'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'fs'
-import { tmpdir } from 'os'
-import { join } from 'path'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
-  verifyJournal,
   canonicalJson,
-  sha256Hex,
-  JournalWriter,
   type JournalEvent,
+  sha256Hex,
   type VerifyResult,
+  verifyJournal,
 } from '../../journal.ts'
-import type { Context, StepRegistry } from '../runner.ts'
+import type { StepRegistry } from '../runner.ts'
 
 // ---------------------------------------------------------------------------
 // Fixture directory
@@ -79,7 +78,7 @@ function eventsToLines(events: JournalEvent[]): string[] {
 }
 
 function writeJournalFile(path: string, lines: string[]): void {
-  writeFileSync(path, lines.join('\n') + '\n', 'utf8')
+  writeFileSync(path, `${lines.join('\n')}\n`, 'utf8')
 }
 
 // ---------------------------------------------------------------------------
@@ -99,23 +98,23 @@ export function registerJournalSteps(registry: StepRegistry): void {
       const anchor = sha256Hex('genesis-anchor')
       const events = buildChain(5, anchor)
       writeJournalFile(path, eventsToLines(events))
-      ctx['journalPath'] = path
-      ctx['expectedCount'] = events.length
+      ctx.journalPath = path
+      ctx.expectedCount = events.length
     },
   )
 
   registry.register(
     'the verifier reads the journal end-to-end',
     async (ctx) => {
-      const path = ctx['journalPath'] as string
-      ctx['result'] = await verifyJournal(path)
+      const path = ctx.journalPath as string
+      ctx.result = await verifyJournal(path)
     },
   )
 
   registry.register(
     'the result reports ok',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(true)
     },
   )
@@ -123,10 +122,10 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the events-verified count matches the number of records',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(true)
       if (result.ok) {
-        expect(result.eventsVerified).toBe(ctx['expectedCount'] as number)
+        expect(result.eventsVerified).toBe(ctx.expectedCount as number)
       }
     },
   )
@@ -150,23 +149,23 @@ export function registerJournalSteps(registry: StepRegistry): void {
       lines[4] = JSON.stringify(tampered)
 
       writeJournalFile(path, lines)
-      ctx['journalPath'] = path
-      ctx['breakLine'] = 5
+      ctx.journalPath = path
+      ctx.breakLine = 5
     },
   )
 
   registry.register(
     'the verifier reads the journal in order',
     async (ctx) => {
-      const path = ctx['journalPath'] as string
-      ctx['result'] = await verifyJournal(path)
+      const path = ctx.journalPath as string
+      ctx.result = await verifyJournal(path)
     },
   )
 
   registry.register(
     'the result reports not-ok at the fifth line',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.lineNumber).toBe(5)
@@ -177,7 +176,7 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the break reason names the prevHash chain break',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         // Either prevHash mismatch or hash mismatch is acceptable — tampering
@@ -216,14 +215,14 @@ export function registerJournalSteps(registry: StepRegistry): void {
 
       const lines = [...eventsToLines(first9), eventsToLines(last2)[1]!]
       writeJournalFile(path, lines)
-      ctx['journalPath'] = path
+      ctx.journalPath = path
     },
   )
 
   registry.register(
     'the result reports not-ok at the line with seq eleven',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.seq).toBe(11)
@@ -234,7 +233,7 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the break reason names the seq gap and the expected value',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.reason).toMatch(/seq gap|prevHash/)
@@ -270,14 +269,14 @@ export function registerJournalSteps(registry: StepRegistry): void {
       // The version skew check is BEFORE the hash recompute check, so we DON'T need
       // to fix subsequent lines — the verifier will stop at line 4.
       writeJournalFile(path, lines)
-      ctx['journalPath'] = path
+      ctx.journalPath = path
     },
   )
 
   registry.register(
     'the result reports not-ok at the fourth line',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.lineNumber).toBe(4)
@@ -288,7 +287,7 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the break reason names the version skew',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.reason).toMatch(/version skew/)
@@ -313,14 +312,14 @@ export function registerJournalSteps(registry: StepRegistry): void {
       lines[2] = '{ this is not valid JSON }'
 
       writeJournalFile(path, lines)
-      ctx['journalPath'] = path
+      ctx.journalPath = path
     },
   )
 
   registry.register(
     'the result reports not-ok at the third line',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.lineNumber).toBe(3)
@@ -331,7 +330,7 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the break reason mentions a parse or schema failure',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.reason).toMatch(/parse|schema/)
@@ -356,14 +355,14 @@ export function registerJournalSteps(registry: StepRegistry): void {
       lines.splice(5, 0, '')
 
       writeJournalFile(path, lines)
-      ctx['journalPath'] = path
+      ctx.journalPath = path
     },
   )
 
   registry.register(
     'the result reports not-ok at the sixth line',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.lineNumber).toBe(6)
@@ -374,7 +373,7 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the break reason names structural damage',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.reason).toMatch(/structural damage|empty line/)
@@ -390,22 +389,22 @@ export function registerJournalSteps(registry: StepRegistry): void {
     'no audit journal exists at the requested path',
     (ctx) => {
       const dir = ensureTmpRoot()
-      ctx['journalPath'] = join(dir, 'does-not-exist.log')
+      ctx.journalPath = join(dir, 'does-not-exist.log')
     },
   )
 
   registry.register(
     'the verifier is invoked against the missing path',
     async (ctx) => {
-      const path = ctx['journalPath'] as string
-      ctx['result'] = await verifyJournal(path)
+      const path = ctx.journalPath as string
+      ctx.result = await verifyJournal(path)
     },
   )
 
   registry.register(
     'the result reports not-ok',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
     },
   )
@@ -413,7 +412,7 @@ export function registerJournalSteps(registry: StepRegistry): void {
   registry.register(
     'the break reason includes the underlying read failure',
     (ctx) => {
-      const result = ctx['result'] as VerifyResult
+      const result = ctx.result as VerifyResult
       expect(result.ok).toBe(false)
       if (!result.ok) {
         expect(result.break.reason).toMatch(/read failed/)

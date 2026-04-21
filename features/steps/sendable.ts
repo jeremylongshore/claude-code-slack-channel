@@ -9,11 +9,11 @@
  */
 
 import { expect } from 'bun:test'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
-import { tmpdir } from 'os'
-import { join } from 'path'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { assertSendable } from '../../lib.ts'
-import type { Context, StepRegistry } from '../runner.ts'
+import type { StepRegistry } from '../runner.ts'
 
 // ---------------------------------------------------------------------------
 // Fixture management — one tmp tree shared across all scenarios in this file.
@@ -94,21 +94,21 @@ export function registerSendableSteps(
   registry.register(
     'an inbox directory exists at a known location',
     (ctx) => {
-      ctx['inboxDir'] = inboxDir
+      ctx.inboxDir = inboxDir
     },
   )
 
   registry.register(
     'the allowlisted sendable roots are configured explicitly',
     (ctx) => {
-      ctx['allowlistRoots'] = [allowlistRoot]
+      ctx.allowlistRoots = [allowlistRoot]
     },
   )
 
   registry.register(
     'the state root contains credential files that are never sendable',
     (ctx) => {
-      ctx['stateRoot'] = stateRoot
+      ctx.stateRoot = stateRoot
     },
   )
 
@@ -120,7 +120,7 @@ export function registerSendableSteps(
     'a caller requests a file path that contains a parent-component token',
     (ctx) => {
       // Raw traversal string — assertSendable checks before resolving
-      ctx['targetPath'] = join(inboxDir, '..', 'outside', 'secret.txt')
+      ctx.targetPath = join(inboxDir, '..', 'outside', 'secret.txt')
     },
   )
 
@@ -164,7 +164,7 @@ export function registerSendableSteps(
   registry.register(
     'a caller requests a path that realpath cannot resolve',
     (ctx) => {
-      ctx['targetPath'] = join(inboxDir, 'does-not-exist.png')
+      ctx.targetPath = join(inboxDir, 'does-not-exist.png')
     },
   )
 
@@ -195,7 +195,7 @@ export function registerSendableSteps(
   registry.register(
     'a caller requests a path that resolves under the state root',
     (ctx) => {
-      ctx['targetPath'] = join(stateRoot, 'access.json')
+      ctx.targetPath = join(stateRoot, 'access.json')
     },
   )
 
@@ -219,7 +219,7 @@ export function registerSendableSteps(
     'the inbox carve-out does not apply',
     (ctx) => {
       // The file is in stateRoot/access.json, NOT in the inbox. Verify.
-      const path = ctx['targetPath'] as string
+      const path = ctx.targetPath as string
       expect(path).toContain('state')
       expect(path).not.toContain('inbox')
     },
@@ -232,7 +232,7 @@ export function registerSendableSteps(
   registry.register(
     'a caller requests a path that resolves under the inbox directory',
     (ctx) => {
-      ctx['targetPath'] = join(inboxDir, 'photo.png')
+      ctx.targetPath = join(inboxDir, 'photo.png')
     },
   )
 
@@ -255,8 +255,8 @@ export function registerSendableSteps(
       // Inbox IS under stateRoot-equivalent (we put it in a different root here,
       // but the semantics are the same: inbox is always an exempted subdir).
       // Re-run with stateRoot = parent of inbox to verify carve-out.
-      const inbox = ctx['inboxDir'] as string
-      const allowlistRoots = ctx['allowlistRoots'] as string[]
+      const inbox = ctx.inboxDir as string
+      const allowlistRoots = ctx.allowlistRoots as string[]
       const targetPath = join(inbox, 'photo.png')
       // Here the stateRoot wraps the inbox — carve-out must still allow it.
       const rootParent = fixtures.root
@@ -271,7 +271,7 @@ export function registerSendableSteps(
   registry.register(
     'a credential file lives under an allowlisted root',
     (ctx) => {
-      ctx['targetPath'] = join(allowlistRoot, 'creds', 'credentials')
+      ctx.targetPath = join(allowlistRoot, 'creds', 'credentials')
     },
   )
 
@@ -302,7 +302,7 @@ export function registerSendableSteps(
   registry.register(
     "a caller requests a file whose parent chain includes a sensitive directory name",
     (ctx) => {
-      ctx['targetPath'] = join(allowlistRoot, '.ssh', 'id_rsa')
+      ctx.targetPath = join(allowlistRoot, '.ssh', 'id_rsa')
     },
   )
 
@@ -326,7 +326,7 @@ export function registerSendableSteps(
   registry.register(
     "a caller requests a file whose parent chain matches a pair denylist entry",
     (ctx) => {
-      ctx['targetPath'] = join(allowlistRoot, '.config', 'gcloud', 'credentials')
+      ctx.targetPath = join(allowlistRoot, '.config', 'gcloud', 'credentials')
     },
   )
 
@@ -350,7 +350,7 @@ export function registerSendableSteps(
   registry.register(
     'a caller requests a path that resolves outside the configured roots',
     (ctx) => {
-      ctx['targetPath'] = join(fixtures.root, 'outside', 'secret.txt')
+      ctx.targetPath = join(fixtures.root, 'outside', 'secret.txt')
     },
   )
 

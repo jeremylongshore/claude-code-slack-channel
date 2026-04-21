@@ -35,10 +35,10 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createHash, randomBytes } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { type FileHandle, open as fsOpen, readFile } from 'node:fs/promises'
 import { z } from 'zod'
-import { createHash, randomBytes } from 'crypto'
-import { open as fsOpen, readFile, type FileHandle } from 'fs/promises'
-import { existsSync, readFileSync } from 'fs'
 import type { SessionKey } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -533,7 +533,7 @@ export class JournalWriter {
     // (e.g. a framing field assembled incorrectly) rather than caller bugs.
     JournalEvent.parse(event)
 
-    const line = JSON.stringify(event) + '\n'
+    const line = `${JSON.stringify(event)}\n`
     try {
       await this.fh.write(line)
       // fsync after every successful write (ccsc-5pi.7). Durability
@@ -628,14 +628,14 @@ export function canonicalJson(value: unknown): string {
   }
   if (typeof value === 'string') return JSON.stringify(value)
   if (Array.isArray(value)) {
-    return '[' + value.map(canonicalJson).join(',') + ']'
+    return `[${value.map(canonicalJson).join(',')}]`
   }
   if (isRecord(value)) {
     const keys = Object.keys(value).sort()
     const pairs = keys.map(
-      (k) => JSON.stringify(k) + ':' + canonicalJson(value[k]),
+      (k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`,
     )
-    return '{' + pairs.join(',') + '}'
+    return `{${pairs.join(',')}}`
   }
   throw new Error(`canonicalJson: unsupported value type: ${typeof value}`)
 }
@@ -944,6 +944,7 @@ export type VerifyResult =
 // to stay decoupled from journal.ts. These bidirectional checks break
 // the build the moment either side drifts.
 import type { VerifyResultShape } from './lib.ts'
+
 type _VerifyForward = VerifyResult extends VerifyResultShape ? true : never
 type _VerifyBackward = VerifyResultShape extends VerifyResult ? true : never
 const _verifyShapeForward: _VerifyForward = true

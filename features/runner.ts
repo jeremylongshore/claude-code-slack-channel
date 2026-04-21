@@ -45,7 +45,7 @@ export class StepRegistry {
   register(pattern: string | RegExp, fn: StepFn): void {
     const re =
       typeof pattern === 'string'
-        ? new RegExp('^' + escapeRegExp(pattern) + '$')
+        ? new RegExp(`^${escapeRegExp(pattern)}$`)
         : pattern
     this.steps.push({ pattern: re, fn })
   }

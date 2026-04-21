@@ -9,12 +9,12 @@
 
 import { expect } from 'bun:test'
 import {
-  gate,
-  defaultAccess,
-  PERMISSION_REPLY_RE,
   type Access,
+  defaultAccess,
   type GateOptions,
   type GateResult,
+  gate,
+  PERMISSION_REPLY_RE,
 } from '../../lib.ts'
 import type { Context, StepRegistry } from '../runner.ts'
 
@@ -37,8 +37,8 @@ function makeOpts(overrides: Partial<GateOptions> = {}): GateOptions {
 /** Run gate() and store the result in ctx.result. */
 async function runGate(event: unknown, opts: GateOptions, ctx: Context): Promise<void> {
   const result = await gate(event, opts)
-  ctx['result'] = result
-  ctx['opts'] = opts
+  ctx.result = result
+  ctx.opts = opts
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the gate decides to drop the event',
     (ctx) => {
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('drop')
     },
   )
@@ -85,7 +85,7 @@ export function registerGateSteps(registry: StepRegistry): void {
     'no downstream notification is emitted',
     (ctx) => {
       // In gate() the 'drop' action IS the mechanism for not emitting.
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('drop')
     },
   )
@@ -104,14 +104,14 @@ export function registerGateSteps(registry: StepRegistry): void {
           // allowBotIds absent = empty
         },
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
   registry.register(
     'a peer bot posts a message into that channel',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',
@@ -142,14 +142,14 @@ export function registerGateSteps(registry: StepRegistry): void {
           },
         },
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
   registry.register(
     'that peer bot posts a non-command message into the channel',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',
@@ -166,7 +166,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the gate decides to deliver the event',
     (ctx) => {
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('deliver')
     },
   )
@@ -174,7 +174,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the event is handled by the normal channel pipeline',
     (ctx) => {
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('deliver')
     },
   )
@@ -186,7 +186,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     "that peer bot posts text shaped like an approval reply",
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       // 'y abcde' matches PERMISSION_REPLY_RE
       const event = {
@@ -216,7 +216,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'a channel-tombstone event carries no user field',
     (ctx) => {
-      ctx['tombstoneEvent'] = {
+      ctx.tombstoneEvent = {
         type: 'message',
         subtype: 'message_deleted',
         channel: 'C_CHAN',
@@ -229,7 +229,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the gate evaluates the event',
     async (ctx) => {
-      const event = ctx['tombstoneEvent'] as unknown
+      const event = ctx.tombstoneEvent as unknown
       const opts = makeOpts()
       await runGate(event, opts, ctx)
     },
@@ -246,14 +246,14 @@ export function registerGateSteps(registry: StepRegistry): void {
         ...defaultAccess(),
         allowFrom: ['U_ALLOWED'],
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
   registry.register(
     'that user direct-messages the bot',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',
@@ -270,7 +270,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the DM is routed to the normal handler pipeline',
     (ctx) => {
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('deliver')
     },
   )
@@ -287,7 +287,7 @@ export function registerGateSteps(registry: StepRegistry): void {
         dmPolicy: 'pairing',
         allowFrom: [],
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
@@ -301,7 +301,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'an unknown user direct-messages the bot for the first time',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',
@@ -318,7 +318,7 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the gate decides to issue a new pairing code',
     (ctx) => {
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('pair')
     },
   )
@@ -326,10 +326,10 @@ export function registerGateSteps(registry: StepRegistry): void {
   registry.register(
     'the pending map records the code against the sender',
     (ctx) => {
-      const result = ctx['result'] as GateResult
+      const result = ctx.result as GateResult
       expect(result.action).toBe('pair')
       expect(typeof result.code).toBe('string')
-      const access = (ctx['opts'] as GateOptions).access
+      const access = (ctx.opts as GateOptions).access
       expect(Object.keys(access.pending).length).toBeGreaterThan(0)
     },
   )
@@ -346,14 +346,14 @@ export function registerGateSteps(registry: StepRegistry): void {
         dmPolicy: 'allowlist',
         allowFrom: [],
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
   registry.register(
     'an unknown user direct-messages the bot',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',
@@ -378,14 +378,14 @@ export function registerGateSteps(registry: StepRegistry): void {
         ...defaultAccess(),
         channels: {}, // C_NEW not present
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
   registry.register(
     'a human posts a message into that channel',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',
@@ -411,14 +411,14 @@ export function registerGateSteps(registry: StepRegistry): void {
           C_CHAN: { requireMention: true, allowFrom: [] },
         },
       }
-      ctx['access'] = access
+      ctx.access = access
     },
   )
 
   registry.register(
     'a human posts a message that does not mention the bot',
     async (ctx) => {
-      const access = ctx['access'] as Access
+      const access = ctx.access as Access
       const opts = makeOpts({ access })
       const event = {
         type: 'message',

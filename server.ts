@@ -1,4 +1,15 @@
 #!/usr/bin/env bun
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 /**
  * Slack Channel for Claude Code
  *
@@ -13,73 +24,61 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { z } from 'zod'
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
-import { homedir } from 'os'
-import { join, resolve } from 'path'
+import { z } from 'zod'
+import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  chmodSync,
-  existsSync,
-  renameSync,
-  statSync,
-} from 'fs'
-import {
-  defaultAccess,
-  pruneExpired,
-  generateCode as _generateCode,
-  assertSendable as libAssertSendable,
-  parseSendableRoots,
-  validateSendableRoots,
-  assertOutboundAllowed as libAssertOutboundAllowed,
-  assertPublishAllowed,
-  deliveredThreadKey as libDeliveredThreadKey,
-  permissionPairingKey as permKey,
-  listSessions as libListSessions,
-  LIST_SESSIONS_MAX,
-  isSlackFileUrl,
-  chunkText,
-  sanitizeFilename,
-  sanitizeDisplayName,
-  gate as libGate,
-  isDuplicateEvent,
-  resolveJournalPath,
-  parseVerifyArg,
-  formatVerifyResult,
-  decidePermissionRoute,
-  recordApprovalVote,
-  EVENT_DEDUP_TTL_MS,
-  PERMISSION_REPLY_RE,
-  escMrkdwn,
-  buildAndPostAuditReceipt,
-  enforceAuditReceiptCap,
-  AUDIT_RECEIPTS_MAX,
   type Access,
+  AUDIT_RECEIPTS_MAX,
+  assertPublishAllowed,
+  buildAndPostAuditReceipt,
+  chunkText,
+  decidePermissionRoute,
+  defaultAccess,
+  EVENT_DEDUP_TTL_MS,
+  enforceAuditReceiptCap,
+  escMrkdwn,
+  formatVerifyResult,
   type GateResult,
+  isDuplicateEvent,
+  isSlackFileUrl,
+  LIST_SESSIONS_MAX,
+  assertOutboundAllowed as libAssertOutboundAllowed,
+  assertSendable as libAssertSendable,
+  deliveredThreadKey as libDeliveredThreadKey,
+  gate as libGate,
+  listSessions as libListSessions,
+  PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
+  parseSendableRoots,
+  parseVerifyArg,
+  permissionPairingKey as permKey,
+  pruneExpired,
+  recordApprovalVote,
+  resolveJournalPath,
+  sanitizeDisplayName,
+  sanitizeFilename,
+  validateSendableRoots,
 } from './lib.ts'
-import { JournalWriter, createBootAnchor, verifyJournal } from './journal.ts'
 import {
-  extractManifests,
+  assertPublishSizeAndSerialize,
   createManifestCache,
   createPublishRateLimiter,
+  extractManifests,
   findOurPriorManifestPins,
   ManifestV1,
-  assertPublishSizeAndSerialize,
   type PinItemLike,
 } from './manifest.ts'
 import {
-  parsePolicyRules,
-  evaluate as policyEvaluate,
-  detectShadowing,
-  detectBroadAutoApprove,
+  type ApprovalKey,
   approvalKey,
+  detectBroadAutoApprove,
+  detectShadowing,
   type PolicyRule,
   type ToolCall as PolicyToolCall,
-  type ApprovalKey,
+  parsePolicyRules,
+  evaluate as policyEvaluate,
 } from './policy.ts'
 
 // ---------------------------------------------------------------------------
@@ -118,6 +117,7 @@ if (_verifyPath !== null) {
     process.exit(2)
   }
 }
+
 import {
   createSessionSupervisor,
   resolveIdleMs,
@@ -125,13 +125,13 @@ import {
 } from './supervisor.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
-export { MAX_PENDING, MAX_PAIRING_REPLIES, PAIRING_EXPIRY_MS } from './lib.ts'
+export { MAX_PAIRING_REPLIES, MAX_PENDING, PAIRING_EXPIRY_MS } from './lib.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const STATE_DIR = process.env['SLACK_STATE_DIR'] || join(homedir(), '.claude', 'channels', 'slack')
+const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'channels', 'slack')
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
@@ -145,7 +145,7 @@ const DEFAULT_CHUNK_LIMIT = 4000
 // readable at startup. A missing root used to degrade silently to lexical
 // resolution in assertSendable — a TOCTOU window where an attacker could
 // plant a symlink post-boot. Validating here closes that window.
-const SENDABLE_ROOTS = parseSendableRoots(process.env['SLACK_SENDABLE_ROOTS'])
+const SENDABLE_ROOTS = parseSendableRoots(process.env.SLACK_SENDABLE_ROOTS)
 try {
   validateSendableRoots(SENDABLE_ROOTS)
 } catch (err) {
@@ -187,8 +187,8 @@ function loadEnv(): { botToken: string; appToken: string } {
     vars[key] = val
   }
 
-  const botToken = vars['SLACK_BOT_TOKEN'] || ''
-  const appToken = vars['SLACK_APP_TOKEN'] || ''
+  const botToken = vars.SLACK_BOT_TOKEN || ''
+  const appToken = vars.SLACK_APP_TOKEN || ''
 
   if (!botToken.startsWith('xoxb-')) {
     console.error('[slack] SLACK_BOT_TOKEN must start with xoxb-')
@@ -226,7 +226,7 @@ function loadAccess(): Access {
     return { ...defaultAccess(), ...JSON.parse(raw) }
   } catch {
     // Corrupt file — move aside, start fresh
-    const aside = ACCESS_FILE + '.corrupt.' + Date.now()
+    const aside = `${ACCESS_FILE}.corrupt.${Date.now()}`
     try {
       renameSync(ACCESS_FILE, aside)
     } catch { /* ignore */ }
@@ -249,7 +249,7 @@ function saveAccess(access: Access): void {
 // Static mode
 // ---------------------------------------------------------------------------
 
-const STATIC_MODE = (process.env['SLACK_ACCESS_MODE'] || '').toLowerCase() === 'static'
+const STATIC_MODE = (process.env.SLACK_ACCESS_MODE || '').toLowerCase() === 'static'
 let staticAccess: Access | null = null
 
 if (STATIC_MODE) {
@@ -287,7 +287,7 @@ function getAccess(): Access {
 // block. Fail loud so the operator fixes the config.
 // ---------------------------------------------------------------------------
 
-let policyRules: readonly PolicyRule[] = loadPolicyRulesAtBoot()
+const policyRules: readonly PolicyRule[] = loadPolicyRulesAtBoot()
 const policyApprovals = new Map<ApprovalKey, { ttlExpires: number }>()
 
 /** Pre-execution audit receipts awaiting their post-execution edit.
@@ -1825,7 +1825,7 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
       const MAX_PREVIEW = 2900
       const previewText = details.input_preview
         ? details.input_preview.length > MAX_PREVIEW
-          ? details.input_preview.slice(0, MAX_PREVIEW) + '…'
+          ? `${details.input_preview.slice(0, MAX_PREVIEW)}…`
           : details.input_preview
         : 'No preview available'
 
@@ -2076,10 +2076,10 @@ async function handleMessage(event: unknown): Promise<void> {
       journalWrite({
         kind: 'gate.inbound.drop',
         outcome: 'drop',
-        actor: ev['bot_id'] ? 'peer_agent' : 'session_owner',
+        actor: ev.bot_id ? 'peer_agent' : 'session_owner',
         input: {
-          channel: ev['channel'] as string,
-          user: ev['user'] as string | undefined,
+          channel: ev.channel as string,
+          user: ev.user as string | undefined,
         },
       })
       return
@@ -2093,7 +2093,7 @@ async function handleMessage(event: unknown): Promise<void> {
           kind: 'pairing.issued',
           outcome: 'n/a',
           actor: 'system',
-          input: { channel: ev['channel'] as string },
+          input: { channel: ev.channel as string },
         })
       }
 
@@ -2102,7 +2102,7 @@ async function handleMessage(event: unknown): Promise<void> {
         : `Hi! I need to verify you before connecting.\nYour pairing code: *${result.code}*\nAsk the Claude Code user to run: \`/slack-channel:access pair ${result.code}\``
 
       await web.chat.postMessage({
-        channel: ev['channel'] as string,
+        channel: ev.channel as string,
         text: msg,
         unfurl_links: false,
         unfurl_media: false,
@@ -2112,30 +2112,30 @@ async function handleMessage(event: unknown): Promise<void> {
 
     case 'deliver': {
       // Audit log for delivered bot messages (diagnostics for multi-agent flows)
-      if (ev['bot_id']) {
+      if (ev.bot_id) {
         console.error('[slack] bot message delivered', {
-          bot_id: ev['bot_id'],
-          user: ev['user'],
-          channel: ev['channel'],
-          ts: ev['ts'],
+          bot_id: ev.bot_id,
+          user: ev.user,
+          channel: ev.channel,
+          ts: ev.ts,
         })
       }
 
       // Track this (channel, thread) pair as delivered (for outbound
       // gate). A thread-level key so replies cannot leak across
       // threads in the same channel (ccsc-xa3.6).
-      const channelId = ev['channel'] as string
-      const incomingThreadTs = ev['thread_ts'] as string | undefined
+      const channelId = ev.channel as string
+      const incomingThreadTs = ev.thread_ts as string | undefined
       deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
 
       journalWrite({
         kind: 'gate.inbound.deliver',
         outcome: 'allow',
-        actor: ev['bot_id'] ? 'peer_agent' : 'session_owner',
-        sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev['ts'] as string) },
+        actor: ev.bot_id ? 'peer_agent' : 'session_owner',
+        sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
         input: {
           channel: channelId,
-          user: ev['bot_id'] ? (ev['bot_id'] as string) : (ev['user'] as string | undefined),
+          user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
           thread_ts: incomingThreadTs,
         },
       })
@@ -2152,8 +2152,8 @@ async function handleMessage(event: unknown): Promise<void> {
       if (supervisor !== null) {
         await activateAndTouch(
           supervisor,
-          { channel: channelId, thread: incomingThreadTs ?? (ev['ts'] as string) },
-          ev['user'] as string | undefined,
+          { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
+          ev.user as string | undefined,
         )
       }
 
@@ -2162,9 +2162,9 @@ async function handleMessage(event: unknown): Promise<void> {
       lastActiveThread = incomingThreadTs
 
       // Check for permission reply before normal delivery
-      const msgText = ((ev['text'] as string) || '').trim()
+      const msgText = ((ev.text as string) || '').trim()
       const permMatch = PERMISSION_REPLY_RE.exec(msgText)
-      if (permMatch && result.access!.allowFrom.includes(ev['user'] as string)) {
+      if (permMatch && result.access!.allowFrom.includes(ev.user as string)) {
         const requestId = permMatch[2].toLowerCase()
 
         pruneStalePermissions()
@@ -2184,7 +2184,7 @@ async function handleMessage(event: unknown): Promise<void> {
           try {
             await web.reactions.add({
               channel: channelId,
-              timestamp: ev['ts'] as string,
+              timestamp: ev.ts as string,
               name: 'heavy_multiplication_x',
             })
           } catch { /* non-critical */ }
@@ -2197,13 +2197,13 @@ async function handleMessage(event: unknown): Promise<void> {
         // the button path (processApprovalVote); UX is reactions instead
         // of Block Kit message updates.
         if (replyDetails.policy && replyIsAllow) {
-          const voterId = ev['user'] as string
+          const voterId = ev.user as string
           const result = processApprovalVote(replyDetails, voterId, Date.now())
           if (result.kind === 'duplicate') {
             try {
               await web.reactions.add({
                 channel: channelId,
-                timestamp: ev['ts'] as string,
+                timestamp: ev.ts as string,
                 name: 'no_entry_sign',
               })
             } catch { /* non-critical */ }
@@ -2213,7 +2213,7 @@ async function handleMessage(event: unknown): Promise<void> {
             try {
               await web.reactions.add({
                 channel: channelId,
-                timestamp: ev['ts'] as string,
+                timestamp: ev.ts as string,
                 name: 'ballot_box_with_check',
               })
             } catch { /* non-critical */ }
@@ -2249,7 +2249,7 @@ async function handleMessage(event: unknown): Promise<void> {
         try {
           await web.reactions.add({
             channel: channelId,
-            timestamp: ev['ts'] as string,
+            timestamp: ev.ts as string,
             name: 'white_check_mark',
           })
         } catch { /* non-critical */ }
@@ -2257,14 +2257,14 @@ async function handleMessage(event: unknown): Promise<void> {
       }
 
       const access = result.access!
-      const userName = await resolveUserName(ev['user'] as string)
+      const userName = await resolveUserName(ev.user as string)
 
       // Ack reaction
       if (access.ackReaction) {
         try {
           await web.reactions.add({
-            channel: ev['channel'] as string,
-            timestamp: ev['ts'] as string,
+            channel: ev.channel as string,
+            timestamp: ev.ts as string,
             name: access.ackReaction,
           })
         } catch { /* non-critical */ }
@@ -2277,21 +2277,21 @@ async function handleMessage(event: unknown): Promise<void> {
       // safe to render but MUST NOT be used for authorization decisions.
       // We still run user_id through a strict format check (Slack IDs are
       // A-Z/0-9 only) so a malformed event payload cannot inject markup.
-      const rawUserId = ev['user'] as string
+      const rawUserId = ev.user as string
       const userIdSafe = /^[A-Z0-9]{1,32}$/.test(rawUserId) ? rawUserId : 'invalid'
       const meta: Record<string, string> = {
-        chat_id: ev['channel'] as string,
-        message_id: ev['ts'] as string,
+        chat_id: ev.channel as string,
+        message_id: ev.ts as string,
         user_id: userIdSafe,
         user: userName,
-        ts: ev['ts'] as string,
+        ts: ev.ts as string,
       }
 
-      if (ev['thread_ts']) {
-        meta.thread_ts = ev['thread_ts'] as string
+      if (ev.thread_ts) {
+        meta.thread_ts = ev.thread_ts as string
       }
 
-      const evFiles = ev['files'] as any[] | undefined
+      const evFiles = ev.files as any[] | undefined
       if (evFiles?.length) {
         const fileDescs = evFiles.map((f: any) => {
           const name = sanitizeFilename(f.name || 'unnamed')
@@ -2302,7 +2302,7 @@ async function handleMessage(event: unknown): Promise<void> {
       }
 
       // Strip bot mention from text if present
-      let text = (ev['text'] as string | undefined) || ''
+      let text = (ev.text as string | undefined) || ''
       if (botUserId) {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
@@ -2523,7 +2523,7 @@ async function main(): Promise<void> {
     botUserId = (auth.user_id as string) || ''
     selfBotId = (auth.bot_id as string) || ''
     // app_id may not be present in all auth.test responses; fall back to empty
-    selfAppId = ((auth as unknown as Record<string, unknown>)['app_id'] as string) || ''
+    selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
     console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
   } catch (err) {
     console.error('[slack] Failed to resolve bot identity:', err)

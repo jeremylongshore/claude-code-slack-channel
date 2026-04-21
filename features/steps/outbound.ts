@@ -8,10 +8,10 @@
 
 import { expect } from 'bun:test'
 import {
-  assertOutboundAllowed,
-  deliveredThreadKey,
-  defaultAccess,
   type Access,
+  assertOutboundAllowed,
+  defaultAccess,
+  deliveredThreadKey,
 } from '../../lib.ts'
 import type { Context, StepRegistry } from '../runner.ts'
 
@@ -29,9 +29,9 @@ function tryOutbound(
 ): void {
   try {
     assertOutboundAllowed(chatId, threadTs, access, deliveredThreads)
-    ctx['outboundError'] = null
+    ctx.outboundError = null
   } catch (e) {
-    ctx['outboundError'] = e as Error
+    ctx.outboundError = e as Error
   }
 }
 
@@ -53,10 +53,10 @@ export function registerOutboundSteps(registry: StepRegistry): void {
           C_OPT: { requireMention: false, allowFrom: [] },
         },
       }
-      ctx['access'] = access
-      ctx['chatId'] = 'C_OPT'
-      ctx['threadTs'] = undefined
-      ctx['deliveredThreads'] = new Set<string>()
+      ctx.access = access
+      ctx.chatId = 'C_OPT'
+      ctx.threadTs = undefined
+      ctx.deliveredThreads = new Set<string>()
     },
   )
 
@@ -76,7 +76,7 @@ export function registerOutboundSteps(registry: StepRegistry): void {
   registry.register(
     'the gate allows the outbound message',
     (ctx) => {
-      expect(ctx['outboundError']).toBeNull()
+      expect(ctx.outboundError).toBeNull()
     },
   )
 
@@ -84,7 +84,7 @@ export function registerOutboundSteps(registry: StepRegistry): void {
     'the channel-level opt-in supersedes any thread-level delivery check',
     (ctx) => {
       // Confirm that even with an empty deliveredThreads set, the opt-in channel passes.
-      expect(ctx['outboundError']).toBeNull()
+      expect(ctx.outboundError).toBeNull()
     },
   )
 
@@ -100,10 +100,10 @@ export function registerOutboundSteps(registry: StepRegistry): void {
       const deliveredThreads = new Set<string>([
         deliveredThreadKey(channel, thread),
       ])
-      ctx['access'] = defaultAccess()
-      ctx['chatId'] = channel
-      ctx['threadTs'] = thread
-      ctx['deliveredThreads'] = deliveredThreads
+      ctx.access = defaultAccess()
+      ctx.chatId = channel
+      ctx.threadTs = thread
+      ctx.deliveredThreads = deliveredThreads
     },
   )
 
@@ -123,7 +123,7 @@ export function registerOutboundSteps(registry: StepRegistry): void {
   registry.register(
     'the composite key matches the delivered entry',
     (ctx) => {
-      expect(ctx['outboundError']).toBeNull()
+      expect(ctx.outboundError).toBeNull()
     },
   )
 
@@ -134,16 +134,16 @@ export function registerOutboundSteps(registry: StepRegistry): void {
   registry.register(
     'the channel is not in the access allowlist',
     (ctx) => {
-      ctx['access'] = defaultAccess() // no channels
-      ctx['chatId'] = 'C_UNOPT'
-      ctx['threadTs'] = '9999.0001'
+      ctx.access = defaultAccess() // no channels
+      ctx.chatId = 'C_UNOPT'
+      ctx.threadTs = '9999.0001'
     },
   )
 
   registry.register(
     'the delivered-threads set is empty for this thread',
     (ctx) => {
-      ctx['deliveredThreads'] = new Set<string>()
+      ctx.deliveredThreads = new Set<string>()
     },
   )
 
@@ -163,15 +163,15 @@ export function registerOutboundSteps(registry: StepRegistry): void {
   registry.register(
     'the gate throws an outbound-gate error',
     (ctx) => {
-      expect(ctx['outboundError']).not.toBeNull()
-      expect((ctx['outboundError'] as Error).message).toContain('Outbound gate')
+      expect(ctx.outboundError).not.toBeNull()
+      expect((ctx.outboundError as Error).message).toContain('Outbound gate')
     },
   )
 
   registry.register(
     'the error identifies the channel and thread that failed the check',
     (ctx) => {
-      const err = ctx['outboundError'] as Error
+      const err = ctx.outboundError as Error
       expect(err.message).toContain('C_UNOPT')
     },
   )
@@ -188,11 +188,11 @@ export function registerOutboundSteps(registry: StepRegistry): void {
       const deliveredThreads = new Set<string>([
         deliveredThreadKey(channel, threadA),
       ])
-      ctx['access'] = defaultAccess()
-      ctx['chatId'] = channel
-      ctx['threadA'] = threadA
-      ctx['threadB'] = '2222.0002'
-      ctx['deliveredThreads'] = deliveredThreads
+      ctx.access = defaultAccess()
+      ctx.chatId = channel
+      ctx.threadA = threadA
+      ctx.threadB = '2222.0002'
+      ctx.deliveredThreads = deliveredThreads
     },
   )
 
@@ -212,7 +212,7 @@ export function registerOutboundSteps(registry: StepRegistry): void {
   registry.register(
     'cross-thread authority is denied',
     (ctx) => {
-      expect(ctx['outboundError']).not.toBeNull()
+      expect(ctx.outboundError).not.toBeNull()
     },
   )
 
@@ -229,10 +229,10 @@ export function registerOutboundSteps(registry: StepRegistry): void {
       const deliveredThreads = new Set<string>([
         deliveredThreadKey(channel, thread),
       ])
-      ctx['access'] = defaultAccess()
-      ctx['chatId'] = channel
-      ctx['threadTs'] = undefined // top-level post
-      ctx['deliveredThreads'] = deliveredThreads
+      ctx.access = defaultAccess()
+      ctx.chatId = channel
+      ctx.threadTs = undefined // top-level post
+      ctx.deliveredThreads = deliveredThreads
     },
   )
 
@@ -252,7 +252,7 @@ export function registerOutboundSteps(registry: StepRegistry): void {
   registry.register(
     'the top-level slot is distinct from any threaded slot',
     (ctx) => {
-      expect(ctx['outboundError']).not.toBeNull()
+      expect(ctx.outboundError).not.toBeNull()
     },
   )
 }

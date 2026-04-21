@@ -31,21 +31,33 @@
         "noSkippedTests": "error",
         "noDuplicateParameters": "error",
         "noDuplicateCase": "error",
-        "noConstEnum": "error"
+        "noConstEnum": "error",
+        "noControlCharactersInRegex": "error",
+        "noAssignInExpressions": "error"
       },
       "correctness": {
         "noUnreachable": "error",
         "noUnreachableSuper": "error",
         "noConstAssign": "error",
         "noInvalidConstructorSuper": "error",
-        "noGlobalObjectCalls": "error"
+        "noGlobalObjectCalls": "error",
+        "noUnusedImports": "error"
       },
       "security": {
         "noGlobalEval": "error"
       },
       "complexity": {
         "noExtraBooleanCast": "error",
-        "noUselessConstructor": "error"
+        "noUselessConstructor": "error",
+        "useLiteralKeys": "error",
+        "noUselessContinue": "error",
+        "noUselessEscapeInRegex": "error",
+        "useOptionalChain": "error"
+      },
+      "style": {
+        "useNodejsImportProtocol": "error",
+        "useTemplate": "error",
+        "useConst": "error"
       }
     }
   },
@@ -53,7 +65,7 @@
     "enabled": true,
     "actions": {
       "source": {
-        "organizeImports": "off"
+        "organizeImports": "on"
       }
     }
   }

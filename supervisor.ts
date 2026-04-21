@@ -36,9 +36,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { loadSession, saveSession, sessionPath } from './lib'
-import type { Session, SessionKey } from './lib'
 import type { JournalWriter } from './journal'
+import type { Session, SessionKey } from './lib'
+import { loadSession, saveSession, sessionPath } from './lib'
 
 // ---------------------------------------------------------------------------
 // Lifecycle state
@@ -308,7 +308,7 @@ export const DEFAULT_IDLE_MS = 4 * 60 * 60 * 1000
 export function resolveIdleMs(
   env: Record<string, string | undefined> = process.env,
 ): number {
-  const raw = env['SLACK_SESSION_IDLE_MS']
+  const raw = env.SLACK_SESSION_IDLE_MS
   if (raw === undefined || raw === '') return DEFAULT_IDLE_MS
   const parsed = Number(raw)
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_IDLE_MS
@@ -324,7 +324,7 @@ function defaultLog(event: string, fields: Record<string, unknown>): void {
   // process.stdout.write is sync for TTYs, async for pipes; either way
   // the supervisor does not await the flush. Structured logs are best-
   // effort; loss of a line is not a correctness issue.
-  process.stdout.write(line + '\n')
+  process.stdout.write(`${line}\n`)
 }
 
 /** Construct a SessionSupervisor bound to a state directory.
