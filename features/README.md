@@ -32,22 +32,35 @@ To update a scenario:
 3. The updated `.feature` file and the new `.harness-hash` land in the
    same commit.
 
-## Runner status — lint-only today
+## Runner status — fully wired (ccsc-mjw)
 
-There is no executing runner wired up. The CI gate is lint-only:
+The runner is wired. All 37 scenarios across the five feature files
+execute as bun:test tests via `features/runner.test.ts`. Run them
+alongside the main suite:
+
+```bash
+bun test                         # runs server.test.ts + features/runner.test.ts
+bun test features/runner.test.ts # features only
+```
+
+Architecture:
+
+| File | Role |
+|---|---|
+| `features/runner.ts` | Gherkin parser + StepRegistry + buildRunner (no bun:test imports) |
+| `features/runner.test.ts` | bun:test entry — discovers .feature files, wires step defs, runs |
+| `features/steps/gate.ts` | Step defs for `inbound_gate.feature` → `gate()` in `lib.ts` |
+| `features/steps/sendable.ts` | Step defs for `file_exfiltration_guard.feature` → `assertSendable()` |
+| `features/steps/outbound.ts` | Step defs for `outbound_reply_filter.feature` → `assertOutboundAllowed()` |
+| `features/steps/policy.ts` | Step defs for `policy_evaluation.feature` → `evaluate()` in `policy.ts` |
+| `features/steps/journal.ts` | Step defs for `audit_chain_verifier.feature` → `verifyJournal()` |
+
+The CI lint gate still runs and guards the .feature files from
+imperative-verb / structural violations:
 
 ```bash
 bash scripts/gherkin-lint.sh --path features/ --strict
 ```
-
-This enforces declarative style (no imperative verbs, no CSS
-selectors), scenario length (≤10 steps), and structural rules (no
-scenario may start with `And`, a `Background` block is required when
-a `Given` repeats 3+ times).
-
-Wiring a runner that executes the scenarios against real step
-definitions is tracked by a deferred bd filed alongside this scaffold
-(see `000-docs/TEST_AUDIT.md` → "Post-audit follow-up").
 
 ## Pinning (tamper guard)
 
