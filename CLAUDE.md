@@ -131,6 +131,43 @@ All state lives in `~/.claude/channels/slack/` (files `0o600`, directories `0o70
 - Epic / sub-epic titles read like English sentences, not code. Leaf bead titles can stay technical. `ccsc-v1b: Build the policy engine's core logic` ✓, not `29-A.Eval: evaluate() + load-time safety` ✗.
 - Issues → 2–5 themed epics (A/B split + sub-epics when >5 children). Don't ship one flat epic with 10 children.
 
+## Issue tracking (bd) — readable-trail rule
+
+The `/audit-tests` integrity closeout (PR #129) was filed because the prior deep pass (PR #127) skipped pieces of the skill without filing bds for them — leaving only a rationale paragraph in a doc. That's not a trail, that's a memory-leak. The rule that came out of it:
+
+**File a bd for everything skipped, deferred, or accepted as a known gap — even when the rationale looks defensible in the moment.** The bd IS the trail. Docs rot, conversations evaporate, MCP logs age out. bds survive, have IDs, and support `bd search`.
+
+### When to file
+
+- A tool/script in a skill refuses to run or produces noise, and you work around it → file a bd (e.g., `ccsc-g1d` for `bias-count.sh`).
+- A step in a rubric/skill is marked ⚪ N/A or skipped with a rationale → file a bd to revisit.
+- An auto-remediation step is deferred because of time or dependency ordering → file a bd, wire dependencies.
+- A limitation surfaces in a doc ("runner not wired", "only covers lib.ts", "proxy metric until TS tool lands") → file a bd and cite the ID in the doc.
+- A code comment says "TODO" or "fix later" → file a bd, replace the comment with the ID.
+
+### How to file
+
+1. **Title** — one sentence in plain English, naming the outcome. `Wire a Gherkin runner to make features/*.feature scenarios executable` ✓, not `mjw: runner TODO` ✗.
+2. **Description** — why the bd exists, what needs to be done, and enough context that a cold reader can act. Link the discovery site (doc, PR, commit SHA) so a future investigator can find the provenance.
+3. **Acceptance criteria** — concrete, testable. `bunfig.toml configures [install.security] scanner; CI runs the scanner on install` ✓, not `scanner working` ✗.
+4. **Labels** — tag related work so it can be pulled as a set (`audit-integrity`, `security`, `wall1`). Use `bd list --label <x>` to surface the set later.
+5. **Dependencies** — `bd dep add <this> <blocker>` whenever a bd depends on another. `bd ready` honors blockers; `bd blocked` shows the waiting set.
+
+### How to close
+
+**With evidence, not with a wave.** The close `--reason` is what a future audit reads to verify the bd actually shipped:
+
+```
+bd close ccsc-xyz --reason "Shipped in PR #N (commit SHA). <what changed>. <what was verified — tests, lint, CI>."
+```
+
+If the bd was killed without shipping (wrong framing, superseded, obsolete), say so explicitly in `--reason` with the superseding bd id.
+
+### Cross-linking in docs
+
+When a design doc, audit report, or CLAUDE.md references a known limitation, cite the bd id inline — `ccsc-tr7`, not "a follow-up task." Treat bd ids as stable identifiers in prose. Readers can jump from the doc to `bd show <id>` and back.
+
+The reference implementation of this pattern is `000-docs/TEST_AUDIT.md` → "Post-audit follow-up (filed bds)" — one table, every deferred item as a row with a bd id, status, and one-sentence title. Copy that shape when other docs need to project the same "here's what we didn't do and why" surface.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
