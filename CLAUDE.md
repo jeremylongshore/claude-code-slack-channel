@@ -42,6 +42,8 @@ bun test                                 # Run test suite (bun:test) — 669 tes
 bun test --timeout 15000                 # Match CI's timeout
 bun test --watch                         # Watch mode
 bun test --test-name-pattern "gate"      # Run tests matching a pattern
+bun test server.test.ts                  # Just the unit suite (skip Gherkin runner)
+bun test features/runner.test.ts         # Just the Gherkin scenarios (37 tests)
 bun server.ts                            # Run server directly
 npx tsx server.ts                        # Node.js fallback
 ```
@@ -184,20 +186,22 @@ When investigating an incident, start with the authoritative log. Use the projec
 ## State
 
 All state lives in `~/.claude/channels/slack/` (files `0o600`, directories `0o700`, single-writer):
-- `.env` — tokens (0o600)
-- `access.json` — allowlist + pairing codes (0o600, atomic writes)
+- `.env` — tokens
+- `access.json` — allowlist + pairing codes (atomic writes)
 - `inbox/` — downloaded attachments
-- `sessions/<channel>/<thread>.json` — per-thread conversation state (v0.5.0+). Migrated flat pre-0.5.0 files surface as the `default` thread. See [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md) for the layout spec, lifecycle state machine, and supervisor contract; operator-facing docs in [`ACCESS.md`](ACCESS.md#state-directory-layout).
+- `sessions/<channel>/<thread>.json` — per-thread conversation state
+- `audit.log` — hash-chained authoritative journal (Epic 30-A)
+
+Layout spec + lifecycle state machine + supervisor contract: [`000-docs/session-state-machine.md`](000-docs/session-state-machine.md). Operator-facing docs: [`ACCESS.md`](ACCESS.md#state-directory-layout).
 
 ## Conventions
 
-- MIT license
-- Matches `anthropics/claude-plugins-official` patterns (file structure, naming, skills)
-- Bun primary runtime, Node.js/Docker as alternatives
-- TypeScript strict mode
-- No external frameworks beyond the four declared runtime dependencies
+- Matches `anthropics/claude-plugins-official` patterns (file structure, naming, skills).
+- Bun primary runtime; Node.js/Docker as alternatives.
 - Epic / sub-epic titles read like English sentences, not code. Leaf bead titles can stay technical. `ccsc-v1b: Build the policy engine's core logic` ✓, not `29-A.Eval: evaluate() + load-time safety` ✗.
 - Issues → 2–5 themed epics (A/B split + sub-epics when >5 children). Don't ship one flat epic with 10 children.
+- Branch naming: `feat/<description>-bz-<bead-id>` (multiple beads: chain `-bz-<bead>` per bead, e.g. `feat/security-scanners-bz-bsz-bz-8g6`). Docs-only: `docs/<description>`. Bug fixes: `fix/<description>-bz-<bead-id>`.
+- Client floor: Channels require Claude Code v2.1.80+ with `claude.ai` login (Research Preview constraint — see README).
 
 ## Issue tracking (bd) — readable-trail rule
 
