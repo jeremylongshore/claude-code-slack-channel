@@ -2245,6 +2245,226 @@ export async function activateAndTouch(
 // Inbound message handler
 // ---------------------------------------------------------------------------
 
+/** Deliver a gated inbound event to Claude Code via MCP.
+ *
+ *  Called by handleMessage when gate() returns action='deliver'. Handles:
+ *  session tracking, inbound journal write, supervisor activation,
+ *  permission-reply text detection (quorum path + single-approver path),
+ *  and final MCP channel notification. Extracted from handleMessage to
+ *  reduce its cyclomatic complexity (Phase 3, ccsc-530). */
+async function deliverEvent(ev: Record<string, unknown>, access: Access): Promise<void> {
+  // Audit log for delivered bot messages (diagnostics for multi-agent flows)
+  if (ev.bot_id) {
+    console.error('[slack] bot message delivered', {
+      bot_id: ev.bot_id,
+      user: ev.user,
+      channel: ev.channel,
+      ts: ev.ts,
+    })
+  }
+
+  // Track this (channel, thread) pair as delivered (for outbound
+  // gate). A thread-level key so replies cannot leak across
+  // threads in the same channel (ccsc-xa3.6).
+  const channelId = ev.channel as string
+  const incomingThreadTs = ev.thread_ts as string | undefined
+  deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
+
+  journalWrite({
+    kind: 'gate.inbound.deliver',
+    outcome: 'allow',
+    actor: ev.bot_id ? 'peer_agent' : 'session_owner',
+    sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
+    input: {
+      channel: channelId,
+      user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
+      thread_ts: incomingThreadTs,
+    },
+  })
+
+  // Activate session and record inbound activity via the supervisor.
+  // The thread key follows session-state-machine.md §39: top-level
+  // messages (no thread_ts) use the message ts so every event maps
+  // to a non-null SessionKey. Covers both human and peer-bot deliver
+  // paths (ccsc-jqs / B3 + xa3.10).
+  //
+  // On activate failure (e.g. quarantined from a prior crash) we LOG
+  // and DROP — do not propagate so the event loop stays alive for
+  // other sessions. Same policy for handle.update() failures.
+  if (supervisor !== null) {
+    await activateAndTouch(
+      supervisor,
+      { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
+      ev.user as string | undefined,
+    )
+  }
+
+  // Track last active channel for permission relay
+  lastActiveChannel = channelId
+  lastActiveThread = incomingThreadTs
+
+  // Check for permission reply before normal delivery
+  const msgText = ((ev.text as string) || '').trim()
+  const permMatch = PERMISSION_REPLY_RE.exec(msgText)
+  if (permMatch && access.allowFrom.includes(ev.user as string)) {
+    const requestId = permMatch[2].toLowerCase()
+
+    pruneStalePermissions()
+
+    // Scope the lookup to the thread the reply arrived from. A
+    // reply posted in thread X cannot satisfy a request issued
+    // from thread Y (ccsc-xa3.7). If the requestId exists but in
+    // a different thread we still reject — an honest SO who
+    // replies in the wrong thread gets an unambiguous rejection
+    // emoji rather than a silent cross-thread resolution.
+    const replyKey = permKey(incomingThreadTs, requestId)
+
+    // Skip if already resolved (e.g. by a button click) OR if the
+    // requestId is not pending in THIS thread.
+    const replyDetails = pendingPermissions.get(replyKey)
+    if (!replyDetails) {
+      try {
+        await web.reactions.add({
+          channel: channelId,
+          timestamp: ev.ts as string,
+          name: 'heavy_multiplication_x',
+        })
+      } catch {
+        /* non-critical */
+      }
+      return
+    }
+
+    const replyIsAllow = permMatch[1].toLowerCase().startsWith('y')
+
+    // Multi-approver path via text reply. Same state transition as
+    // the button path (processApprovalVote); UX is reactions instead
+    // of Block Kit message updates.
+    if (replyDetails.policy && replyIsAllow) {
+      const voterId = ev.user as string
+      const voteResult = processApprovalVote(replyDetails, voterId, Date.now())
+      if (voteResult.kind === 'duplicate') {
+        try {
+          await web.reactions.add({
+            channel: channelId,
+            timestamp: ev.ts as string,
+            name: 'no_entry_sign',
+          })
+        } catch {
+          /* non-critical */
+        }
+        return
+      }
+      if (voteResult.kind === 'pending') {
+        try {
+          await web.reactions.add({
+            channel: channelId,
+            timestamp: ev.ts as string,
+            name: 'ballot_box_with_check',
+          })
+        } catch {
+          /* non-critical */
+        }
+        return
+      }
+      // voteResult.kind === 'approved' — fall through to the resolve
+      // block below with behavior='allow'.
+    }
+
+    // Post the pre-execution audit receipt into the originating
+    // thread before releasing Claude. Same guardrails as the button
+    // path: only on allow, only when the channel opts in, never
+    // blocks tool execution on projection failure.
+    if (replyIsAllow) {
+      await postAuditReceiptIfEnabled(
+        web,
+        access,
+        replyDetails.channel,
+        replyDetails.thread,
+        replyDetails.tool_name,
+      )
+    }
+
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: {
+        request_id: requestId,
+        behavior: replyIsAllow ? 'allow' : 'deny',
+      },
+    })
+    pendingPermissions.delete(replyKey)
+    // Ack with a reaction so the user knows it was processed
+    try {
+      await web.reactions.add({
+        channel: channelId,
+        timestamp: ev.ts as string,
+        name: 'white_check_mark',
+      })
+    } catch {
+      /* non-critical */
+    }
+    return // Don't forward as chat
+  }
+
+  const userName = await resolveUserName(ev.user as string)
+
+  // Ack reaction
+  if (access.ackReaction) {
+    try {
+      await web.reactions.add({
+        channel: ev.channel as string,
+        timestamp: ev.ts as string,
+        name: access.ackReaction,
+      })
+    } catch {
+      /* non-critical */
+    }
+  }
+
+  // Build meta attributes for the <channel> tag.
+  //
+  // user_id is the opaque Slack ID (U...) — trustworthy, set by Slack.
+  // user is the sanitized display name — attacker-controlled content,
+  // safe to render but MUST NOT be used for authorization decisions.
+  // We still run user_id through a strict format check (Slack IDs are
+  // A-Z/0-9 only) so a malformed event payload cannot inject markup.
+  const rawUserId = ev.user as string
+  const userIdSafe = /^[A-Z0-9]{1,32}$/.test(rawUserId) ? rawUserId : 'invalid'
+  const meta: Record<string, string> = {
+    chat_id: ev.channel as string,
+    message_id: ev.ts as string,
+    user_id: userIdSafe,
+    user: userName,
+    ts: ev.ts as string,
+  }
+
+  if (ev.thread_ts) {
+    meta.thread_ts = ev.thread_ts as string
+  }
+
+  const evFiles = ev.files as any[] | undefined
+  if (evFiles?.length) {
+    const fileDescs = evFiles.map((f: any) => {
+      const name = sanitizeFilename(f.name || 'unnamed')
+      return `${name} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`
+    })
+    meta.attachment_count = String(evFiles.length)
+    meta.attachments = fileDescs.join('; ')
+  }
+
+  // Strip bot mention from text if present
+  let text = (ev.text as string | undefined) || ''
+  if (botUserId) {
+    text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
+  }
+
+  // Push into Claude Code session via MCP notification
+  mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content: text, meta },
+  })
+}
+
 async function handleMessage(event: unknown): Promise<void> {
   const ev = event as Record<string, unknown>
 
@@ -2293,217 +2513,7 @@ async function handleMessage(event: unknown): Promise<void> {
     }
 
     case 'deliver': {
-      // Audit log for delivered bot messages (diagnostics for multi-agent flows)
-      if (ev.bot_id) {
-        console.error('[slack] bot message delivered', {
-          bot_id: ev.bot_id,
-          user: ev.user,
-          channel: ev.channel,
-          ts: ev.ts,
-        })
-      }
-
-      // Track this (channel, thread) pair as delivered (for outbound
-      // gate). A thread-level key so replies cannot leak across
-      // threads in the same channel (ccsc-xa3.6).
-      const channelId = ev.channel as string
-      const incomingThreadTs = ev.thread_ts as string | undefined
-      deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
-
-      journalWrite({
-        kind: 'gate.inbound.deliver',
-        outcome: 'allow',
-        actor: ev.bot_id ? 'peer_agent' : 'session_owner',
-        sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
-        input: {
-          channel: channelId,
-          user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
-          thread_ts: incomingThreadTs,
-        },
-      })
-
-      // Activate session and record inbound activity via the supervisor.
-      // The thread key follows session-state-machine.md §39: top-level
-      // messages (no thread_ts) use the message ts so every event maps
-      // to a non-null SessionKey. Covers both human and peer-bot deliver
-      // paths (ccsc-jqs / B3 + xa3.10).
-      //
-      // On activate failure (e.g. quarantined from a prior crash) we LOG
-      // and DROP — do not propagate so the event loop stays alive for
-      // other sessions. Same policy for handle.update() failures.
-      if (supervisor !== null) {
-        await activateAndTouch(
-          supervisor,
-          { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
-          ev.user as string | undefined,
-        )
-      }
-
-      // Track last active channel for permission relay
-      lastActiveChannel = channelId
-      lastActiveThread = incomingThreadTs
-
-      // Check for permission reply before normal delivery
-      const msgText = ((ev.text as string) || '').trim()
-      const permMatch = PERMISSION_REPLY_RE.exec(msgText)
-      if (permMatch && result.access!.allowFrom.includes(ev.user as string)) {
-        const requestId = permMatch[2].toLowerCase()
-
-        pruneStalePermissions()
-
-        // Scope the lookup to the thread the reply arrived from. A
-        // reply posted in thread X cannot satisfy a request issued
-        // from thread Y (ccsc-xa3.7). If the requestId exists but in
-        // a different thread we still reject — an honest SO who
-        // replies in the wrong thread gets an unambiguous rejection
-        // emoji rather than a silent cross-thread resolution.
-        const replyKey = permKey(incomingThreadTs, requestId)
-
-        // Skip if already resolved (e.g. by a button click) OR if the
-        // requestId is not pending in THIS thread.
-        const replyDetails = pendingPermissions.get(replyKey)
-        if (!replyDetails) {
-          try {
-            await web.reactions.add({
-              channel: channelId,
-              timestamp: ev.ts as string,
-              name: 'heavy_multiplication_x',
-            })
-          } catch {
-            /* non-critical */
-          }
-          return
-        }
-
-        const replyIsAllow = permMatch[1].toLowerCase().startsWith('y')
-
-        // Multi-approver path via text reply. Same state transition as
-        // the button path (processApprovalVote); UX is reactions instead
-        // of Block Kit message updates.
-        if (replyDetails.policy && replyIsAllow) {
-          const voterId = ev.user as string
-          const result = processApprovalVote(replyDetails, voterId, Date.now())
-          if (result.kind === 'duplicate') {
-            try {
-              await web.reactions.add({
-                channel: channelId,
-                timestamp: ev.ts as string,
-                name: 'no_entry_sign',
-              })
-            } catch {
-              /* non-critical */
-            }
-            return
-          }
-          if (result.kind === 'pending') {
-            try {
-              await web.reactions.add({
-                channel: channelId,
-                timestamp: ev.ts as string,
-                name: 'ballot_box_with_check',
-              })
-            } catch {
-              /* non-critical */
-            }
-            return
-          }
-          // result.kind === 'approved' — fall through to the resolve
-          // block below with behavior='allow'.
-        }
-
-        // Post the pre-execution audit receipt into the originating
-        // thread before releasing Claude. Same guardrails as the button
-        // path: only on allow, only when the channel opts in, never
-        // blocks tool execution on projection failure.
-        if (replyIsAllow) {
-          await postAuditReceiptIfEnabled(
-            web,
-            result.access!,
-            replyDetails.channel,
-            replyDetails.thread,
-            replyDetails.tool_name,
-          )
-        }
-
-        await mcp.notification({
-          method: 'notifications/claude/channel/permission',
-          params: {
-            request_id: requestId,
-            behavior: replyIsAllow ? 'allow' : 'deny',
-          },
-        })
-        pendingPermissions.delete(replyKey)
-        // Ack with a reaction so the user knows it was processed
-        try {
-          await web.reactions.add({
-            channel: channelId,
-            timestamp: ev.ts as string,
-            name: 'white_check_mark',
-          })
-        } catch {
-          /* non-critical */
-        }
-        return // Don't forward as chat
-      }
-
-      const access = result.access!
-      const userName = await resolveUserName(ev.user as string)
-
-      // Ack reaction
-      if (access.ackReaction) {
-        try {
-          await web.reactions.add({
-            channel: ev.channel as string,
-            timestamp: ev.ts as string,
-            name: access.ackReaction,
-          })
-        } catch {
-          /* non-critical */
-        }
-      }
-
-      // Build meta attributes for the <channel> tag.
-      //
-      // user_id is the opaque Slack ID (U...) — trustworthy, set by Slack.
-      // user is the sanitized display name — attacker-controlled content,
-      // safe to render but MUST NOT be used for authorization decisions.
-      // We still run user_id through a strict format check (Slack IDs are
-      // A-Z/0-9 only) so a malformed event payload cannot inject markup.
-      const rawUserId = ev.user as string
-      const userIdSafe = /^[A-Z0-9]{1,32}$/.test(rawUserId) ? rawUserId : 'invalid'
-      const meta: Record<string, string> = {
-        chat_id: ev.channel as string,
-        message_id: ev.ts as string,
-        user_id: userIdSafe,
-        user: userName,
-        ts: ev.ts as string,
-      }
-
-      if (ev.thread_ts) {
-        meta.thread_ts = ev.thread_ts as string
-      }
-
-      const evFiles = ev.files as any[] | undefined
-      if (evFiles?.length) {
-        const fileDescs = evFiles.map((f: any) => {
-          const name = sanitizeFilename(f.name || 'unnamed')
-          return `${name} (${f.mimetype || 'unknown'}, ${f.size || '?'} bytes)`
-        })
-        meta.attachment_count = String(evFiles.length)
-        meta.attachments = fileDescs.join('; ')
-      }
-
-      // Strip bot mention from text if present
-      let text = (ev.text as string | undefined) || ''
-      if (botUserId) {
-        text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
-      }
-
-      // Push into Claude Code session via MCP notification
-      mcp.notification({
-        method: 'notifications/claude/channel',
-        params: { content: text, meta },
-      })
+      await deliverEvent(ev, result.access!)
     }
   }
 }
