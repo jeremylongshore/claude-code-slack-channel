@@ -1,15 +1,18 @@
 # gitleaks fingerprint ignore list.
 #
 # Every entry below is a journal-redactor test fixture in server.test.ts —
-# string-concatenated secret shapes ('A' + 'KIA' + ...) that exist so the
-# redactor can be exercised on the patterns it is supposed to scrub. They
-# are not real secrets. If a fingerprint here goes stale (fixture moved
-# lines), regenerate with:
+# string-concatenated or join-built secret shapes that exist so the redactor
+# can be exercised on the patterns it is supposed to scrub. They are not
+# real secrets.
+#
+# gitleaks scans git HISTORY, so we have to keep the fingerprint for every
+# commit that introduced or moved a fixture (not just HEAD). Regenerate:
 #
 #   gitleaks detect --redact --verbose --exit-code 0 \
 #     | awk '/^Fingerprint:/ {print $2}'
 #
-# ccsc-bsz closes the gap that previously left this repo ungated.
+# Pre-reformat fixtures (historical — commits 2395053, 4259082,
+# d532b79, 072786d; lines reference the commit they were introduced in):
 239505312e9395b7bc565900f7af2b1001b44c40:server.test.ts:generic-api-key:5750
 425908256ad4a7c96381d3f82311943e1a94a71e:server.test.ts:generic-api-key:5750
 d532b79d9dff7aaf5861289c21fed390d2ddf239:server.test.ts:aws-access-token:3470
@@ -17,3 +20,6 @@ d532b79d9dff7aaf5861289c21fed390d2ddf239:server.test.ts:aws-access-token:3470
 072786d61ffb8e1139c09cba2b29c641b4944384:server.test.ts:aws-access-token:3352
 072786d61ffb8e1139c09cba2b29c641b4944384:server.test.ts:aws-access-token:3494
 072786d61ffb8e1139c09cba2b29c641b4944384:server.test.ts:jwt:3329
+# Post-reformat (ccsc-5vx, commit cfd008f) — the jwt fixture at its
+# new line:
+cfd008ff32c10937c2d1de4518cd7c3692a6ef2b:server.test.ts:jwt:5928
