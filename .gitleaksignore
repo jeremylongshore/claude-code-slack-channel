@@ -23,3 +23,5 @@ d532b79d9dff7aaf5861289c21fed390d2ddf239:server.test.ts:aws-access-token:3470
 # Post-reformat (ccsc-5vx, commit cfd008f) — the jwt fixture at its
 # new line:
 cfd008ff32c10937c2d1de4518cd7c3692a6ef2b:server.test.ts:jwt:5928
+# Same fixture, merged-to-main SHA from PR #143 squash/rebase:
+dd7a3aeb44cdfcdc4c1010608184a06dc3b7e797:server.test.ts:jwt:5928
