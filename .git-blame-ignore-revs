@@ -1,0 +1,11 @@
+# Commits listed here are skipped by `git blame` so that large mechanical
+# rewrites (formatter passes, mass rename, etc.) don't obscure the real
+# authorship history of a line.
+#
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honors this file automatically in the web-UI blame view.
+
+# style(biome): enable formatter + one-time reformat pass (ccsc-5vx) — PR #143
+cfd008fbe8fe48ffdb5d35a6cc12929c73f02b2f
