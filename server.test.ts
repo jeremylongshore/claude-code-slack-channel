@@ -9411,6 +9411,31 @@ describe('SENDABLE_BASENAME_DENY per-entry (ccsc-y4e)', () => {
     writeFileSync(p, 'ok')
     expect(() => assertSendable(p, sbInbox, [])).not.toThrow()
   })
+
+  // Positive controls for the .env regex anchors — kills the `^`-drop and
+  // `$`-drop mutants on /^\.env(\..*)?$/. A mutant that drops `^` would
+  // substring-block filenames that merely end in .env (e.g., `prod.env`);
+  // a mutant that drops `$` would prefix-block filenames that merely start
+  // with .env (e.g., `.envrc-backup.txt`). The original rejects ONLY the
+  // canonical forms .env and .env.<suffix>, so both positive fixtures must
+  // be accepted.
+  test('accepts "prod.env" — ".env" anchor requires leading dot at start', () => {
+    const p = join(sbInbox, 'prod.env')
+    writeFileSync(p, 'not a secret — just a data file that happens to end in .env')
+    expect(() => assertSendable(p, sbInbox, [])).not.toThrow()
+  })
+
+  test('accepts ".envmt.txt" — ".env" anchor requires end-of-string or .<suffix>', () => {
+    // The regex is /^\.env(\..*)?$/ — after .env, only an optional dot-
+    // prefixed suffix is allowed, then end. ".envmt.txt" starts with .env
+    // but the next char is "m" (no dot), so the optional group doesn't
+    // match and $ must anchor after .env — but there's "mt.txt" left.
+    // Original rejects the match (file passes the guard). A mutant that
+    // drops the trailing $ would match .env + anything, blocking this.
+    const p = join(sbInbox, '.envmt.txt')
+    writeFileSync(p, 'not a secret — name starts with .env but is not .env.<suffix>')
+    expect(() => assertSendable(p, sbInbox, [])).not.toThrow()
+  })
 })
 
 describe('SENDABLE_PARENT_DENY per-entry (ccsc-y4e)', () => {
@@ -9460,6 +9485,46 @@ describe('SENDABLE_PARENT_DENY per-entry (ccsc-y4e)', () => {
     const p = join(dir, 'app.toml')
     writeFileSync(p, 'fixture')
     expect(() => assertSendable(p, spInbox, [spRoot])).not.toThrow()
+  })
+})
+
+describe('pruneExpired Access-pending boundary (ccsc-y4e)', () => {
+  test('an Access.pending entry expiring exactly at now is evicted — kills the "<=" → "<" mutant', () => {
+    // Mutant: pruneExpired at lib.ts:667 swaps `entry.expiresAt <= now` for
+    // `entry.expiresAt < now`. Under the mutant, a pending-code whose
+    // expiresAt ties the current clock tick is kept instead of evicted.
+    //
+    // pruneExpired reads Date.now() directly (no injected clock). Override
+    // the global for the duration of the test, then restore, so we can
+    // exercise the exact-equality boundary deterministically.
+    const FIXED_NOW = 1_700_000_000_000
+    const originalNow = Date.now
+    Date.now = () => FIXED_NOW
+    try {
+      const access = makeAccess({
+        pending: {
+          TIE: {
+            senderId: 'U_TIE',
+            chatId: 'D_TIE',
+            createdAt: FIXED_NOW - 1,
+            expiresAt: FIXED_NOW, // ties the clock exactly
+            replies: 1,
+          },
+          LIVE: {
+            senderId: 'U_LIVE',
+            chatId: 'D_LIVE',
+            createdAt: FIXED_NOW,
+            expiresAt: FIXED_NOW + 1, // strictly in the future
+            replies: 1,
+          },
+        },
+      })
+      pruneExpired(access)
+      expect(access.pending['TIE']).toBeUndefined()
+      expect(access.pending['LIVE']).toBeDefined()
+    } finally {
+      Date.now = originalNow
+    }
   })
 })
 
