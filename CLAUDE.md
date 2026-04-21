@@ -8,35 +8,73 @@ Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP 
 
 ## Architecture
 
-Five source files: `server.ts` (stateful runtime, ~2200 lines), `lib.ts` (pure functions, ~1700 lines), `policy.ts` (~575 lines), `journal.ts` (~1100 lines), `supervisor.ts` (~1000 lines). Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
+Six production source files (Bun/TypeScript, strict mode):
+
+| File | LoC | Purpose |
+|---|---|---|
+| `server.ts` | 2552 | Stateful runtime — Slack client bootstrap, MCP server, event handlers |
+| `lib.ts` | 1770 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt helpers |
+| `journal.ts` | 1103 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
+| `supervisor.ts` | 1008 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32) |
+| `policy.ts` | 605 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
+| `manifest.ts` | 582 | Bot-manifest protocol — schema, publish-side validation, subset check (Epic 31) |
+
+Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
 
 ```
 Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude Code
 ```
 
-**`lib.ts`** contains all pure, testable logic: `gate()`, `assertSendable()`, `assertOutboundAllowed()`, `chunkText()`, `sanitizeFilename()`, types, and constants. Side-effect-free — accepts dependencies as parameters.
+**`lib.ts`** contains all pure, testable logic. Side-effect-free — accepts dependencies as parameters. When adding logic, put pure functions here and keep `server.ts` for wiring.
 
-**`server.ts`** imports from `lib.ts` and handles stateful concerns: Slack client bootstrap, token loading, MCP server registration, event listeners, file I/O. When adding logic, put pure functions in `lib.ts` and keep `server.ts` for wiring.
+**`server.ts`** handles stateful concerns: Slack client bootstrap, token loading, MCP server registration, event listeners, file I/O.
+
+**`policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`** are epic-scoped modules with their own design docs (see below). 31-A.4 invariant: `server.ts` does not import `manifest.ts` directly — enforced by both `.dependency-cruiser.js` and a compile-time import-graph test in `server.test.ts`.
 
 ## Commands
 
+### Everyday
+
 ```bash
-bun install              # Install deps
-bun run typecheck        # TypeScript strict check (tsc --noEmit)
-bun test                 # Run test suite (bun:test)
-bun test --watch         # Watch mode
-bun test --grep "gate"   # Run tests matching a pattern
-bun server.ts            # Run server directly
-npx tsx server.ts        # Node.js fallback
+bun install                              # Install deps
+bun run typecheck                        # TypeScript strict check (tsc --noEmit)
+bun test                                 # Run test suite (bun:test) — 669 tests
+bun test --timeout 15000                 # Match CI's timeout
+bun test --watch                         # Watch mode
+bun test --test-name-pattern "gate"      # Run tests matching a pattern
+bun server.ts                            # Run server directly
+npx tsx server.ts                        # Node.js fallback
 ```
 
-Dev mode (bypasses plugin allowlist):
+### Quality gates (mirrored from CI)
+
+```bash
+bunx @biomejs/biome check .              # Lint — curated rule set (Wall 7b)
+bash scripts/coverage-floor.sh 95        # Coverage floor — 95% line + func
+bunx depcruise --config .dependency-cruiser.js .   # Architecture rules (Wall 7d)
+bash scripts/gherkin-lint.sh --path features/ --strict   # Wall 1 lint
+bash scripts/harness-hash.sh --verify    # Tamper check for pinned artifacts
+bun audit --audit-level=high --ignore=GHSA-j3q9-mxjg-w52f   # Dep CVE scan
+bun scripts/crap-score.ts --threshold 85 # Cyclomatic complexity gate (Wall 5)
+bash scripts/bias-count.sh /tmp/test-scan   # Test-suite bias audit (manual)
+```
+
+### Mutation testing (manual, ~45 min)
+
+```bash
+bunx stryker run                         # lib+policy+manifest+journal; see 000-docs/MUTATION_REPORT.md
+```
+
+### Dev mode (bypasses plugin allowlist)
+
 ```bash
 claude --dangerously-load-development-channels server:slack
 ```
 
-CI workflows (`.github/workflows/`):
-- `ci.yml` — Typecheck (required by branch protection) + test suite on push/PR to main.
+### CI workflows (`.github/workflows/`)
+
+- `ci.yml` — single job `Typecheck` that runs nine gates in order: typecheck → Biome lint → test → coverage floor → depcruise → gherkin-lint → harness-hash verify → bun audit → crap-score. Required by branch protection (`strict: true`).
+- `secrets-scan.yml` — gitleaks v8.30.1 against PR diff (or full history on push to main). `.gitleaksignore` carries 7 fingerprints for journal-redactor test fixtures.
 - `codeql.yml` — CodeQL security scan.
 - `gemini-review.yml` — automated PR review.
 - `scorecard.yml` — OpenSSF Scorecard.
@@ -60,12 +98,35 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 
 ## Key Files
 
+### Production source
 - `server.ts` — MCP server runtime: bootstrap, Slack clients, tools, event handling
 - `lib.ts` — pure functions: gate logic, security guards, text chunking, session types
 - `policy.ts` — `PolicyRule` Zod schema, `evaluate()` decision procedure, `detectShadowing` linter, `checkMonotonicity`
 - `journal.ts` — hash-chained audit log: `JournalWriter`, `verifyJournal`, `EventKind`, redactor
 - `supervisor.ts` — `SessionSupervisor`: activate/deactivate/quiesce, idle reaper, quarantine tracking
-- `server.test.ts` — single-file test suite covering security-critical functions (uses `bun:test`); run a subset with `bun test --grep "<pattern>"`
+- `manifest.ts` — bot-manifest protocol (Epic 31): schema, `assertPublishAllowed`, `validateManifestSubset`
+
+### Tests & acceptance contracts
+- `server.test.ts` — single-file test suite covering security-critical functions (uses `bun:test`); 669 tests, 1 405 expects. Run a subset with `bun test --test-name-pattern "<pattern>"`
+- `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); five primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`
+- `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 37 scenarios against the real primitives
+
+### Config
+- `biome.json` — Biome lint config (curated rule set, formatter off, `recommended: false`)
+- `.dependency-cruiser.js` — architecture rules, enforces 31-A.4 manifest-isolation invariant
+- `stryker.conf.mjs` — mutation-testing config; mutates `lib.ts` + `policy.ts` + `manifest.ts` + `journal.ts`
+- `.harness-hash` — SHA-256 manifest pinning `.feature` files + `.dependency-cruiser.js`
+- `bunfig.toml` — bun runtime config (carries `[install.security]` placeholder for future scanner)
+- `tsconfig.json` — TS strict, includes all production sources + `features/**/*.ts`
+
+### Scripts
+- `scripts/coverage-floor.sh` — parses `bun test --coverage` output, enforces 95% floor
+- `scripts/crap-score.ts` — TS-aware AST walker for cyclomatic complexity (Wall 5)
+- `scripts/gherkin-lint.sh` — Wall 1 Gherkin style check (mirrored from `/audit-tests` skill)
+- `scripts/harness-hash.sh` — tamper-detect pinned artifacts (mirrored from skill)
+- `scripts/bias-count.sh` — test-bias pattern scanner (mirrored from skill with pipefail fix)
+
+### Skills & docs
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
 - `ACCESS.md` — access control schema documentation
@@ -75,6 +136,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 
 The design-in-public commitment: the doc ships before the code, and the doc is the source of truth for security-boundary decisions. Read the matching doc before touching its subsystem — a PR that contradicts a frozen doc is a revert, not a merge.
 
+### Design (contracts — read before touching the subsystem)
 - `ARCHITECTURE.md` — top-level component diagram, four-principal model.
 - `000-docs/THREAT-MODEL.md` — trust boundaries, attack surface per primitive, T1–T10 threats, invariants.
 - `000-docs/session-state-machine.md` — `SessionKey`, supervisor contract, lifecycle (Epic 32-A/B).
@@ -82,7 +144,13 @@ The design-in-public commitment: the doc ships before the code, and the doc is t
 - `000-docs/audit-journal-architecture.md` — hash-chain, redaction, verify command (Epic 30-A/B).
 - `000-docs/bot-manifest-protocol.md` — manifest schema, "advertisements are not grants" invariant (Epic 31-A/B).
 
-When a design doc and code disagree, the code is wrong.
+### Audit + quality-gate reports (snapshots — diff against on next audit)
+- `000-docs/TEST_AUDIT.md` — Seven Walls scorecard, suite metrics, bias audit (produced by `/audit-tests`).
+- `000-docs/QUALITY_GATES.md` — Step 5.5 gate-sweep matrix: one row per quality-gate category, current state, CI wiring.
+- `000-docs/MUTATION_REPORT.md` — Stryker baselines per file. Current: `journal.ts` 87.76% / `lib.ts` 84.78% / `manifest.ts` 92.06% / `policy.ts` 78.00% / All 85.22%.
+- `000-docs/AUTO_REMEDIATION_REPORT.md` — Step 8 gap analysis (no-op on this suite; rubric-driven remediation would add nothing today).
+
+When a design doc and code disagree, the code is wrong. When an audit report and current state disagree, the code is right and the report is stale — file a bd for the refresh.
 
 ## Security Architecture (critical context)
 
