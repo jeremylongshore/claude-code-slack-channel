@@ -32,3 +32,10 @@ jobs:
 
       - name: Coverage floor (≥95% line + function)
         run: bash scripts/coverage-floor.sh 95
+
+      - name: Architecture rules (dependency-cruiser)
+        # Note: dependency-cruiser v17 removed the `--validate` flag; passing
+        # `-c/--config` now runs validation automatically. Omitting `--validate`
+        # so the step actually fails on violations (with `--validate` v17 silently
+        # prints help + exits 0, defeating the point of the CI gate).
+        run: bunx depcruise --config .dependency-cruiser.js .
