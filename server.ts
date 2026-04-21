@@ -1906,6 +1906,226 @@ mcp.setNotificationHandler(
   },
 )
 
+// ---------------------------------------------------------------------------
+// Interactive handler helpers (Block Kit button verbs)
+// ---------------------------------------------------------------------------
+
+/** Show the input_preview for a pending permission request.
+ *
+ *  Updates the Block Kit message in-place to add a context block containing
+ *  the (plain_text, truncated) preview. Scoped to the thread the button lives
+ *  in — the permKey lookup won't resolve a request issued from a different
+ *  thread even when the requestId matches (ccsc-xa3.7). */
+async function handleMoreAction(
+  requestId: string,
+  channelId: string,
+  messageTs: string,
+  interactionThreadTs: string | undefined,
+): Promise<void> {
+  const details = pendingPermissions.get(permKey(interactionThreadTs, requestId))
+  if (!details || !channelId || !messageTs) return
+
+  // Use plain_text to prevent mrkdwn injection from tool input.
+  // Truncate to stay within Slack's 3000-char text object limit.
+  const MAX_PREVIEW = 2900
+  const previewText = details.input_preview
+    ? details.input_preview.length > MAX_PREVIEW
+      ? `${details.input_preview.slice(0, MAX_PREVIEW)}…`
+      : details.input_preview
+    : 'No preview available'
+
+  const safeTool = escMrkdwn(details.tool_name)
+  const safeDesc = escMrkdwn(details.description)
+
+  try {
+    await web.chat.update({
+      channel: channelId,
+      ts: messageTs,
+      text: `Claude wants to run ${safeTool}: ${safeDesc}`,
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}`,
+          },
+        },
+        {
+          type: 'context',
+          elements: [{ type: 'plain_text', text: previewText }],
+        },
+        {
+          type: 'actions',
+          elements: [
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '✅ Allow' },
+              style: 'primary',
+              action_id: `perm:allow:${requestId}`,
+            },
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: '❌ Deny' },
+              style: 'danger',
+              action_id: `perm:deny:${requestId}`,
+            },
+          ],
+        },
+      ],
+    })
+  } catch {
+    /* non-critical — Slack API rejection won't block the session */
+  }
+}
+
+/** Process an allow or deny button click for a pending permission request.
+ *
+ *  Handles the multi-approver quorum path (NIST user_id dedup via
+ *  processApprovalVote) and the single-approver fast path. On quorum or
+ *  immediate decision, sends the MCP permission notification and updates
+ *  the Block Kit message to show the verdict. The access object is passed
+ *  in rather than read here so the caller's allowFrom guard is the
+ *  authoritative access snapshot. */
+async function handleAllowDenyAction(
+  verb: string,
+  requestId: string,
+  userId: string,
+  channelId: string,
+  messageTs: string,
+  interactionThreadTs: string | undefined,
+  access: Access,
+): Promise<void> {
+  // Allow or Deny — send verdict to Claude Code. Lookup is scoped
+  // to (interaction thread, requestId) so a click in thread X
+  // cannot satisfy a request issued from thread Y even when the
+  // requestIds match (ccsc-xa3.7).
+  const key = permKey(interactionThreadTs, requestId)
+  const details = pendingPermissions.get(key)
+  if (!details) {
+    // Already resolved (by button or text reply) — update message and bail
+    if (channelId && messageTs) {
+      try {
+        await web.chat.update({
+          channel: channelId,
+          ts: messageTs,
+          text: 'Already resolved',
+          blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '⚪ Already resolved' } }],
+        })
+      } catch {
+        /* non-critical */
+      }
+    }
+    return
+  }
+
+  // Multi-approver path: votes accumulate with NIST user_id dedup until
+  // quorum. Deny always wins immediately — one "no" overrides yeses.
+  // Shared state transition is in processApprovalVote(); UX is per-
+  // resolver (Block Kit updates here, reactions in the text-reply path).
+  if (details.policy && verb === 'allow') {
+    const voteResult = processApprovalVote(details, userId, Date.now())
+    if (voteResult.kind === 'duplicate') {
+      try {
+        await web.chat.postEphemeral({
+          channel: channelId,
+          user: userId,
+          text: 'You have already approved this request. A different approver must vote to reach quorum.',
+        })
+      } catch {
+        /* non-critical */
+      }
+      return
+    }
+    if (voteResult.kind === 'pending') {
+      const safeTool = escMrkdwn(details.tool_name)
+      const safeDesc = escMrkdwn(details.description)
+      const progress = `${voteResult.state.approvedBy.size}/${voteResult.state.approversNeeded} approvals`
+      if (channelId && messageTs) {
+        try {
+          await web.chat.update({
+            channel: channelId,
+            ts: messageTs,
+            text: `Claude wants to run ${safeTool} — ${progress}`,
+            blocks: [
+              {
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}\n\n_${progress} — awaiting additional approver(s)._`,
+                },
+              },
+              {
+                type: 'actions',
+                elements: [
+                  {
+                    type: 'button',
+                    text: { type: 'plain_text', text: '✅ Allow' },
+                    style: 'primary',
+                    action_id: `perm:allow:${requestId}`,
+                  },
+                  {
+                    type: 'button',
+                    text: { type: 'plain_text', text: '❌ Deny' },
+                    style: 'danger',
+                    action_id: `perm:deny:${requestId}`,
+                  },
+                ],
+              },
+            ],
+          })
+        } catch {
+          /* non-critical */
+        }
+      }
+      return
+    }
+    // voteResult.kind === 'approved' — quorum reached. Fall through to the
+    // resolve path below with behavior='allow'. Helper has already
+    // granted the TTL window and journaled policy.approved.
+  }
+
+  const behavior = verb === 'allow' ? 'allow' : 'deny'
+  const verdict = behavior === 'allow' ? 'allowed' : 'denied'
+  const safeTool = escMrkdwn(details.tool_name)
+
+  // Post the pre-execution audit receipt into the originating
+  // thread before releasing Claude to execute. Only fires on
+  // 'allow' since no execution follows a deny. No-op when the
+  // channel's policy opts out via audit: undefined | 'off'.
+  if (behavior === 'allow') {
+    await postAuditReceiptIfEnabled(web, access, details.channel, details.thread, details.tool_name)
+  }
+
+  await mcp.notification({
+    method: 'notifications/claude/channel/permission',
+    params: { request_id: requestId, behavior },
+  })
+  pendingPermissions.delete(key)
+
+  // Update message to show outcome (remove buttons)
+  if (channelId && messageTs) {
+    const emoji = behavior === 'allow' ? '✅' : '❌'
+    try {
+      await web.chat.update({
+        channel: channelId,
+        ts: messageTs,
+        text: `${emoji} ${safeTool} — ${verdict}`,
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `${emoji} *\`${safeTool}\`* — ${verdict} by <@${userId}>`,
+            },
+          },
+        ],
+      })
+    } catch {
+      /* non-critical */
+    }
+  }
+}
+
 // Handle Block Kit button interactions (delivered via Socket Mode)
 socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
   try {
@@ -1948,202 +2168,19 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
       (body.message?.thread_ts as string | undefined) || undefined
 
     if (verb === 'more') {
-      // Expand details — update the message to include input_preview.
-      // Scoped to the thread this button lives in; a request issued
-      // in a different thread with the same requestId (vanishingly
-      // rare collision) won't leak its preview here.
-      const details = pendingPermissions.get(permKey(interactionThreadTs, requestId))
-      if (!details || !channelId || !messageTs) return
-
-      // Use plain_text to prevent mrkdwn injection from tool input.
-      // Truncate to stay within Slack's 3000-char text object limit.
-      const MAX_PREVIEW = 2900
-      const previewText = details.input_preview
-        ? details.input_preview.length > MAX_PREVIEW
-          ? `${details.input_preview.slice(0, MAX_PREVIEW)}…`
-          : details.input_preview
-        : 'No preview available'
-
-      const safeTool = escMrkdwn(details.tool_name)
-      const safeDesc = escMrkdwn(details.description)
-
-      try {
-        await web.chat.update({
-          channel: channelId,
-          ts: messageTs,
-          text: `Claude wants to run ${safeTool}: ${safeDesc}`,
-          blocks: [
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}`,
-              },
-            },
-            {
-              type: 'context',
-              elements: [{ type: 'plain_text', text: previewText }],
-            },
-            {
-              type: 'actions',
-              elements: [
-                {
-                  type: 'button',
-                  text: { type: 'plain_text', text: '✅ Allow' },
-                  style: 'primary',
-                  action_id: `perm:allow:${requestId}`,
-                },
-                {
-                  type: 'button',
-                  text: { type: 'plain_text', text: '❌ Deny' },
-                  style: 'danger',
-                  action_id: `perm:deny:${requestId}`,
-                },
-              ],
-            },
-          ],
-        })
-      } catch {
-        /* non-critical — Slack API rejection won't block the session */
-      }
+      await handleMoreAction(requestId, channelId, messageTs, interactionThreadTs)
       return
     }
 
-    // Allow or Deny — send verdict to Claude Code. Lookup is scoped
-    // to (interaction thread, requestId) so a click in thread X
-    // cannot satisfy a request issued from thread Y even when the
-    // requestIds match (ccsc-xa3.7).
-    const key = permKey(interactionThreadTs, requestId)
-    const details = pendingPermissions.get(key)
-    if (!details) {
-      // Already resolved (by button or text reply) — update message and bail
-      if (channelId && messageTs) {
-        try {
-          await web.chat.update({
-            channel: channelId,
-            ts: messageTs,
-            text: 'Already resolved',
-            blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '⚪ Already resolved' } }],
-          })
-        } catch {
-          /* non-critical */
-        }
-      }
-      return
-    }
-
-    // Multi-approver path: votes accumulate with NIST user_id dedup until
-    // quorum. Deny always wins immediately — one "no" overrides yeses.
-    // Shared state transition is in processApprovalVote(); UX is per-
-    // resolver (Block Kit updates here, reactions in the text-reply path).
-    if (details.policy && verb === 'allow') {
-      const result = processApprovalVote(details, userId, Date.now())
-      if (result.kind === 'duplicate') {
-        try {
-          await web.chat.postEphemeral({
-            channel: channelId,
-            user: userId,
-            text: 'You have already approved this request. A different approver must vote to reach quorum.',
-          })
-        } catch {
-          /* non-critical */
-        }
-        return
-      }
-      if (result.kind === 'pending') {
-        const safeTool = escMrkdwn(details.tool_name)
-        const safeDesc = escMrkdwn(details.description)
-        const progress = `${result.state.approvedBy.size}/${result.state.approversNeeded} approvals`
-        if (channelId && messageTs) {
-          try {
-            await web.chat.update({
-              channel: channelId,
-              ts: messageTs,
-              text: `Claude wants to run ${safeTool} — ${progress}`,
-              blocks: [
-                {
-                  type: 'section',
-                  text: {
-                    type: 'mrkdwn',
-                    text: `🟡 *Claude wants to run \`${safeTool}\`*\n${safeDesc}\n\n_${progress} — awaiting additional approver(s)._`,
-                  },
-                },
-                {
-                  type: 'actions',
-                  elements: [
-                    {
-                      type: 'button',
-                      text: { type: 'plain_text', text: '✅ Allow' },
-                      style: 'primary',
-                      action_id: `perm:allow:${requestId}`,
-                    },
-                    {
-                      type: 'button',
-                      text: { type: 'plain_text', text: '❌ Deny' },
-                      style: 'danger',
-                      action_id: `perm:deny:${requestId}`,
-                    },
-                  ],
-                },
-              ],
-            })
-          } catch {
-            /* non-critical */
-          }
-        }
-        return
-      }
-      // result.kind === 'approved' — quorum reached. Fall through to the
-      // resolve path below with behavior='allow'. Helper has already
-      // granted the TTL window and journaled policy.approved.
-    }
-
-    const behavior = verb === 'allow' ? 'allow' : 'deny'
-    const verdict = behavior === 'allow' ? 'allowed' : 'denied'
-    const safeTool = escMrkdwn(details.tool_name)
-
-    // Post the pre-execution audit receipt into the originating
-    // thread before releasing Claude to execute. Only fires on
-    // 'allow' since no execution follows a deny. No-op when the
-    // channel's policy opts out via audit: undefined | 'off'.
-    if (behavior === 'allow') {
-      await postAuditReceiptIfEnabled(
-        web,
-        access,
-        details.channel,
-        details.thread,
-        details.tool_name,
-      )
-    }
-
-    await mcp.notification({
-      method: 'notifications/claude/channel/permission',
-      params: { request_id: requestId, behavior },
-    })
-    pendingPermissions.delete(key)
-
-    // Update message to show outcome (remove buttons)
-    if (channelId && messageTs) {
-      const emoji = behavior === 'allow' ? '✅' : '❌'
-      try {
-        await web.chat.update({
-          channel: channelId,
-          ts: messageTs,
-          text: `${emoji} ${safeTool} — ${verdict}`,
-          blocks: [
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `${emoji} *\`${safeTool}\`* — ${verdict} by <@${userId}>`,
-              },
-            },
-          ],
-        })
-      } catch {
-        /* non-critical */
-      }
-    }
+    await handleAllowDenyAction(
+      verb,
+      requestId,
+      userId,
+      channelId,
+      messageTs,
+      interactionThreadTs,
+      access,
+    )
   } catch (err) {
     console.error('[slack] Error handling interactive event:', err)
   }
