@@ -235,9 +235,7 @@ function utf8ByteLength(s: string): number {
  * what to do with the duplication. Keeping this function position-
  * preserving and non-deduping makes it trivially testable.
  */
-export function extractManifests(
-  texts: ReadonlyArray<string | null | undefined>,
-): ManifestV1[] {
+export function extractManifests(texts: ReadonlyArray<string | null | undefined>): ManifestV1[] {
   return texts.flatMap((text) => {
     if (typeof text !== 'string' || text.length === 0) return []
     if (!looksLikeManifest(text)) return []
@@ -251,9 +249,7 @@ export function extractManifests(
     // and not a signal.
     const bytes = utf8ByteLength(text)
     if (bytes > MAX_MANIFEST_BYTES) {
-      console.debug(
-        `[manifest] silent drop: oversized body ${bytes}B > ${MAX_MANIFEST_BYTES}B cap`,
-      )
+      console.debug(`[manifest] silent drop: oversized body ${bytes}B > ${MAX_MANIFEST_BYTES}B cap`)
       return []
     }
     try {
@@ -327,9 +323,7 @@ export interface ManifestCacheOptions {
  * (protocol doc §166 "A restart clears it.") — persistence is out of
  * scope.
  */
-export function createManifestCache(
-  opts: ManifestCacheOptions = {},
-): ManifestCache {
+export function createManifestCache(opts: ManifestCacheOptions = {}): ManifestCache {
   const now = opts.now ?? Date.now
   const maxEntries = opts.maxEntries ?? 256
   const ttlMs = opts.ttlMs ?? MANIFEST_CACHE_TTL_MS
@@ -463,8 +457,7 @@ export function findOurPriorManifestPins(
     const msg = item.message
     if (!msg?.ts) return []
     const isOurs =
-      (!!selfBotId && msg.bot_id === selfBotId) ||
-      (!!botUserId && msg.user === botUserId)
+      (!!selfBotId && msg.bot_id === selfBotId) || (!!botUserId && msg.user === botUserId)
     if (!isOurs) return []
     const text = msg.text ?? ''
     if (!text.includes(MANIFEST_V1_MAGIC_KEY)) return []
@@ -523,9 +516,7 @@ export interface PublishRateLimiterOptions {
  * `this` binding concerns, injected time source for testability,
  * soft-LRU eviction when the entry cap would be breached.
  */
-export function createPublishRateLimiter(
-  opts: PublishRateLimiterOptions = {},
-): PublishRateLimiter {
+export function createPublishRateLimiter(opts: PublishRateLimiterOptions = {}): PublishRateLimiter {
   const now = opts.now ?? Date.now
   const windowMs = opts.windowMs ?? PUBLISH_RATE_LIMIT_MS
   const maxEntries = opts.maxEntries ?? 256

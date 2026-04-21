@@ -65,12 +65,7 @@ import { loadSession, saveSession, sessionPath } from './lib'
  *                       (SO) clears this; see session-state-machine.md
  *                       §132-137.
  */
-export type SessionState =
-  | 'activating'
-  | 'active'
-  | 'quiescing'
-  | 'deactivating'
-  | 'quarantined'
+export type SessionState = 'activating' | 'active' | 'quiescing' | 'deactivating' | 'quarantined'
 
 // ---------------------------------------------------------------------------
 // SessionHandle — in-memory wrapper around one Session file
@@ -256,10 +251,7 @@ export interface SessionSupervisor {
  *  payload. Consumers are expected to inject their own writer; the
  *  default writes one newline-delimited JSON object per call to stdout
  *  so the journal sink (Epic 30-A) can tail the stream. */
-export type SupervisorLog = (
-  event: string,
-  fields: Record<string, unknown>,
-) => void
+export type SupervisorLog = (event: string, fields: Record<string, unknown>) => void
 
 /** Injection points for a SessionSupervisor. All are optional; defaults
  *  give you a production-shaped supervisor that writes to stdout and
@@ -305,9 +297,7 @@ export const DEFAULT_IDLE_MS = 4 * 60 * 60 * 1000
  *  server.ts boot can write `resolveIdleMs()` without repeating the
  *  env lookup. Tests pass an explicit record to keep the function
  *  deterministic at the test boundary. */
-export function resolveIdleMs(
-  env: Record<string, string | undefined> = process.env,
-): number {
+export function resolveIdleMs(env: Record<string, string | undefined> = process.env): number {
   const raw = env.SLACK_SESSION_IDLE_MS
   if (raw === undefined || raw === '') return DEFAULT_IDLE_MS
   const parsed = Number(raw)
@@ -340,9 +330,7 @@ function defaultLog(event: string, fields: Record<string, unknown>): void {
  *  can read state but not yet persist changes. See
  *  000-docs/session-state-machine.md §221-267 for the full target
  *  behaviour. */
-export function createSessionSupervisor(
-  opts: SupervisorOptions,
-): SessionSupervisor {
+export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervisor {
   const log = opts.log ?? defaultLog
   const clock = opts.clock ?? Date.now
   const idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
@@ -477,10 +465,7 @@ export function createSessionSupervisor(
   }
 
   return {
-    activate(
-      key: SessionKey,
-      initialOwnerId?: string,
-    ): Promise<SessionHandle> {
+    activate(key: SessionKey, initialOwnerId?: string): Promise<SessionHandle> {
       const id = keyId(key)
 
       // Quarantined keys are a sticky terminal state per session-state-
@@ -491,10 +476,7 @@ export function createSessionSupervisor(
       const priorErr = quarantined.get(id)
       if (priorErr !== undefined) {
         return Promise.reject(
-          new Error(
-            `SessionSupervisor.activate: key is quarantined`,
-            { cause: priorErr },
-          ),
+          new Error(`SessionSupervisor.activate: key is quarantined`, { cause: priorErr }),
         )
       }
 
@@ -646,9 +628,7 @@ export function createSessionSupervisor(
     shutdown(): Promise<void> {
       // Under ccsc-xa3.14 (deactivate + reaper sub-epic).
       return Promise.reject(
-        new Error(
-          'SessionSupervisor.shutdown: not yet implemented (ccsc-xa3.14)',
-        ),
+        new Error('SessionSupervisor.shutdown: not yet implemented (ccsc-xa3.14)'),
       )
     },
 
@@ -837,9 +817,7 @@ class ConcreteHandle implements SessionHandle {
     }
 
     if (this._state !== 'active') {
-      return Promise.reject(
-        new Error(`beginQuiesce: cannot quiesce from state '${this._state}'`),
-      )
+      return Promise.reject(new Error(`beginQuiesce: cannot quiesce from state '${this._state}'`))
     }
 
     this._state = 'quiescing'
@@ -873,9 +851,7 @@ class ConcreteHandle implements SessionHandle {
    *  honour and tests can exercise the drain path. */
   beginWork(requestId: string): AbortController {
     if (this.inFlight.has(requestId)) {
-      throw new Error(
-        `beginWork: requestId already in flight: '${requestId}'`,
-      )
+      throw new Error(`beginWork: requestId already in flight: '${requestId}'`)
     }
     const ctrl = new AbortController()
     this.inFlight.set(requestId, ctrl)
@@ -915,18 +891,14 @@ class ConcreteHandle implements SessionHandle {
     const enqueueTimeState = this._state
 
     if (enqueueTimeState === 'quarantined') {
-      return Promise.reject(
-        new Error(`SessionHandle.update: handle is quarantined`),
-      )
+      return Promise.reject(new Error(`SessionHandle.update: handle is quarantined`))
     }
     if (enqueueTimeState !== 'active') {
       // Covers 'quiescing', 'deactivating', and 'activating'. Include the
       // actual state so callers can distinguish the cases without inspecting
       // `handle.state` separately.
       return Promise.reject(
-        new Error(
-          `SessionHandle.update: handle is not active (state: ${enqueueTimeState})`,
-        ),
+        new Error(`SessionHandle.update: handle is not active (state: ${enqueueTimeState})`),
       )
     }
 

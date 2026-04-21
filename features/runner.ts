@@ -43,10 +43,7 @@ export class StepRegistry {
 
   /** Register a step by exact string (anchored match) or RegExp. */
   register(pattern: string | RegExp, fn: StepFn): void {
-    const re =
-      typeof pattern === 'string'
-        ? new RegExp(`^${escapeRegExp(pattern)}$`)
-        : pattern
+    const re = typeof pattern === 'string' ? new RegExp(`^${escapeRegExp(pattern)}$`) : pattern
     this.steps.push({ pattern: re, fn })
   }
 
@@ -149,16 +146,10 @@ export function parseFeature(source: string): Feature {
 // ---------------------------------------------------------------------------
 
 /** Execute a single step against the registry. Throws if unmatched. */
-export async function runStep(
-  registry: StepRegistry,
-  step: Step,
-  ctx: Context,
-): Promise<void> {
+export async function runStep(registry: StepRegistry, step: Step, ctx: Context): Promise<void> {
   const result = registry.match(step.text)
   if (!result) {
-    throw new Error(
-      `No step definition for: "${step.keyword}: ${step.text}"`,
-    )
+    throw new Error(`No step definition for: "${step.keyword}: ${step.text}"`)
   }
   await result.fn(ctx, result.match)
 }
@@ -181,9 +172,7 @@ export function validateRegistry(feature: Feature, registry: StepRegistry): void
     }
   }
   if (missing.length > 0) {
-    throw new Error(
-      `Missing step definitions in feature "${feature.name}":\n${missing.join('\n')}`,
-    )
+    throw new Error(`Missing step definitions in feature "${feature.name}":\n${missing.join('\n')}`)
   }
 }
 

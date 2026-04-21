@@ -90,163 +90,130 @@ export function registerJournalSteps(registry: StepRegistry): void {
   // Scenario: A clean, monotonic chain verifies successfully
   // -------------------------------------------------------------------------
 
-  registry.register(
-    'an audit journal containing a valid sequence of events',
-    (ctx) => {
-      const dir = ensureTmpRoot()
-      const path = join(dir, `clean-${Date.now()}.log`)
-      const anchor = sha256Hex('genesis-anchor')
-      const events = buildChain(5, anchor)
-      writeJournalFile(path, eventsToLines(events))
-      ctx.journalPath = path
-      ctx.expectedCount = events.length
-    },
-  )
+  registry.register('an audit journal containing a valid sequence of events', (ctx) => {
+    const dir = ensureTmpRoot()
+    const path = join(dir, `clean-${Date.now()}.log`)
+    const anchor = sha256Hex('genesis-anchor')
+    const events = buildChain(5, anchor)
+    writeJournalFile(path, eventsToLines(events))
+    ctx.journalPath = path
+    ctx.expectedCount = events.length
+  })
 
-  registry.register(
-    'the verifier reads the journal end-to-end',
-    async (ctx) => {
-      const path = ctx.journalPath as string
-      ctx.result = await verifyJournal(path)
-    },
-  )
+  registry.register('the verifier reads the journal end-to-end', async (ctx) => {
+    const path = ctx.journalPath as string
+    ctx.result = await verifyJournal(path)
+  })
 
-  registry.register(
-    'the result reports ok',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(true)
-    },
-  )
+  registry.register('the result reports ok', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(true)
+  })
 
-  registry.register(
-    'the events-verified count matches the number of records',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(true)
-      if (result.ok) {
-        expect(result.eventsVerified).toBe(ctx.expectedCount as number)
-      }
-    },
-  )
+  registry.register('the events-verified count matches the number of records', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.eventsVerified).toBe(ctx.expectedCount as number)
+    }
+  })
 
   // -------------------------------------------------------------------------
   // Scenario: A prevHash mismatch is reported at the breaking line
   // -------------------------------------------------------------------------
 
-  registry.register(
-    "an audit journal whose fifth event carries a tampered prevHash",
-    (ctx) => {
-      const dir = ensureTmpRoot()
-      const path = join(dir, `tampered-prevhash-${Date.now()}.log`)
-      const anchor = sha256Hex('tampered-anchor')
-      const events = buildChain(7, anchor)
-      const lines = eventsToLines(events)
+  registry.register('an audit journal whose fifth event carries a tampered prevHash', (ctx) => {
+    const dir = ensureTmpRoot()
+    const path = join(dir, `tampered-prevhash-${Date.now()}.log`)
+    const anchor = sha256Hex('tampered-anchor')
+    const events = buildChain(7, anchor)
+    const lines = eventsToLines(events)
 
-      // Tamper: replace the 5th event's prevHash with a bogus value
-      const fifth = JSON.parse(lines[4]!) as JournalEvent
-      const tampered = { ...fifth, prevHash: sha256Hex('bogus-prev') }
-      lines[4] = JSON.stringify(tampered)
+    // Tamper: replace the 5th event's prevHash with a bogus value
+    const fifth = JSON.parse(lines[4]!) as JournalEvent
+    const tampered = { ...fifth, prevHash: sha256Hex('bogus-prev') }
+    lines[4] = JSON.stringify(tampered)
 
-      writeJournalFile(path, lines)
-      ctx.journalPath = path
-      ctx.breakLine = 5
-    },
-  )
+    writeJournalFile(path, lines)
+    ctx.journalPath = path
+    ctx.breakLine = 5
+  })
 
-  registry.register(
-    'the verifier reads the journal in order',
-    async (ctx) => {
-      const path = ctx.journalPath as string
-      ctx.result = await verifyJournal(path)
-    },
-  )
+  registry.register('the verifier reads the journal in order', async (ctx) => {
+    const path = ctx.journalPath as string
+    ctx.result = await verifyJournal(path)
+  })
 
-  registry.register(
-    'the result reports not-ok at the fifth line',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.lineNumber).toBe(5)
-      }
-    },
-  )
+  registry.register('the result reports not-ok at the fifth line', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(5)
+    }
+  })
 
-  registry.register(
-    'the break reason names the prevHash chain break',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        // Either prevHash mismatch or hash mismatch is acceptable — tampering
-        // prevHash will cause the hash recomputation to also mismatch. The
-        // verifier checks prevHash first, so we'll see "prevHash mismatch".
-        expect(result.break.reason).toMatch(/prevHash|hash/)
-      }
-    },
-  )
+  registry.register('the break reason names the prevHash chain break', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      // Either prevHash mismatch or hash mismatch is acceptable — tampering
+      // prevHash will cause the hash recomputation to also mismatch. The
+      // verifier checks prevHash first, so we'll see "prevHash mismatch".
+      expect(result.break.reason).toMatch(/prevHash|hash/)
+    }
+  })
 
   // -------------------------------------------------------------------------
   // Scenario: A seq gap is reported at the gap line
   // -------------------------------------------------------------------------
 
-  registry.register(
-    'an audit journal whose sequence jumps from nine to eleven',
-    (ctx) => {
-      const dir = ensureTmpRoot()
-      const path = join(dir, `seq-gap-${Date.now()}.log`)
-      const anchor = sha256Hex('seq-gap-anchor')
+  registry.register('an audit journal whose sequence jumps from nine to eleven', (ctx) => {
+    const dir = ensureTmpRoot()
+    const path = join(dir, `seq-gap-${Date.now()}.log`)
+    const anchor = sha256Hex('seq-gap-anchor')
 
-      // Build 9 clean events
-      const first9 = buildChain(9, anchor)
-      // Build events 10 and 11 — we'll drop event 10 to create the gap
-      const last2 = buildChain(2, first9[8]!.hash)
-      // last2[0] = seq 10, last2[1] = seq 11. We inject seq 11 directly after seq 9.
+    // Build 9 clean events
+    const first9 = buildChain(9, anchor)
+    // Build events 10 and 11 — we'll drop event 10 to create the gap
+    const last2 = buildChain(2, first9[8]!.hash)
+    // last2[0] = seq 10, last2[1] = seq 11. We inject seq 11 directly after seq 9.
 
-      // Re-stamp last2[1] (seq 11) to chain from last2[0].hash correctly.
-      // Actually: we want seq 9 → (gap) → seq 11. We need seq 11 to hash from seq 10.
-      // If we include seq 10 but skip it, the prevHash of seq 11 is correct but seq gap triggers.
-      // Strategy: keep last2[1] but relabel it to chain from seq 10's hash so prevHash passes,
-      // leaving only the seq check to catch it.
-      // last2[0].hash is the hash of seq 10. last2[1].prevHash == last2[0].hash.
-      // So lines: first9 lines + last2[1] line.
-      // The verifier will see seq 9 → seq 11 and report a seq gap.
+    // Re-stamp last2[1] (seq 11) to chain from last2[0].hash correctly.
+    // Actually: we want seq 9 → (gap) → seq 11. We need seq 11 to hash from seq 10.
+    // If we include seq 10 but skip it, the prevHash of seq 11 is correct but seq gap triggers.
+    // Strategy: keep last2[1] but relabel it to chain from seq 10's hash so prevHash passes,
+    // leaving only the seq check to catch it.
+    // last2[0].hash is the hash of seq 10. last2[1].prevHash == last2[0].hash.
+    // So lines: first9 lines + last2[1] line.
+    // The verifier will see seq 9 → seq 11 and report a seq gap.
 
-      const lines = [...eventsToLines(first9), eventsToLines(last2)[1]!]
-      writeJournalFile(path, lines)
-      ctx.journalPath = path
-    },
-  )
+    const lines = [...eventsToLines(first9), eventsToLines(last2)[1]!]
+    writeJournalFile(path, lines)
+    ctx.journalPath = path
+  })
 
-  registry.register(
-    'the result reports not-ok at the line with seq eleven',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.seq).toBe(11)
-      }
-    },
-  )
+  registry.register('the result reports not-ok at the line with seq eleven', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.seq).toBe(11)
+    }
+  })
 
-  registry.register(
-    'the break reason names the seq gap and the expected value',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.reason).toMatch(/seq gap|prevHash/)
-      }
-    },
-  )
+  registry.register('the break reason names the seq gap and the expected value', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/seq gap|prevHash/)
+    }
+  })
 
   // -------------------------------------------------------------------------
   // Scenario: A version skew is reported at the mismatched event
   // -------------------------------------------------------------------------
 
   registry.register(
-    "an audit journal whose fourth event declares a schema version other than one",
+    'an audit journal whose fourth event declares a schema version other than one',
     (ctx) => {
       const dir = ensureTmpRoot()
       const path = join(dir, `version-skew-${Date.now()}.log`)
@@ -273,150 +240,114 @@ export function registerJournalSteps(registry: StepRegistry): void {
     },
   )
 
-  registry.register(
-    'the result reports not-ok at the fourth line',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.lineNumber).toBe(4)
-      }
-    },
-  )
+  registry.register('the result reports not-ok at the fourth line', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(4)
+    }
+  })
 
-  registry.register(
-    'the break reason names the version skew',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.reason).toMatch(/version skew/)
-      }
-    },
-  )
+  registry.register('the break reason names the version skew', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/version skew/)
+    }
+  })
 
   // -------------------------------------------------------------------------
   // Scenario: A malformed line is reported as a parse or schema error
   // -------------------------------------------------------------------------
 
-  registry.register(
-    "an audit journal whose third line is not valid canonical JSON",
-    (ctx) => {
-      const dir = ensureTmpRoot()
-      const path = join(dir, `malformed-${Date.now()}.log`)
-      const anchor = sha256Hex('malformed-anchor')
-      const events = buildChain(5, anchor)
-      const lines = eventsToLines(events)
+  registry.register('an audit journal whose third line is not valid canonical JSON', (ctx) => {
+    const dir = ensureTmpRoot()
+    const path = join(dir, `malformed-${Date.now()}.log`)
+    const anchor = sha256Hex('malformed-anchor')
+    const events = buildChain(5, anchor)
+    const lines = eventsToLines(events)
 
-      // Replace line 3 (index 2) with invalid JSON
-      lines[2] = '{ this is not valid JSON }'
+    // Replace line 3 (index 2) with invalid JSON
+    lines[2] = '{ this is not valid JSON }'
 
-      writeJournalFile(path, lines)
-      ctx.journalPath = path
-    },
-  )
+    writeJournalFile(path, lines)
+    ctx.journalPath = path
+  })
 
-  registry.register(
-    'the result reports not-ok at the third line',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.lineNumber).toBe(3)
-      }
-    },
-  )
+  registry.register('the result reports not-ok at the third line', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(3)
+    }
+  })
 
-  registry.register(
-    'the break reason mentions a parse or schema failure',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.reason).toMatch(/parse|schema/)
-      }
-    },
-  )
+  registry.register('the break reason mentions a parse or schema failure', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/parse|schema/)
+    }
+  })
 
   // -------------------------------------------------------------------------
   // Scenario: An empty line in the middle of the journal
   // -------------------------------------------------------------------------
 
-  registry.register(
-    "an audit journal whose sixth line is blank",
-    (ctx) => {
-      const dir = ensureTmpRoot()
-      const path = join(dir, `blank-line-${Date.now()}.log`)
-      const anchor = sha256Hex('blank-line-anchor')
-      const events = buildChain(8, anchor)
-      const lines = eventsToLines(events)
+  registry.register('an audit journal whose sixth line is blank', (ctx) => {
+    const dir = ensureTmpRoot()
+    const path = join(dir, `blank-line-${Date.now()}.log`)
+    const anchor = sha256Hex('blank-line-anchor')
+    const events = buildChain(8, anchor)
+    const lines = eventsToLines(events)
 
-      // Insert a blank line at position 5 (0-indexed), making it line 6 (1-indexed).
-      lines.splice(5, 0, '')
+    // Insert a blank line at position 5 (0-indexed), making it line 6 (1-indexed).
+    lines.splice(5, 0, '')
 
-      writeJournalFile(path, lines)
-      ctx.journalPath = path
-    },
-  )
+    writeJournalFile(path, lines)
+    ctx.journalPath = path
+  })
 
-  registry.register(
-    'the result reports not-ok at the sixth line',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.lineNumber).toBe(6)
-      }
-    },
-  )
+  registry.register('the result reports not-ok at the sixth line', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(6)
+    }
+  })
 
-  registry.register(
-    'the break reason names structural damage',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.reason).toMatch(/structural damage|empty line/)
-      }
-    },
-  )
+  registry.register('the break reason names structural damage', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/structural damage|empty line/)
+    }
+  })
 
   // -------------------------------------------------------------------------
   // Scenario: A missing journal file is reported without crashing
   // -------------------------------------------------------------------------
 
-  registry.register(
-    'no audit journal exists at the requested path',
-    (ctx) => {
-      const dir = ensureTmpRoot()
-      ctx.journalPath = join(dir, 'does-not-exist.log')
-    },
-  )
+  registry.register('no audit journal exists at the requested path', (ctx) => {
+    const dir = ensureTmpRoot()
+    ctx.journalPath = join(dir, 'does-not-exist.log')
+  })
 
-  registry.register(
-    'the verifier is invoked against the missing path',
-    async (ctx) => {
-      const path = ctx.journalPath as string
-      ctx.result = await verifyJournal(path)
-    },
-  )
+  registry.register('the verifier is invoked against the missing path', async (ctx) => {
+    const path = ctx.journalPath as string
+    ctx.result = await verifyJournal(path)
+  })
 
-  registry.register(
-    'the result reports not-ok',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-    },
-  )
+  registry.register('the result reports not-ok', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+  })
 
-  registry.register(
-    'the break reason includes the underlying read failure',
-    (ctx) => {
-      const result = ctx.result as VerifyResult
-      expect(result.ok).toBe(false)
-      if (!result.ok) {
-        expect(result.break.reason).toMatch(/read failed/)
-      }
-    },
-  )
+  registry.register('the break reason includes the underlying read failure', (ctx) => {
+    const result = ctx.result as VerifyResult
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.reason).toMatch(/read failed/)
+    }
+  })
 }

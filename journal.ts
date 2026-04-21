@@ -124,11 +124,9 @@ export type Actor = z.infer<typeof Actor>
  *  parse time so a malformed `prevHash` / `hash` is caught before it
  *  reaches the verifier. The writer produces them via `toString('hex')`
  *  on a Node crypto digest, which is guaranteed lowercase. */
-const Sha256Hex = z
-  .string()
-  .regex(/^[0-9a-f]{64}$/, {
-    message: 'sha256 hex must be 64 lowercase hex chars',
-  })
+const Sha256Hex = z.string().regex(/^[0-9a-f]{64}$/, {
+  message: 'sha256 hex must be 64 lowercase hex chars',
+})
 
 /** Subset match of `SessionKey` from lib.ts. Duplicated here rather
  *  than reusing the lib schema because the journal must be hashable
@@ -423,13 +421,7 @@ export class JournalWriter {
     const fh = await fsOpen(opts.path, 'a', 0o600)
     ACTIVE_PATHS.add(opts.path)
 
-    return new JournalWriter(
-      fh,
-      lastHash,
-      nextSeq,
-      opts.now ?? ((): Date => new Date()),
-      opts.path,
-    )
+    return new JournalWriter(fh, lastHash, nextSeq, opts.now ?? ((): Date => new Date()), opts.path)
   }
 
   /** Append a new event. Returns the fully-framed `JournalEvent` that
@@ -443,9 +435,7 @@ export class JournalWriter {
   async writeEvent(input: WriteInput): Promise<JournalEvent> {
     if (this.broken) {
       return Promise.reject(
-        new Error(
-          `JournalWriter is broken after a prior write failure: ${this.broken.message}`,
-        ),
+        new Error(`JournalWriter is broken after a prior write failure: ${this.broken.message}`),
       )
     }
     if (this.fh === null) {
@@ -472,9 +462,7 @@ export class JournalWriter {
     // check in writeEvent() catches fresh calls; this check catches calls
     // that raced in before broken was set and are now draining the queue.
     if (this.broken) {
-      throw new Error(
-        `JournalWriter is broken after a prior write failure: ${this.broken.message}`,
-      )
+      throw new Error(`JournalWriter is broken after a prior write failure: ${this.broken.message}`)
     }
     if (this.fh === null) {
       throw new Error('JournalWriter._doWrite: writer closed mid-queue')
@@ -620,9 +608,7 @@ export function canonicalJson(value: unknown): string {
   if (typeof value === 'boolean') return value ? 'true' : 'false'
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || !Number.isInteger(value)) {
-      throw new Error(
-        `canonicalJson: only finite integer numbers supported (got ${String(value)})`,
-      )
+      throw new Error(`canonicalJson: only finite integer numbers supported (got ${String(value)})`)
     }
     return String(value)
   }
@@ -632,9 +618,7 @@ export function canonicalJson(value: unknown): string {
   }
   if (isRecord(value)) {
     const keys = Object.keys(value).sort()
-    const pairs = keys.map(
-      (k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`,
-    )
+    const pairs = keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`)
     return `{${pairs.join(',')}}`
   }
   throw new Error(`canonicalJson: unsupported value type: ${typeof value}`)
@@ -831,10 +815,7 @@ function truncateString(s: string, max: number): string {
  *    - Non-string primitives (numbers, booleans, null) pass through.
  *    - Unsupported container types (Maps, Sets, class instances) pass
  *      through by reference. Pre-flatten those at the caller. */
-export function truncate(
-  value: unknown,
-  max: number = TRUNCATION_LIMIT_DEFAULT,
-): unknown {
+export function truncate(value: unknown, max: number = TRUNCATION_LIMIT_DEFAULT): unknown {
   if (typeof value === 'string') {
     const t = truncateString(value, max)
     return t === value ? value : t
@@ -1025,9 +1006,7 @@ export async function verifyJournal(path: string): Promise<VerifyResult> {
           lineNumber,
           seq: null,
           ts: null,
-          reason: `parse/schema error: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          reason: `parse/schema error: ${err instanceof Error ? err.message : String(err)}`,
         },
       }
     }

@@ -49,8 +49,14 @@ export const MatchSpec = z
   .object({
     tool: z.string().min(1).optional(),
     pathPrefix: z.string().min(1).optional(),
-    channel: z.string().regex(/^[CD][A-Z0-9]+$/).optional(),
-    thread_ts: z.string().regex(/^\d+\.\d+$/).optional(),
+    channel: z
+      .string()
+      .regex(/^[CD][A-Z0-9]+$/)
+      .optional(),
+    thread_ts: z
+      .string()
+      .regex(/^\d+\.\d+$/)
+      .optional(),
     actor: z.enum(['session_owner', 'claude_process']).optional(),
     argEquals: z.record(z.string(), z.unknown()).optional(),
   })
@@ -536,7 +542,9 @@ export function checkMonotonicity(
 ): MonotonicityViolation[] {
   const violations: MonotonicityViolation[] = []
   const prevIds = new Set(prev.map((r) => r.id))
-  const prevDenies = prev.filter((r): r is Extract<PolicyRule, { effect: 'deny' }> => r.effect === 'deny')
+  const prevDenies = prev.filter(
+    (r): r is Extract<PolicyRule, { effect: 'deny' }> => r.effect === 'deny',
+  )
 
   for (const newRule of next) {
     if (prevIds.has(newRule.id)) continue // unchanged or modified, not added
@@ -584,14 +592,11 @@ export interface BroadMatchWarning {
  *  axis: "this rule IS reachable and would be monotone, but its shape
  *  means it probably matches far more than you think."
  */
-export function detectBroadAutoApprove(
-  rules: readonly PolicyRule[],
-): BroadMatchWarning[] {
+export function detectBroadAutoApprove(rules: readonly PolicyRule[]): BroadMatchWarning[] {
   const warnings: BroadMatchWarning[] = []
   for (const rule of rules) {
     if (rule.effect !== 'auto_approve') continue
-    const hasNarrow =
-      rule.match.tool !== undefined || rule.match.pathPrefix !== undefined
+    const hasNarrow = rule.match.tool !== undefined || rule.match.pathPrefix !== undefined
     if (!hasNarrow) {
       warnings.push({
         ruleId: rule.id,

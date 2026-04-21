@@ -78,10 +78,7 @@ function functionName(node: ts.Node, source: ts.SourceFile): string {
     if (node.name && ts.isIdentifier(node.name)) return node.name.text
   }
   if (ts.isConstructorDeclaration(node)) return 'constructor'
-  if (
-    (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) &&
-    node.parent
-  ) {
+  if ((ts.isFunctionExpression(node) || ts.isArrowFunction(node)) && node.parent) {
     const parent = node.parent
     if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
       return parent.name.text

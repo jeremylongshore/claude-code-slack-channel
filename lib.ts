@@ -236,14 +236,10 @@ function isValidSessionComponent(component: string): boolean {
  */
 export function sessionPath(root: string, key: SessionKey): string {
   if (!isValidSessionComponent(key.channel)) {
-    throw new Error(
-      `sessionPath: invalid channel component: ${JSON.stringify(key.channel)}`,
-    )
+    throw new Error(`sessionPath: invalid channel component: ${JSON.stringify(key.channel)}`)
   }
   if (!isValidSessionComponent(key.thread)) {
-    throw new Error(
-      `sessionPath: invalid thread component: ${JSON.stringify(key.thread)}`,
-    )
+    throw new Error(`sessionPath: invalid thread component: ${JSON.stringify(key.thread)}`)
   }
 
   // Canonicalize the state root. Throws ENOENT if the caller did not
@@ -353,9 +349,7 @@ export async function loadSession(root: string, path: string): Promise<Session> 
   // symlinks at `path` to their true target.
   const resolvedFile = realpathSync.native(path)
   if (!isUnderRoot(resolvedFile, resolvedRoot)) {
-    throw new Error(
-      `loadSession: resolved path escapes state root: ${JSON.stringify(path)}`,
-    )
+    throw new Error(`loadSession: resolved path escapes state root: ${JSON.stringify(path)}`)
   }
   const raw = await readFile(resolvedFile, 'utf8')
   const parsed = JSON.parse(raw)
@@ -481,12 +475,7 @@ function collectChannelSummaries(
   }
 
   for (const entry of threadEntries) {
-    const summary = readThreadSummary(
-      channel,
-      entry,
-      resolvedChannelDir,
-      resolvedRoot,
-    )
+    const summary = readThreadSummary(channel, entry, resolvedChannelDir, resolvedRoot)
     if (summary === null) continue
     out.push(summary)
     if (out.length >= LIST_SESSIONS_MAX) return
@@ -705,12 +694,7 @@ const SENDABLE_BASENAME_DENY: RegExp[] = [
  * Matched as literal path components (not prefixes), with two-segment entries
  * checked against consecutive components (e.g. `.config`/`gcloud`).
  */
-const SENDABLE_PARENT_DENY_SINGLE: Set<string> = new Set([
-  '.ssh',
-  '.aws',
-  '.gnupg',
-  '.git',
-])
+const SENDABLE_PARENT_DENY_SINGLE: Set<string> = new Set(['.ssh', '.aws', '.gnupg', '.git'])
 
 const SENDABLE_PARENT_DENY_PAIRS: Array<[string, string]> = [
   ['.config', 'gcloud'],
@@ -863,17 +847,21 @@ export function assertSendable(
         return resolve(stateRoot)
       }
     })()
-    if (
-      isUnderRoot(real, stateRootReal) &&
-      !isUnderRoot(real, inboxReal)
-    ) {
+    if (isUnderRoot(real, stateRootReal) && !isUnderRoot(real, inboxReal)) {
       throw new Error('Blocked: file path is under the state directory')
     }
   }
 
-  const roots: string[] = [inboxReal, ...allowlistRoots.map((r) => {
-    try { return realpathSync(resolve(r)) } catch { return resolve(r) }
-  })]
+  const roots: string[] = [
+    inboxReal,
+    ...allowlistRoots.map((r) => {
+      try {
+        return realpathSync(resolve(r))
+      } catch {
+        return resolve(r)
+      }
+    }),
+  ]
 
   let underRoot = false
   for (const root of roots) {
@@ -921,10 +909,7 @@ export function assertSendable(
  * (top-level channel post) collapses to the empty string slot — it
  * is its OWN delivery slot, distinct from any threaded reply.
  */
-export function deliveredThreadKey(
-  channel: string,
-  threadTs: string | undefined,
-): string {
+export function deliveredThreadKey(channel: string, threadTs: string | undefined): string {
   return `${channel}\0${threadTs ?? ''}`
 }
 
@@ -938,10 +923,7 @@ export function deliveredThreadKey(
  * `undefined` thread collapses to empty-string — distinct from any
  * threaded slot per the same rule the outbound gate uses.
  */
-export function permissionPairingKey(
-  threadTs: string | undefined,
-  requestId: string,
-): string {
+export function permissionPairingKey(threadTs: string | undefined, requestId: string): string {
   return `${threadTs ?? ''}\0${requestId}`
 }
 
@@ -1314,11 +1296,7 @@ export function resolveJournalPath(
       // operator-side edge case resolved by passing `./-name` through
       // the shell or by using the `--audit-log-file=-name` equals
       // form (which keeps the literal).
-      if (
-        typeof next === 'string' &&
-        next.length > 0 &&
-        !next.startsWith('-')
-      ) {
+      if (typeof next === 'string' && next.length > 0 && !next.startsWith('-')) {
         return { path: next, source: 'flag' }
       }
       // Missing / empty / flag-shaped value: fall through. Don't
@@ -1393,9 +1371,7 @@ export type PermissionRoute =
  *  `requireAuthoredPolicy`). A matched `auto_approve` rule produces
  *  `{ kind: 'allow', rule: <id> }` and routes to `auto_allow`.
  */
-export function decidePermissionRoute(
-  decision: PolicyDecisionShape,
-): PermissionRoute {
+export function decidePermissionRoute(decision: PolicyDecisionShape): PermissionRoute {
   switch (decision.kind) {
     case 'allow':
       return decision.rule !== undefined
@@ -1503,10 +1479,7 @@ export function recordApprovalVote(
  *  control sequences (link syntax, channel refs) via attacker-
  *  controlled strings like tool names or policy reasons. Pure. */
 export function escMrkdwn(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,11 +1668,7 @@ export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
     const arg = argv[i]!
     if (arg === '--verify-audit-log') {
       const next = argv[i + 1]
-      if (
-        typeof next === 'string' &&
-        next.length > 0 &&
-        !next.startsWith('-')
-      ) {
+      if (typeof next === 'string' && next.length > 0 && !next.startsWith('-')) {
         return next
       }
       continue

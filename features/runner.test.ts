@@ -17,17 +17,9 @@
 import { afterAll, beforeEach, describe, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import {
-  buildRunner,
-  parseFeature,
-  StepRegistry,
-  validateRegistry,
-} from './runner.ts'
+import { buildRunner, parseFeature, StepRegistry, validateRegistry } from './runner.ts'
 import { registerGateSteps } from './steps/gate.ts'
-import {
-  cleanupJournalFixtures,
-  registerJournalSteps,
-} from './steps/journal.ts'
+import { cleanupJournalFixtures, registerJournalSteps } from './steps/journal.ts'
 import { registerOutboundSteps } from './steps/outbound.ts'
 import { registerPolicySteps } from './steps/policy.ts'
 import {

@@ -85,9 +85,7 @@ function makeOpts(overrides: Partial<GateOptions> = {}): GateOptions {
  *  positive. Used by the 31-A.4 invariant test below and available
  *  to any future import-graph lint in this suite. */
 function extractImportSpecifiers(src: string): string[] {
-  const stripped = src
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/[^\n]*/g, '')
+  const stripped = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
   const specs: string[] = []
   const re = /(?:\bfrom|\bimport\s*\(|\brequire\s*\()\s*(['"])([^'"]+)\1/g
   for (const m of stripped.matchAll(re)) specs.push(m[2]!)
@@ -141,10 +139,7 @@ describe('gate', () => {
   })
 
   test('drops messages with no user field', async () => {
-    const result = await gate(
-      { channel_type: 'im', channel: 'D1' },
-      makeOpts(),
-    )
+    const result = await gate({ channel_type: 'im', channel: 'D1' }, makeOpts())
     expect(result.action).toBe('drop')
   })
 
@@ -258,7 +253,12 @@ describe('gate', () => {
     const access = makeAccess({ dmPolicy: 'pairing' })
     await gate(
       { user: 'U_NEW', channel_type: 'im', channel: 'D1' },
-      makeOpts({ access, saveAccess: () => { saved = true } }),
+      makeOpts({
+        access,
+        saveAccess: () => {
+          saved = true
+        },
+      }),
     )
     expect(saved).toBe(true)
   })
@@ -268,7 +268,13 @@ describe('gate', () => {
     const access = makeAccess({ dmPolicy: 'pairing' })
     await gate(
       { user: 'U_NEW', channel_type: 'im', channel: 'D1' },
-      makeOpts({ access, staticMode: true, saveAccess: () => { saved = true } }),
+      makeOpts({
+        access,
+        staticMode: true,
+        saveAccess: () => {
+          saved = true
+        },
+      }),
     )
     expect(saved).toBe(false)
   })
@@ -367,7 +373,13 @@ describe('gate', () => {
       channels: { C1: { requireMention: false, allowFrom: ['U_PEER'], allowBotIds: ['U_PEER'] } },
     })
     const result = await gate(
-      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hello from peer' },
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'hello from peer',
+      },
       makeOpts({ access }),
     )
     expect(result.action).toBe('deliver')
@@ -378,7 +390,13 @@ describe('gate', () => {
       channels: { C1: { requireMention: false, allowFrom: ['U_BOT'], allowBotIds: ['U_BOT'] } },
     })
     const result = await gate(
-      { bot_id: 'B_BOT', user: 'U_BOT', channel: 'C1', channel_type: 'channel', text: 'my own echo' },
+      {
+        bot_id: 'B_BOT',
+        user: 'U_BOT',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'my own echo',
+      },
       makeOpts({ access }),
     )
     expect(result.action).toBe('drop')
@@ -389,7 +407,13 @@ describe('gate', () => {
       channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_UNKNOWN'] } },
     })
     const result = await gate(
-      { bot_id: 'B_UNKNOWN', bot_profile: { app_id: 'A_BOT' }, channel: 'C1', channel_type: 'channel', text: 'no user field' },
+      {
+        bot_id: 'B_UNKNOWN',
+        bot_profile: { app_id: 'A_BOT' },
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'no user field',
+      },
       makeOpts({ access }),
     )
     expect(result.action).toBe('drop')
@@ -400,7 +424,13 @@ describe('gate', () => {
       channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER'] } },
     })
     const result = await gate(
-      { bot_id: 'B_PEER', user: 'U_PEER', channel_type: 'im', channel: 'D_DM', text: 'hello via DM' },
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel_type: 'im',
+        channel: 'D_DM',
+        text: 'hello via DM',
+      },
       makeOpts({ access }),
     )
     expect(result.action).toBe('drop')
@@ -428,13 +458,25 @@ describe('gate', () => {
       channels: { C1: { requireMention: true, allowFrom: [], allowBotIds: ['U_PEER'] } },
     })
     const noMention = await gate(
-      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'no mention here' },
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'no mention here',
+      },
       makeOpts({ access }),
     )
     expect(noMention.action).toBe('drop')
 
     const withMention = await gate(
-      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hey <@U_BOT> please look' },
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'hey <@U_BOT> please look',
+      },
       makeOpts({ access }),
     )
     expect(withMention.action).toBe('deliver')
@@ -449,7 +491,13 @@ describe('gate', () => {
 
     // A non-permission message delivers normally
     const normalMsg = await gate(
-      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'incident detected' },
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'incident detected',
+      },
       makeOpts({ access }),
     )
     expect(normalMsg.action).toBe('deliver')
@@ -576,10 +624,10 @@ describe('gate', () => {
 // purely-lexical paths.
 
 describe('assertSendable', () => {
-  let root: string          // tmp root that stands in for HOME
-  let inbox: string         // allowed inbox dir
-  let project: string       // additional allowlisted root
-  let outside: string       // not in allowlist
+  let root: string // tmp root that stands in for HOME
+  let inbox: string // allowed inbox dir
+  let project: string // additional allowlisted root
+  let outside: string // not in allowlist
 
   beforeAll(() => {
     root = mkdtempSync(join(tmpdir(), 'slack-sendable-'))
@@ -611,7 +659,9 @@ describe('assertSendable', () => {
     // Symlink inside inbox that points at the .env outside
     try {
       symlinkSync(join(root, '.env'), join(inbox, 'innocent-looking.txt'))
-    } catch { /* some FSes don't support symlinks; test will skip */ }
+    } catch {
+      /* some FSes don't support symlinks; test will skip */
+    }
   })
 
   afterAll(() => {
@@ -635,7 +685,9 @@ describe('assertSendable', () => {
   })
 
   test('denies ~/.aws/credentials via parent-component deny', () => {
-    expect(() => assertSendable(join(root, '.aws', 'credentials'), inbox, [root])).toThrow('Blocked')
+    expect(() => assertSendable(join(root, '.aws', 'credentials'), inbox, [root])).toThrow(
+      'Blocked',
+    )
   })
 
   test('denies ~/.ssh/id_rsa via parent-component deny', () => {
@@ -650,17 +702,13 @@ describe('assertSendable', () => {
     } catch {
       return
     }
-    expect(() =>
-      assertSendable(join(inbox, 'innocent-looking.txt'), inbox, []),
-    ).toThrow('Blocked')
+    expect(() => assertSendable(join(inbox, 'innocent-looking.txt'), inbox, [])).toThrow('Blocked')
   })
 
   test('denies a path containing a ".." component (raw string)', () => {
     // join() collapses ".." at build time, so pass a raw string to exercise
     // the pre-resolve check.
-    expect(() =>
-      assertSendable(`${inbox}/../.env`, inbox, [root]),
-    ).toThrow('..')
+    expect(() => assertSendable(`${inbox}/../.env`, inbox, [root])).toThrow('..')
   })
 
   test('denies a file whose basename matches the .env regex', () => {
@@ -670,9 +718,7 @@ describe('assertSendable', () => {
   })
 
   test('denies nonexistent files', () => {
-    expect(() =>
-      assertSendable(join(inbox, 'does-not-exist.png'), inbox, []),
-    ).toThrow('Blocked')
+    expect(() => assertSendable(join(inbox, 'does-not-exist.png'), inbox, [])).toThrow('Blocked')
   })
 
   test('error messages do not echo the attempted path', () => {
@@ -699,10 +745,10 @@ describe('assertSendable', () => {
 // symlink from outside into the state dir still trips the guard.
 
 describe('assertSendable — state-root denylist', () => {
-  let root: string          // tmp root analogous to ~/.claude
-  let stateRoot: string     // tmp state dir (analogous to ~/.claude/channels/slack)
-  let inbox: string         // INBOX_DIR inside state dir
-  let sibling: string       // non-state directory used as allowlist entry
+  let root: string // tmp root analogous to ~/.claude
+  let stateRoot: string // tmp state dir (analogous to ~/.claude/channels/slack)
+  let inbox: string // INBOX_DIR inside state dir
+  let sibling: string // non-state directory used as allowlist entry
 
   beforeAll(() => {
     root = realpathSync.native(mkdtempSync(join(tmpdir(), 'slack-sendable-state-')))
@@ -722,11 +768,10 @@ describe('assertSendable — state-root denylist', () => {
     // Symlink OUTSIDE state dir that points to a file INSIDE it. Used to
     // verify the realpath flattening on the stateRoot side of the check.
     try {
-      symlinkSync(
-        join(stateRoot, 'access.json'),
-        join(sibling, 'innocent.txt'),
-      )
-    } catch { /* some FSes don't support symlinks; test will skip */ }
+      symlinkSync(join(stateRoot, 'access.json'), join(sibling, 'innocent.txt'))
+    } catch {
+      /* some FSes don't support symlinks; test will skip */
+    }
   })
 
   afterAll(() => {
@@ -736,19 +781,14 @@ describe('assertSendable — state-root denylist', () => {
   test('blocks access.json when operator allowlists an ancestor of the state dir', () => {
     // Operator misconfig: SLACK_SENDABLE_ROOTS includes the parent of the
     // state dir. Without the stateRoot guard this would have succeeded.
-    expect(() =>
-      assertSendable(join(stateRoot, 'access.json'), inbox, [root], stateRoot),
-    ).toThrow('state directory')
+    expect(() => assertSendable(join(stateRoot, 'access.json'), inbox, [root], stateRoot)).toThrow(
+      'state directory',
+    )
   })
 
   test('blocks a file deep inside sessions/<channel>/<thread>.json', () => {
     expect(() =>
-      assertSendable(
-        join(stateRoot, 'sessions', 'C123', 'T456.json'),
-        inbox,
-        [root],
-        stateRoot,
-      ),
+      assertSendable(join(stateRoot, 'sessions', 'C123', 'T456.json'), inbox, [root], stateRoot),
     ).toThrow('state directory')
   })
 
@@ -761,27 +801,18 @@ describe('assertSendable — state-root denylist', () => {
     // The symlink sits in `sibling` (which is in the allowlist), but its
     // realpath resolves inside the state dir. The guard must follow.
     expect(() =>
-      assertSendable(
-        join(sibling, 'innocent.txt'),
-        inbox,
-        [root, sibling],
-        stateRoot,
-      ),
+      assertSendable(join(sibling, 'innocent.txt'), inbox, [root, sibling], stateRoot),
     ).toThrow('state directory')
   })
 
   test('allows a sibling directory next to the state dir', () => {
-    expect(() =>
-      assertSendable(join(sibling, 'ok.txt'), inbox, [sibling], stateRoot),
-    ).not.toThrow()
+    expect(() => assertSendable(join(sibling, 'ok.txt'), inbox, [sibling], stateRoot)).not.toThrow()
   })
 
   test('legacy three-arg call (no stateRoot) preserves existing behavior', () => {
     // Operator did NOT supply stateRoot. We keep the old allowlist semantics
     // so existing callers / tests keep passing.
-    expect(() =>
-      assertSendable(join(sibling, 'ok.txt'), inbox, [sibling]),
-    ).not.toThrow()
+    expect(() => assertSendable(join(sibling, 'ok.txt'), inbox, [sibling])).not.toThrow()
   })
 })
 
@@ -807,10 +838,7 @@ describe('parseSendableRoots', () => {
   })
 
   test('silently drops relative paths', () => {
-    expect(parseSendableRoots('/tmp/foo:relative/path:/var/bar')).toEqual([
-      '/tmp/foo',
-      '/var/bar',
-    ])
+    expect(parseSendableRoots('/tmp/foo:relative/path:/var/bar')).toEqual(['/tmp/foo', '/var/bar'])
   })
 
   test('silently drops empty entries', () => {
@@ -830,12 +858,8 @@ describe('assertOutboundAllowed', () => {
     })
     // Channel opt-in subsumes thread-level checks: an opted-in
     // channel authorizes any thread in that channel.
-    expect(() =>
-      assertOutboundAllowed('C_OPT', 'T1', access, new Set()),
-    ).not.toThrow()
-    expect(() =>
-      assertOutboundAllowed('C_OPT', undefined, access, new Set()),
-    ).not.toThrow()
+    expect(() => assertOutboundAllowed('C_OPT', 'T1', access, new Set())).not.toThrow()
+    expect(() => assertOutboundAllowed('C_OPT', undefined, access, new Set())).not.toThrow()
     // Spot-check that the helper shape matches what the server uses
     // for the delivered-threads Set.
     expect(deliveredThreadKey('C_OPT', 'T1')).toBe('C_OPT\0T1')
@@ -846,25 +870,19 @@ describe('assertOutboundAllowed', () => {
     const { deliveredThreadKey } = await import('./lib.ts')
     const access = makeAccess()
     const delivered = new Set([deliveredThreadKey('D_DELIVERED', 'T1')])
-    expect(() =>
-      assertOutboundAllowed('D_DELIVERED', 'T1', access, delivered),
-    ).not.toThrow()
+    expect(() => assertOutboundAllowed('D_DELIVERED', 'T1', access, delivered)).not.toThrow()
   })
 
   test('allows delivered top-level (undefined thread) posts', async () => {
     const { deliveredThreadKey } = await import('./lib.ts')
     const access = makeAccess()
     const delivered = new Set([deliveredThreadKey('C_TOP', undefined)])
-    expect(() =>
-      assertOutboundAllowed('C_TOP', undefined, access, delivered),
-    ).not.toThrow()
+    expect(() => assertOutboundAllowed('C_TOP', undefined, access, delivered)).not.toThrow()
   })
 
   test('blocks unknown channels', () => {
     const access = makeAccess()
-    expect(() =>
-      assertOutboundAllowed('C_RANDO', 'T1', access, new Set()),
-    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed('C_RANDO', 'T1', access, new Set())).toThrow('Outbound gate')
   })
 
   test('blocks channels not in either list', async () => {
@@ -873,9 +891,9 @@ describe('assertOutboundAllowed', () => {
       channels: { C_OTHER: { requireMention: false, allowFrom: [] } },
     })
     const delivered = new Set([deliveredThreadKey('D_DIFFERENT', 'T1')])
-    expect(() =>
-      assertOutboundAllowed('C_ATTACKER', 'T1', access, delivered),
-    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed('C_ATTACKER', 'T1', access, delivered)).toThrow(
+      'Outbound gate',
+    )
   })
 
   test('blocks thread B when only thread A delivered in the same channel (ccsc-xa3.6)', async () => {
@@ -885,12 +903,8 @@ describe('assertOutboundAllowed', () => {
     // same (non-opted-in) channel. An outbound to T_B must throw —
     // closes the cross-thread leak documented by the xa3.5 fixture.
     const delivered = new Set([deliveredThreadKey('C_SHARED', 'T_A')])
-    expect(() =>
-      assertOutboundAllowed('C_SHARED', 'T_A', access, delivered),
-    ).not.toThrow()
-    expect(() =>
-      assertOutboundAllowed('C_SHARED', 'T_B', access, delivered),
-    ).toThrow(/thread T_B/)
+    expect(() => assertOutboundAllowed('C_SHARED', 'T_A', access, delivered)).not.toThrow()
+    expect(() => assertOutboundAllowed('C_SHARED', 'T_B', access, delivered)).toThrow(/thread T_B/)
   })
 
   test('blocks top-level post when only a thread has delivered', async () => {
@@ -899,9 +913,9 @@ describe('assertOutboundAllowed', () => {
     const delivered = new Set([deliveredThreadKey('C_SHARED', 'T1')])
     // Top-level slot is distinct from any thread slot. Delivering
     // on T1 does not authorize a top-level post.
-    expect(() =>
-      assertOutboundAllowed('C_SHARED', undefined, access, delivered),
-    ).toThrow(/top-level/)
+    expect(() => assertOutboundAllowed('C_SHARED', undefined, access, delivered)).toThrow(
+      /top-level/,
+    )
   })
 })
 
@@ -984,14 +998,12 @@ describe('thread isolation — outbound gate (ccsc-xa3.5 → xa3.6)', () => {
     const deliveredThreads = new Set([deliveredThreadKey('C_SHARED', 'T_A')])
 
     // T_A: allowed.
-    expect(() =>
-      assertOutboundAllowed('C_SHARED', 'T_A', access, deliveredThreads),
-    ).not.toThrow()
+    expect(() => assertOutboundAllowed('C_SHARED', 'T_A', access, deliveredThreads)).not.toThrow()
 
     // T_B: blocked.
-    expect(() =>
-      assertOutboundAllowed('C_SHARED', 'T_B', access, deliveredThreads),
-    ).toThrow(/thread T_B/)
+    expect(() => assertOutboundAllowed('C_SHARED', 'T_B', access, deliveredThreads)).toThrow(
+      /thread T_B/,
+    )
   })
 })
 
@@ -1014,9 +1026,7 @@ describe('permissionPairingKey', () => {
 
   test('returns the same key for equal (thread, requestId) pairs', async () => {
     const { permissionPairingKey } = await import('./lib.ts')
-    expect(permissionPairingKey('T1.0', 'qrstu')).toBe(
-      permissionPairingKey('T1.0', 'qrstu'),
-    )
+    expect(permissionPairingKey('T1.0', 'qrstu')).toBe(permissionPairingKey('T1.0', 'qrstu'))
   })
 
   test('distinguishes undefined thread (top-level) from any threaded slot', async () => {
@@ -1072,15 +1082,11 @@ describe('permissionPairingKey', () => {
 
 describe('isSlackFileUrl', () => {
   test('accepts canonical files.slack.com https URL', () => {
-    expect(
-      isSlackFileUrl('https://files.slack.com/files-pri/T123-F456/image.png'),
-    ).toBe(true)
+    expect(isSlackFileUrl('https://files.slack.com/files-pri/T123-F456/image.png')).toBe(true)
   })
 
   test('rejects http (no TLS)', () => {
-    expect(
-      isSlackFileUrl('http://files.slack.com/files-pri/T123-F456/image.png'),
-    ).toBe(false)
+    expect(isSlackFileUrl('http://files.slack.com/files-pri/T123-F456/image.png')).toBe(false)
   })
 
   test('rejects other Slack subdomains', () => {
@@ -1089,12 +1095,8 @@ describe('isSlackFileUrl', () => {
   })
 
   test('rejects attacker-controlled host that embeds files.slack.com', () => {
-    expect(
-      isSlackFileUrl('https://files.slack.com.attacker.example/steal'),
-    ).toBe(false)
-    expect(
-      isSlackFileUrl('https://attacker.example/?files.slack.com'),
-    ).toBe(false)
+    expect(isSlackFileUrl('https://files.slack.com.attacker.example/steal')).toBe(false)
+    expect(isSlackFileUrl('https://attacker.example/?files.slack.com')).toBe(false)
   })
 
   test('rejects malformed URLs', () => {
@@ -1122,30 +1124,30 @@ describe('isSlackFileUrl', () => {
 describe('outbound gate coverage for read/edit/react/download', () => {
   test('blocks react on unknown channel', () => {
     const access = makeAccess()
-    expect(() =>
-      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
-    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed('C_RANDOM', 'T1', access, new Set())).toThrow(
+      'Outbound gate',
+    )
   })
 
   test('blocks edit_message on unknown channel', () => {
     const access = makeAccess()
-    expect(() =>
-      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
-    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed('C_RANDOM', 'T1', access, new Set())).toThrow(
+      'Outbound gate',
+    )
   })
 
   test('blocks fetch_messages on unknown channel', () => {
     const access = makeAccess()
-    expect(() =>
-      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
-    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed('C_RANDOM', 'T1', access, new Set())).toThrow(
+      'Outbound gate',
+    )
   })
 
   test('blocks download_attachment on unknown channel', () => {
     const access = makeAccess()
-    expect(() =>
-      assertOutboundAllowed('C_RANDOM', 'T1', access, new Set()),
-    ).toThrow('Outbound gate')
+    expect(() => assertOutboundAllowed('C_RANDOM', 'T1', access, new Set())).toThrow(
+      'Outbound gate',
+    )
   })
 
   test('allows these calls on a delivered (channel, thread) pair', async () => {
@@ -1154,9 +1156,7 @@ describe('outbound gate coverage for read/edit/react/download', () => {
     const delivered = new Set([deliveredThreadKey('D_ALICE', undefined)])
     // DMs deliver at the top level (no thread_ts) by default; gate
     // allows top-level outbound when top-level delivered.
-    expect(() =>
-      assertOutboundAllowed('D_ALICE', undefined, access, delivered),
-    ).not.toThrow()
+    expect(() => assertOutboundAllowed('D_ALICE', undefined, access, delivered)).not.toThrow()
   })
 })
 
@@ -1605,9 +1605,7 @@ describe('sessionPath', () => {
       mkdirSync(join(tmpRoot, 'sessions'), { recursive: true, mode: 0o700 })
       symlinkSync(outside, join(tmpRoot, 'sessions', 'C_EVIL'))
 
-      expect(() => sessionPath(tmpRoot, key('C_EVIL', 'T1.0'))).toThrow(
-        /escapes state root/,
-      )
+      expect(() => sessionPath(tmpRoot, key('C_EVIL', 'T1.0'))).toThrow(/escapes state root/)
 
       // Sanity: the symlink we planted really does point outside.
       expect(readlinkSync(join(tmpRoot, 'sessions', 'C_EVIL'))).toBe(outside)
@@ -1619,9 +1617,7 @@ describe('sessionPath', () => {
   // ── State root precondition ──────────────────────────────────────────
 
   test('throws if the state root does not exist', () => {
-    expect(() =>
-      sessionPath(join(tmpRoot, 'nope-does-not-exist'), key('C_CHAN', 'T1.0')),
-    ).toThrow()
+    expect(() => sessionPath(join(tmpRoot, 'nope-does-not-exist'), key('C_CHAN', 'T1.0'))).toThrow()
   })
 })
 
@@ -2102,9 +2098,7 @@ describe('listSessions', () => {
     try {
       symlinkSync(outside, join(tmpRoot, 'sessions'), 'dir')
 
-      expect(() => listSessions(tmpRoot)).toThrow(
-        /resolves outside state root/,
-      )
+      expect(() => listSessions(tmpRoot)).toThrow(/resolves outside state root/)
     } finally {
       rmSync(outside, { recursive: true, force: true })
     }
@@ -2731,8 +2725,9 @@ describe('path canonicalization for match.pathPrefix (29-A.4)', () => {
   })
 
   test('CWE-22: ../ traversal is defeated by canonicalizing both sides', async () => {
-    const { canonicalizeRulePathPrefix, canonicalizeRequestPath, pathMatchesPrefix } =
-      await import('./policy.ts')
+    const { canonicalizeRulePathPrefix, canonicalizeRequestPath, pathMatchesPrefix } = await import(
+      './policy.ts'
+    )
     // Rule scopes reads to /<tmpRoot>/safe/. A request asks for
     // /<tmpRoot>/safe/../secrets — lexically inside, realpath-wise outside.
     const safe = join(tmpRoot, 'safe')
@@ -2751,8 +2746,9 @@ describe('path canonicalization for match.pathPrefix (29-A.4)', () => {
   })
 
   test('Symlink-out escape is defeated by realpath in canonicalizeRequestPath', async () => {
-    const { canonicalizeRulePathPrefix, canonicalizeRequestPath, pathMatchesPrefix } =
-      await import('./policy.ts')
+    const { canonicalizeRulePathPrefix, canonicalizeRequestPath, pathMatchesPrefix } = await import(
+      './policy.ts'
+    )
     // Rule allows /<tmpRoot>/safe/. Attacker plants a symlink inside
     // /safe pointing to /<tmpRoot>/secrets/key.txt.
     const safe = join(tmpRoot, 'safe')
@@ -2784,7 +2780,9 @@ describe('path canonicalization for match.pathPrefix (29-A.4)', () => {
 // ---------------------------------------------------------------------------
 
 describe('evaluate() — policy engine (29-A.3)', () => {
-  const baseCall = (overrides: Partial<import('./policy.ts').ToolCall> = {}): import('./policy.ts').ToolCall => ({
+  const baseCall = (
+    overrides: Partial<import('./policy.ts').ToolCall> = {},
+  ): import('./policy.ts').ToolCall => ({
     tool: 'reply',
     input: {},
     sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
@@ -2792,12 +2790,14 @@ describe('evaluate() — policy engine (29-A.3)', () => {
     ...overrides,
   })
 
-  const rule = (partial: Partial<import('./policy.ts').PolicyRule> & { id: string; effect: string }): import('./policy.ts').PolicyRule =>
+  const rule = (
+    partial: Partial<import('./policy.ts').PolicyRule> & { id: string; effect: string },
+  ): import('./policy.ts').PolicyRule =>
     ({
       match: { tool: 'reply' },
       priority: 100,
       ...partial,
-    } as import('./policy.ts').PolicyRule)
+    }) as import('./policy.ts').PolicyRule
 
   // ── Single-rule branches ───────────────────────────────────────────────
 
@@ -2817,7 +2817,9 @@ describe('evaluate() — policy engine (29-A.3)', () => {
 
   test('require_approval rule → require with ttlMs + approvers default 1', async () => {
     const { evaluate } = await import('./policy.ts')
-    const rules = [rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000, approvers: 1 } as never)]
+    const rules = [
+      rule({ id: 'r1', effect: 'require_approval', ttlMs: 60_000, approvers: 1 } as never),
+    ]
     const decision = evaluate(baseCall(), rules, 0)
     expect(decision).toEqual({
       kind: 'require',
@@ -2882,7 +2884,12 @@ describe('evaluate() — policy engine (29-A.3)', () => {
   test('non-matching rule is skipped; next rule evaluated', async () => {
     const { evaluate } = await import('./policy.ts')
     const rules = [
-      rule({ id: 'wrong-tool', effect: 'deny', reason: 'x', match: { tool: 'upload_file' } } as never),
+      rule({
+        id: 'wrong-tool',
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      } as never),
       rule({ id: 'right-tool', effect: 'auto_approve', match: { tool: 'reply' } }),
     ]
     const decision = evaluate(baseCall(), rules, 0)
@@ -2894,9 +2901,7 @@ describe('evaluate() — policy engine (29-A.3)', () => {
 
   test('channel field mismatch → rule skipped', async () => {
     const { evaluate } = await import('./policy.ts')
-    const rules = [
-      rule({ id: 'r1', effect: 'auto_approve', match: { channel: 'C_OTHER' } }),
-    ]
+    const rules = [rule({ id: 'r1', effect: 'auto_approve', match: { channel: 'C_OTHER' } })]
     const decision = evaluate(baseCall(), rules, 0)
     // Default: reply is not in requireAuthoredPolicy → allow default.
     expect(decision.kind).toBe('allow')
@@ -2905,9 +2910,7 @@ describe('evaluate() — policy engine (29-A.3)', () => {
 
   test('actor field mismatch → rule skipped', async () => {
     const { evaluate } = await import('./policy.ts')
-    const rules = [
-      rule({ id: 'r1', effect: 'auto_approve', match: { actor: 'session_owner' } }),
-    ]
+    const rules = [rule({ id: 'r1', effect: 'auto_approve', match: { actor: 'session_owner' } })]
     const decision = evaluate(baseCall({ actor: 'claude_process' }), rules, 0)
     expect((decision as { kind: string }).kind).toBe('allow')
   })
@@ -2968,11 +2971,7 @@ describe('evaluate() — policy engine (29-A.3)', () => {
           match: { tool: 'upload_file', pathPrefix: safeDir },
         }),
       ]
-      const decision = evaluate(
-        baseCall({ tool: 'upload_file', input: { path: doc } }),
-        rules,
-        0,
-      )
+      const decision = evaluate(baseCall({ tool: 'upload_file', input: { path: doc } }), rules, 0)
       expect(decision.kind).toBe('allow')
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -3171,16 +3170,26 @@ describe('31-A.9 invariant — evaluate() has no manifest surface', () => {
 })
 
 describe('detectShadowing() — load-time linter (29-A.5)', () => {
-  const rule = (id: string, effect: string, match: Record<string, unknown> = {}, extras: Record<string, unknown> = {}): import('./policy.ts').PolicyRule =>
-    ({ id, effect, match, priority: 100, ...extras } as import('./policy.ts').PolicyRule)
+  const rule = (
+    id: string,
+    effect: string,
+    match: Record<string, unknown> = {},
+    extras: Record<string, unknown> = {},
+  ): import('./policy.ts').PolicyRule =>
+    ({ id, effect, match, priority: 100, ...extras }) as import('./policy.ts').PolicyRule
 
   test('broad auto_approve shadows narrower deny placed after it', async () => {
     const { detectShadowing } = await import('./policy.ts')
     const rules = [
       rule('allow-all-uploads', 'auto_approve', { tool: 'upload_file' }),
-      rule('deny-env-upload', 'deny', { tool: 'upload_file', pathPrefix: '/etc' }, {
-        reason: 'blocks env',
-      }),
+      rule(
+        'deny-env-upload',
+        'deny',
+        { tool: 'upload_file', pathPrefix: '/etc' },
+        {
+          reason: 'blocks env',
+        },
+      ),
     ]
     const warnings = detectShadowing(rules)
     expect(warnings).toHaveLength(1)
@@ -3229,8 +3238,13 @@ describe('detectShadowing() — load-time linter (29-A.5)', () => {
 })
 
 describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
-  const rule = (id: string, effect: string, match: Record<string, unknown> = {}, extras: Record<string, unknown> = {}): import('./policy.ts').PolicyRule =>
-    ({ id, effect, match, priority: 100, ...extras } as import('./policy.ts').PolicyRule)
+  const rule = (
+    id: string,
+    effect: string,
+    match: Record<string, unknown> = {},
+    extras: Record<string, unknown> = {},
+  ): import('./policy.ts').PolicyRule =>
+    ({ id, effect, match, priority: 100, ...extras }) as import('./policy.ts').PolicyRule
 
   test('new auto_approve covered by existing deny → violation', async () => {
     const { checkMonotonicity } = await import('./policy.ts')
@@ -3245,7 +3259,7 @@ describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
     expect(violations[0]!.existingDeny).toBe('deny-all')
   })
 
-  test('new deny rule does not trigger violation (doesn\'t weaken)', async () => {
+  test("new deny rule does not trigger violation (doesn't weaken)", async () => {
     const { checkMonotonicity } = await import('./policy.ts')
     const prev = [rule('r1', 'auto_approve', { tool: 'reply' })]
     const next = [
@@ -3414,7 +3428,9 @@ describe('ManifestV1 schema (31-A.1)', () => {
 
   test('rejects name shorter than 1 or longer than 80 chars', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
-    expect(() => ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), name: '' })).toThrow()
+    expect(() =>
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), name: '' }),
+    ).toThrow()
     expect(() =>
       ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), name: 'x'.repeat(81) }),
     ).toThrow()
@@ -3422,7 +3438,9 @@ describe('ManifestV1 schema (31-A.1)', () => {
 
   test('rejects vendor shorter than 1 or longer than 80 chars', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
-    expect(() => ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), vendor: '' })).toThrow()
+    expect(() =>
+      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), vendor: '' }),
+    ).toThrow()
     expect(() =>
       ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), vendor: 'v'.repeat(81) }),
     ).toThrow()
@@ -3431,11 +3449,17 @@ describe('ManifestV1 schema (31-A.1)', () => {
   test('rejects description longer than 1000 chars', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
     expect(() =>
-      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), description: 'd'.repeat(1001) }),
+      ManifestV1.parse({
+        ...(validManifest() as Record<string, unknown>),
+        description: 'd'.repeat(1001),
+      }),
     ).toThrow()
     // Exactly 1000 is OK.
     expect(() =>
-      ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), description: 'd'.repeat(1000) }),
+      ManifestV1.parse({
+        ...(validManifest() as Record<string, unknown>),
+        description: 'd'.repeat(1000),
+      }),
     ).not.toThrow()
   })
 
@@ -3509,9 +3533,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
 
   test('rejects more than 50 channels', async () => {
     const { ManifestV1 } = await import('./manifest.ts')
-    const fifty = Array.from({ length: 50 }, (_, i) =>
-      `C${i.toString().padStart(5, '0')}AAAA`,
-    )
+    const fifty = Array.from({ length: 50 }, (_, i) => `C${i.toString().padStart(5, '0')}AAAA`)
     expect(() =>
       ManifestV1.parse({ ...(validManifest() as Record<string, unknown>), channels: fifty }),
     ).not.toThrow()
@@ -3663,9 +3685,7 @@ describe('ManifestV1 schema (31-A.1)', () => {
       } as Record<string, unknown>,
     })
     expect(parsed.agentCard?.endpoints).toEqual(['https://agent.example.com'])
-    expect(
-      (parsed.agentCard as Record<string, unknown>).futureField,
-    ).toBeUndefined()
+    expect((parsed.agentCard as Record<string, unknown>).futureField).toBeUndefined()
   })
 })
 
@@ -3966,9 +3986,7 @@ describe('findOurPriorManifestPins (31-B.10)', () => {
     const pins = [
       messagePin({ text: ourManifestText, botId: 'B_PEER', user: 'U_PEER', ts: '300.0' }),
     ]
-    expect(
-      findOurPriorManifestPins(pins, { botId: 'B_US', botUserId: 'U_BOT' }),
-    ).toEqual([])
+    expect(findOurPriorManifestPins(pins, { botId: 'B_US', botUserId: 'U_BOT' })).toEqual([])
   })
 
   test('skips OUR non-manifest pins (missing magic header)', async () => {
@@ -4015,12 +4033,8 @@ describe('findOurPriorManifestPins (31-B.10)', () => {
     // When both identity fields are configured, either signal alone
     // identifies our pin. Some Slack responses include only bot_id and
     // not user, or vice versa — we must catch both.
-    const pinsWithBotIdOnly = [
-      messagePin({ text: ourManifestText, botId: 'B_US', ts: '600.0' }),
-    ]
-    const pinsWithUserOnly = [
-      messagePin({ text: ourManifestText, user: 'U_BOT', ts: '601.0' }),
-    ]
+    const pinsWithBotIdOnly = [messagePin({ text: ourManifestText, botId: 'B_US', ts: '600.0' })]
+    const pinsWithUserOnly = [messagePin({ text: ourManifestText, user: 'U_BOT', ts: '601.0' })]
     const identity = { botId: 'B_US', botUserId: 'U_BOT' }
     expect(findOurPriorManifestPins(pinsWithBotIdOnly, identity)).toEqual(['600.0'])
     expect(findOurPriorManifestPins(pinsWithUserOnly, identity)).toEqual(['601.0'])
@@ -4041,9 +4055,7 @@ describe('findOurPriorManifestPins (31-B.10)', () => {
 
 describe('publish → read round-trip (31-B.7)', () => {
   test('a minimal published manifest round-trips byte-for-field', async () => {
-    const { assertPublishSizeAndSerialize, extractManifests } = await import(
-      './manifest.ts'
-    )
+    const { assertPublishSizeAndSerialize, extractManifests } = await import('./manifest.ts')
     const original: import('./manifest.ts').ManifestV1 = {
       __claude_bot_manifest_v1__: true,
       name: 'RoundTrip Bot',
@@ -4063,9 +4075,7 @@ describe('publish → read round-trip (31-B.7)', () => {
   })
 
   test('a fully-populated manifest (every optional field) round-trips without loss', async () => {
-    const { assertPublishSizeAndSerialize, extractManifests } = await import(
-      './manifest.ts'
-    )
+    const { assertPublishSizeAndSerialize, extractManifests } = await import('./manifest.ts')
     const original: import('./manifest.ts').ManifestV1 = {
       __claude_bot_manifest_v1__: true,
       name: 'Full Bot',
@@ -4115,9 +4125,7 @@ describe('publish → read round-trip (31-B.7)', () => {
     }
     const body = assertPublishSizeAndSerialize(original)
     // Bytes must be between read-cap headroom and publish cap.
-    expect(new TextEncoder().encode(body).length).toBeLessThanOrEqual(
-      MAX_PUBLISH_MANIFEST_BYTES,
-    )
+    expect(new TextEncoder().encode(body).length).toBeLessThanOrEqual(MAX_PUBLISH_MANIFEST_BYTES)
     const extracted = extractManifests([body])
     expect(extracted).toHaveLength(1)
     expect(extracted[0]?.description).toBe('x'.repeat(1000))
@@ -4154,10 +4162,8 @@ describe('assertPublishSizeAndSerialize (31-B.2)', () => {
     expect(MAX_PUBLISH_MANIFEST_BYTES).toBe(8 * 1024)
   })
 
-  test('cap is stricter than the read-side cap (Postel\'s Law)', async () => {
-    const { MAX_PUBLISH_MANIFEST_BYTES, MAX_MANIFEST_BYTES } = await import(
-      './manifest.ts'
-    )
+  test("cap is stricter than the read-side cap (Postel's Law)", async () => {
+    const { MAX_PUBLISH_MANIFEST_BYTES, MAX_MANIFEST_BYTES } = await import('./manifest.ts')
     expect(MAX_PUBLISH_MANIFEST_BYTES).toBeLessThan(MAX_MANIFEST_BYTES)
   })
 
@@ -4229,9 +4235,9 @@ describe('assertPublishSizeAndSerialize (31-B.2)', () => {
       suffix += 1
       candidate = { ...base, channels: [`C${'A'.repeat(suffix)}`] }
     }
-    expect(
-      enc.encode(JSON.stringify(candidate, null, 2)).length,
-    ).toBeGreaterThan(MAX_PUBLISH_MANIFEST_BYTES)
+    expect(enc.encode(JSON.stringify(candidate, null, 2)).length).toBeGreaterThan(
+      MAX_PUBLISH_MANIFEST_BYTES,
+    )
     expect(() => assertPublishSizeAndSerialize(candidate)).toThrow(/Publish size/)
   })
 
@@ -4259,9 +4265,7 @@ describe('assertPublishSizeAndSerialize (31-B.2)', () => {
     // ceremony of a try/catch + captured-variable pattern.
     expect(() => assertPublishSizeAndSerialize(huge)).toThrow(/Publish size/)
     expect(() => assertPublishSizeAndSerialize(huge)).toThrow(String(expectedBytes))
-    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(
-      String(MAX_PUBLISH_MANIFEST_BYTES),
-    )
+    expect(() => assertPublishSizeAndSerialize(huge)).toThrow(String(MAX_PUBLISH_MANIFEST_BYTES))
     // Message points at the fields an operator can actually shrink so
     // a rejection is actionable without doc-diving.
     expect(() => assertPublishSizeAndSerialize(huge)).toThrow(/tools|channels|description/)
@@ -4548,9 +4552,7 @@ describe('createPublishRateLimiter (31-B.4)', () => {
   })
 
   test('default window is 1 hour when opts.windowMs is omitted', async () => {
-    const { createPublishRateLimiter, PUBLISH_RATE_LIMIT_MS } = await import(
-      './manifest.ts'
-    )
+    const { createPublishRateLimiter, PUBLISH_RATE_LIMIT_MS } = await import('./manifest.ts')
     let nowValue = 0
     const limiter = createPublishRateLimiter({ now: () => nowValue })
     nowValue = 100
@@ -4597,7 +4599,8 @@ describe('createSessionSupervisor.activate', () => {
 
   function makeSupervisor() {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    const { createSessionSupervisor } =
+      require('./supervisor.ts') as typeof import('./supervisor.ts')
     return createSessionSupervisor({
       stateRoot: tmpRoot,
       log: (event, fields) => {
@@ -4701,8 +4704,7 @@ describe('createSessionSupervisor.activate', () => {
     // The map is internal (not on the interface), but exposed as a
     // readonly property on ConcreteHandle for server.ts (ccsc-xa3.15)
     // to attach abort controllers onto. Shape-check it here.
-    const inFlight = (handle as unknown as { inFlight: Map<string, AbortController> })
-      .inFlight
+    const inFlight = (handle as unknown as { inFlight: Map<string, AbortController> }).inFlight
     expect(inFlight).toBeInstanceOf(Map)
     expect(inFlight.size).toBe(0)
   })
@@ -4711,9 +4713,9 @@ describe('createSessionSupervisor.activate', () => {
     const sup = makeSupervisor()
     // `..` is rejected by sessionPath(); supervisor must surface the
     // error without caching a handle.
-    await expect(
-      sup.activate({ channel: '..', thread: 'T1' }, 'U_X'),
-    ).rejects.toThrow(/invalid channel/)
+    await expect(sup.activate({ channel: '..', thread: 'T1' }, 'U_X')).rejects.toThrow(
+      /invalid channel/,
+    )
 
     // A subsequent good activate must not observe stale in-flight
     // state (single-flight map cleared).
@@ -4756,7 +4758,8 @@ describe('createSessionSupervisor.quiesce', () => {
 
   function makeSupervisor() {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    const { createSessionSupervisor } =
+      require('./supervisor.ts') as typeof import('./supervisor.ts')
     return createSessionSupervisor({
       stateRoot: tmpRoot,
       log: (event, fields) => {
@@ -4934,7 +4937,8 @@ describe('createSessionSupervisor.deactivate', () => {
 
   function makeSupervisor() {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    const { createSessionSupervisor } =
+      require('./supervisor.ts') as typeof import('./supervisor.ts')
     return createSessionSupervisor({
       stateRoot: tmpRoot,
       log: (event, fields) => {
@@ -4955,9 +4959,7 @@ describe('createSessionSupervisor.deactivate', () => {
     const handle = await sup.activate(key, 'U_OWNER')
     expect(handle.state).toBe('active')
 
-    await expect(sup.deactivate(key)).rejects.toThrow(
-      /must be quiesced first/,
-    )
+    await expect(sup.deactivate(key)).rejects.toThrow(/must be quiesced first/)
     // State must not be mutated by the rejected call.
     expect(handle.state).toBe('active')
     // Live map must still contain the handle.
@@ -5090,7 +5092,8 @@ describe('createSessionSupervisor.reapIdle', () => {
 
   function makeSupervisor(idleMs: number) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    const { createSessionSupervisor } =
+      require('./supervisor.ts') as typeof import('./supervisor.ts')
     return createSessionSupervisor({
       stateRoot: tmpRoot,
       log: (event, fields) => {
@@ -5153,10 +5156,7 @@ describe('createSessionSupervisor.reapIdle', () => {
 
   test('skips sessions with in-flight work, even when past the threshold', async () => {
     const sup = makeSupervisor(60_000)
-    const handle = (await sup.activate(
-      { channel: 'C_R3', thread: 'T' },
-      'U1',
-    )) as DrainHandle
+    const handle = (await sup.activate({ channel: 'C_R3', thread: 'T' }, 'U1')) as DrainHandle
     handle.beginWork('tool-call-1')
 
     clockNow += 120_000
@@ -5174,14 +5174,8 @@ describe('createSessionSupervisor.reapIdle', () => {
 
   test('skips handles whose state is not active (quiescing / quarantined)', async () => {
     const sup = makeSupervisor(60_000)
-    const quiescingHandle = await sup.activate(
-      { channel: 'C_R4a', thread: 'T' },
-      'U1',
-    )
-    const quarantinedHandle = await sup.activate(
-      { channel: 'C_R4b', thread: 'T' },
-      'U2',
-    )
+    const quiescingHandle = await sup.activate({ channel: 'C_R4a', thread: 'T' }, 'U1')
+    const quarantinedHandle = await sup.activate({ channel: 'C_R4b', thread: 'T' }, 'U2')
 
     // Manually drive into non-active states without going through the
     // full quiesce() helper (which would resolve immediately with no
@@ -5287,9 +5281,7 @@ describe('JournalEvent', () => {
 
   test('rejects unknown event kind', async () => {
     const { JournalEvent } = await import('./journal.ts')
-    expect(() =>
-      JournalEvent.parse(minimal({ kind: 'gate.inbound.maybe' })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ kind: 'gate.inbound.maybe' }))).toThrow()
     expect(() => JournalEvent.parse(minimal({ kind: '' }))).toThrow()
   })
 
@@ -5298,33 +5290,21 @@ describe('JournalEvent', () => {
     // Too short
     expect(() => JournalEvent.parse(minimal({ prevHash: 'abcd' }))).toThrow()
     // Uppercase — canonical form is lowercase
-    expect(() =>
-      JournalEvent.parse(minimal({ hash: 'A'.repeat(64) })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ hash: 'A'.repeat(64) }))).toThrow()
     // Non-hex char
-    expect(() =>
-      JournalEvent.parse(minimal({ hash: 'g'.repeat(64) })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ hash: 'g'.repeat(64) }))).toThrow()
     // Off-by-one
-    expect(() =>
-      JournalEvent.parse(minimal({ prevHash: 'a'.repeat(63) })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ prevHash: 'a'.repeat(63) }))).toThrow()
   })
 
   test('rejects non-ISO / non-UTC ts', async () => {
     const { JournalEvent } = await import('./journal.ts')
     // Missing ms precision
-    expect(() =>
-      JournalEvent.parse(minimal({ ts: '2026-04-19T12:34:56Z' })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ ts: '2026-04-19T12:34:56Z' }))).toThrow()
     // No timezone
-    expect(() =>
-      JournalEvent.parse(minimal({ ts: '2026-04-19T12:34:56.789' })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ ts: '2026-04-19T12:34:56.789' }))).toThrow()
     // Space instead of T
-    expect(() =>
-      JournalEvent.parse(minimal({ ts: '2026-04-19 12:34:56.789Z' })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ ts: '2026-04-19 12:34:56.789Z' }))).toThrow()
   })
 
   test('rejects negative or non-integer seq', async () => {
@@ -5343,50 +5323,30 @@ describe('JournalEvent', () => {
     // An extra field that would be silently stripped in lax mode would
     // get included in some serializers' output but not others, breaking
     // the chain property. Must reject at parse time.
-    expect(() =>
-      JournalEvent.parse(minimal({ extraneous: 'oops' })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ extraneous: 'oops' }))).toThrow()
   })
 
   test('outcome enum rejects unknown values', async () => {
     const { JournalEvent } = await import('./journal.ts')
-    expect(() =>
-      JournalEvent.parse(minimal({ outcome: 'maybe' })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ outcome: 'maybe' }))).toThrow()
     // All five legitimate values pass
     for (const o of ['allow', 'deny', 'require', 'drop', 'n/a']) {
-      expect(() =>
-        JournalEvent.parse(minimal({ outcome: o })),
-      ).not.toThrow()
+      expect(() => JournalEvent.parse(minimal({ outcome: o }))).not.toThrow()
     }
   })
 
   test('actor enum rejects unknown values', async () => {
     const { JournalEvent } = await import('./journal.ts')
-    expect(() =>
-      JournalEvent.parse(minimal({ actor: 'admin' })),
-    ).toThrow()
-    for (const a of [
-      'session_owner',
-      'claude_process',
-      'human_approver',
-      'peer_agent',
-      'system',
-    ]) {
-      expect(() =>
-        JournalEvent.parse(minimal({ actor: a })),
-      ).not.toThrow()
+    expect(() => JournalEvent.parse(minimal({ actor: 'admin' }))).toThrow()
+    for (const a of ['session_owner', 'claude_process', 'human_approver', 'peer_agent', 'system']) {
+      expect(() => JournalEvent.parse(minimal({ actor: a }))).not.toThrow()
     }
   })
 
   test('sessionKey: both channel and thread required when present', async () => {
     const { JournalEvent } = await import('./journal.ts')
-    expect(() =>
-      JournalEvent.parse(minimal({ sessionKey: { channel: 'C01' } })),
-    ).toThrow()
-    expect(() =>
-      JournalEvent.parse(minimal({ sessionKey: { thread: 'T01' } })),
-    ).toThrow()
+    expect(() => JournalEvent.parse(minimal({ sessionKey: { channel: 'C01' } }))).toThrow()
+    expect(() => JournalEvent.parse(minimal({ sessionKey: { thread: 'T01' } }))).toThrow()
   })
 
   test('sessionKey: strict — rejects unknown nested fields to protect hash form', async () => {
@@ -5481,9 +5441,7 @@ describe('canonicalJson', () => {
 describe('sha256Hex', () => {
   test('empty string has the known SHA-256 digest', async () => {
     const { sha256Hex } = await import('./journal.ts')
-    expect(sha256Hex('')).toBe(
-      'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
-    )
+    expect(sha256Hex('')).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
   })
 
   test('produces 64 lowercase hex chars for any input', async () => {
@@ -5772,9 +5730,7 @@ describe('JournalWriter', () => {
     try {
       // Unknown kind — schema rejects. No line should be appended, seq
       // should not advance.
-      await expect(
-        w.writeEvent({ kind: 'not.a.real.kind' as never }),
-      ).rejects.toThrow()
+      await expect(w.writeEvent({ kind: 'not.a.real.kind' as never })).rejects.toThrow()
       expect(w.nextSequenceNumber).toBe(1)
       const content = readFileSync(logPath, 'utf8')
       expect(content).toBe('')
@@ -5872,9 +5828,7 @@ describe('JournalWriter', () => {
     try {
       expect(w.nextSequenceNumber).toBe(1)
 
-      await expect(
-        w.writeEvent({ kind: 'not.valid' as never }),
-      ).rejects.toThrow()
+      await expect(w.writeEvent({ kind: 'not.valid' as never })).rejects.toThrow()
 
       // Seq must still be 1 — the bad call must not have consumed a
       // sequence number before failing.
@@ -5908,9 +5862,9 @@ describe('JournalWriter', () => {
     // must also reject with the broken-state message (not a different
     // error), confirming the enqueue-time guard works for new calls
     // after a failure.
-    await expect(
-      w.writeEvent({ kind: 'session.activate' }),
-    ).rejects.toThrow(/JournalWriter is broken/)
+    await expect(w.writeEvent({ kind: 'session.activate' })).rejects.toThrow(
+      /JournalWriter is broken/,
+    )
   })
 })
 
@@ -5959,9 +5913,7 @@ describe('redact', () => {
 
   test('redacts GitHub PATs (ghp_*)', async () => {
     const { redact } = await import('./journal.ts')
-    expect(redact(`token=ghp_${'A'.repeat(36)}`)).toBe(
-      'token=[REDACTED:github]',
-    )
+    expect(redact(`token=ghp_${'A'.repeat(36)}`)).toBe('token=[REDACTED:github]')
   })
 
   test('redacts AWS access keys (AKIA*)', async () => {
@@ -5973,8 +5925,7 @@ describe('redact', () => {
 
   test('redacts JWTs (eyJ...eyJ...)', async () => {
     const { redact } = await import('./journal.ts')
-    const jwt =
-      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123-_def'
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abc123-_def'
     expect(redact(`Bearer ${jwt}`)).toBe('Bearer [REDACTED:jwt]')
   })
 
@@ -6024,15 +5975,10 @@ describe('redact', () => {
 
   test('tokenPatterns() surfaces the six frozen patterns for the verifier', async () => {
     const { tokenPatterns } = await import('./journal.ts')
-    const kinds = tokenPatterns().map((p) => p.kind).sort()
-    expect(kinds).toEqual([
-      'anthropic',
-      'aws_access',
-      'github',
-      'jwt',
-      'slack_app',
-      'slack_bot',
-    ])
+    const kinds = tokenPatterns()
+      .map((p) => p.kind)
+      .sort()
+    expect(kinds).toEqual(['anthropic', 'aws_access', 'github', 'jwt', 'slack_app', 'slack_bot'])
   })
 })
 
@@ -6047,16 +5993,15 @@ describe('redact', () => {
 describe('redact — documented pattern table', () => {
   // Constructed at runtime where needed so literals don't trip the
   // GitHub push-protection secret scanner on source files.
-  const xoxb =
-    'xoxb' + '-' + '111111111111' + '-' + '222222222222' + '-' + 'AbCdEfGhIjKlMnOp'
-  const xapp =
-    'xapp' + '-' + '1' + '-' + 'A0B1C2D3E4F' + '-' + '1234567890123' + '-' +
-    'a'.repeat(32)
+  // Token fixtures constructed via Array.join so no full token literal
+  // (e.g. `xoxb-111…-222…-Ab…`) ever appears in source — keeps the
+  // gitleaks scanner + GitHub push-protection from tripping on test data.
+  const xoxb = ['xoxb', '111111111111', '222222222222', 'AbCdEfGhIjKlMnOp'].join('-')
+  const xapp = ['xapp', '1', 'A0B1C2D3E4F', '1234567890123', 'a'.repeat(32)].join('-')
   const ghp = `ghp_${'A'.repeat(36)}`
   const sk = `sk-ant-api03-${'z'.repeat(30)}`
   const akia = 'AKIAIOSFODNN7EXAMPLE'
-  const jwt =
-    'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.abc-_DEF123'
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.abc-_DEF123'
 
   const positiveCases: ReadonlyArray<{
     kind: string
@@ -6107,7 +6052,9 @@ describe('redact — documented pattern table', () => {
     // If journal.ts adds a new pattern, this test fails until the
     // table above gets a row — forcing coverage to stay in lockstep
     // with the documented pattern list.
-    const documented = tokenPatterns().map((p) => p.kind).sort()
+    const documented = tokenPatterns()
+      .map((p) => p.kind)
+      .sort()
     const covered = positiveCases.map((c) => c.kind).sort()
     expect(covered).toEqual(documented)
   })
@@ -6174,17 +6121,13 @@ describe('redact — documented pattern table', () => {
     // The string contains `"key":"sk-ant-api03-zzz..."` — the sk- body
     // is a contiguous run of [a-zA-Z0-9-] so the pattern matches
     // despite the surrounding quotes.
-    expect(redact(payload)).toBe(
-      JSON.stringify({ key: '[REDACTED:anthropic]', safe: 'ok' }),
-    )
+    expect(redact(payload)).toBe(JSON.stringify({ key: '[REDACTED:anthropic]', safe: 'ok' }))
   })
 
   test('edge: token embedded in error-message JSON quote redacts', async () => {
     const { redact } = await import('./journal.ts')
     const msg = `Error: {"AWS_ACCESS_KEY_ID":"${akia}"} — check env`
-    expect(redact(msg)).toBe(
-      'Error: {"AWS_ACCESS_KEY_ID":"[REDACTED:aws_access]"} — check env',
-    )
+    expect(redact(msg)).toBe('Error: {"AWS_ACCESS_KEY_ID":"[REDACTED:aws_access]"} — check env')
   })
 
   test('edge: all six kinds in one blob redact to all six placeholders', async () => {
@@ -6218,10 +6161,7 @@ describe('redact — documented pattern table', () => {
     const input = {
       outer: {
         middle: {
-          inner: [
-            { creds: { api_key: sk } },
-            { creds: { api_key: 'safe-value' } },
-          ],
+          inner: [{ creds: { api_key: sk } }, { creds: { api_key: 'safe-value' } }],
         },
       },
     }
@@ -6265,10 +6205,9 @@ describe('JournalWriter redaction integration', () => {
       })
       // Returned event reflects redaction — callers observe the
       // scrubbed form, not the original.
-      expect(
-        (ev.input as { env: { ANTHROPIC_API_KEY: string } }).env
-          .ANTHROPIC_API_KEY,
-      ).toBe('[REDACTED:anthropic]')
+      expect((ev.input as { env: { ANTHROPIC_API_KEY: string } }).env.ANTHROPIC_API_KEY).toBe(
+        '[REDACTED:anthropic]',
+      )
       // And the persisted line contains no trace of the secret.
       const disk = readFileSync(logPath, 'utf8')
       expect(disk).not.toContain(secret)
@@ -6290,9 +6229,7 @@ describe('JournalWriter redaction integration', () => {
         kind: 'gate.inbound.drop',
         reason: `peer bot tried to post key ${secret}`,
       })
-      expect(ev.reason).toBe(
-        'peer bot tried to post key [REDACTED:github]',
-      )
+      expect(ev.reason).toBe('peer bot tried to post key [REDACTED:github]')
       const disk = readFileSync(logPath, 'utf8')
       expect(disk).not.toContain(secret)
     } finally {
@@ -6326,8 +6263,7 @@ describe('JournalWriter redaction integration', () => {
   })
 
   test('hash is computed over the redacted form', async () => {
-    const { JournalWriter, canonicalJson, sha256Hex, redact } =
-      await import('./journal.ts')
+    const { JournalWriter, canonicalJson, sha256Hex, redact } = await import('./journal.ts')
     const w = await JournalWriter.open({
       path: logPath,
       initialPrevHash: stableAnchor,
@@ -6345,10 +6281,7 @@ describe('JournalWriter redaction integration', () => {
       // re-derive the chain.
       const { hash: _h, ...rest } = ev
       void _h
-      const expectedRedactedInput = redact({ leaked: secret }) as Record<
-        string,
-        unknown
-      >
+      const expectedRedactedInput = redact({ leaked: secret }) as Record<string, unknown>
       expect(rest.input).toEqual(expectedRedactedInput)
       expect(sha256Hex(stableAnchor + canonicalJson(rest))).toBe(ev.hash)
     } finally {
@@ -6506,9 +6439,7 @@ describe('JournalWriter truncation integration', () => {
         kind: 'gate.inbound.drop',
         reason: bigReason,
       })
-      expect((ev.reason as string).endsWith('[... truncated 952 chars]')).toBe(
-        true,
-      )
+      expect((ev.reason as string).endsWith('[... truncated 952 chars]')).toBe(true)
       // The top-level JournalEvent is .strict(); a `reason.len` sibling
       // would be rejected. The inline marker carries the length
       // signal instead.
@@ -6547,9 +6478,7 @@ describe('JournalWriter truncation integration', () => {
   })
 
   test('hash is computed over the truncated form (verifier can re-derive)', async () => {
-    const { JournalWriter, canonicalJson, sha256Hex } = await import(
-      './journal.ts'
-    )
+    const { JournalWriter, canonicalJson, sha256Hex } = await import('./journal.ts')
     const w = await JournalWriter.open({
       path: logPath,
       initialPrevHash: stableAnchor,
@@ -6601,29 +6530,29 @@ describe('resolveJournalPath', () => {
   })
 
   test('picks up SLACK_AUDIT_LOG env var when no flag present', () => {
-    expect(
-      resolveJournalPath([], { SLACK_AUDIT_LOG: '/var/log/slack-audit.log' }),
-    ).toEqual({ path: '/var/log/slack-audit.log', source: 'env' })
+    expect(resolveJournalPath([], { SLACK_AUDIT_LOG: '/var/log/slack-audit.log' })).toEqual({
+      path: '/var/log/slack-audit.log',
+      source: 'env',
+    })
   })
 
   test('picks up --audit-log-file space-separated form', () => {
-    expect(
-      resolveJournalPath(['--audit-log-file', '/tmp/a.log'], {}),
-    ).toEqual({ path: '/tmp/a.log', source: 'flag' })
+    expect(resolveJournalPath(['--audit-log-file', '/tmp/a.log'], {})).toEqual({
+      path: '/tmp/a.log',
+      source: 'flag',
+    })
   })
 
   test('picks up --audit-log-file=PATH equals form', () => {
-    expect(
-      resolveJournalPath(['--audit-log-file=/tmp/b.log'], {}),
-    ).toEqual({ path: '/tmp/b.log', source: 'flag' })
+    expect(resolveJournalPath(['--audit-log-file=/tmp/b.log'], {})).toEqual({
+      path: '/tmp/b.log',
+      source: 'flag',
+    })
   })
 
   test('flag wins over env var when both are set', () => {
     expect(
-      resolveJournalPath(
-        ['--audit-log-file', '/from/flag'],
-        { SLACK_AUDIT_LOG: '/from/env' },
-      ),
+      resolveJournalPath(['--audit-log-file', '/from/flag'], { SLACK_AUDIT_LOG: '/from/env' }),
     ).toEqual({ path: '/from/flag', source: 'flag' })
   })
 
@@ -6631,12 +6560,14 @@ describe('resolveJournalPath', () => {
     // `--audit-log-file` with no successor or `--audit-log-file=` both
     // represent a launcher bug; don't silently enable journaling at
     // an unexpected path. Fall through to env.
-    expect(
-      resolveJournalPath(['--audit-log-file'], { SLACK_AUDIT_LOG: '/from/env' }),
-    ).toEqual({ path: '/from/env', source: 'env' })
-    expect(
-      resolveJournalPath(['--audit-log-file='], { SLACK_AUDIT_LOG: '/from/env' }),
-    ).toEqual({ path: '/from/env', source: 'env' })
+    expect(resolveJournalPath(['--audit-log-file'], { SLACK_AUDIT_LOG: '/from/env' })).toEqual({
+      path: '/from/env',
+      source: 'env',
+    })
+    expect(resolveJournalPath(['--audit-log-file='], { SLACK_AUDIT_LOG: '/from/env' })).toEqual({
+      path: '/from/env',
+      source: 'env',
+    })
   })
 
   test('empty env var is treated as unset', () => {
@@ -6648,10 +6579,7 @@ describe('resolveJournalPath', () => {
 
   test('flag works mid-argv with unrelated args around it', () => {
     expect(
-      resolveJournalPath(
-        ['--some-other', 'value', '--audit-log-file', '/a.log', '--debug'],
-        {},
-      ),
+      resolveJournalPath(['--some-other', 'value', '--audit-log-file', '/a.log', '--debug'], {}),
     ).toEqual({ path: '/a.log', source: 'flag' })
   })
 
@@ -6659,10 +6587,7 @@ describe('resolveJournalPath', () => {
     // Operator presumably intended the first; later ones are stale
     // from a launcher script concatenation.
     expect(
-      resolveJournalPath(
-        ['--audit-log-file', '/first', '--audit-log-file', '/second'],
-        {},
-      ),
+      resolveJournalPath(['--audit-log-file', '/first', '--audit-log-file', '/second'], {}),
     ).toEqual({ path: '/first', source: 'flag' })
   })
 
@@ -6670,10 +6595,7 @@ describe('resolveJournalPath', () => {
     // `--audit-log-file --debug` is an operator mistake — forgot the
     // path. Do not journal to a file literally named `--debug`.
     expect(
-      resolveJournalPath(
-        ['--audit-log-file', '--debug'],
-        { SLACK_AUDIT_LOG: '/from/env' },
-      ),
+      resolveJournalPath(['--audit-log-file', '--debug'], { SLACK_AUDIT_LOG: '/from/env' }),
     ).toEqual({ path: '/from/env', source: 'env' })
 
     // Same for a bare `-`, which is the stdin convention and never a
@@ -6710,16 +6632,12 @@ describe('parseVerifyArg', () => {
 
   test('picks up --verify-audit-log space-separated form', async () => {
     const { parseVerifyArg } = await loadLib()
-    expect(parseVerifyArg(['--verify-audit-log', '/tmp/audit.log'])).toBe(
-      '/tmp/audit.log',
-    )
+    expect(parseVerifyArg(['--verify-audit-log', '/tmp/audit.log'])).toBe('/tmp/audit.log')
   })
 
   test('picks up --verify-audit-log=PATH equals form', async () => {
     const { parseVerifyArg } = await loadLib()
-    expect(parseVerifyArg(['--verify-audit-log=/tmp/audit.log'])).toBe(
-      '/tmp/audit.log',
-    )
+    expect(parseVerifyArg(['--verify-audit-log=/tmp/audit.log'])).toBe('/tmp/audit.log')
   })
 
   test('flag-shaped successor falls through (shell-mistake protection)', async () => {
@@ -6739,21 +6657,13 @@ describe('parseVerifyArg', () => {
 
   test('equals form preserves leading-hyphen literals', async () => {
     const { parseVerifyArg } = await loadLib()
-    expect(parseVerifyArg(['--verify-audit-log=-weird.log'])).toBe(
-      '-weird.log',
-    )
+    expect(parseVerifyArg(['--verify-audit-log=-weird.log'])).toBe('-weird.log')
   })
 
   test('flag works mid-argv with unrelated args around it', async () => {
     const { parseVerifyArg } = await loadLib()
     expect(
-      parseVerifyArg([
-        '--some-other',
-        'x',
-        '--verify-audit-log',
-        '/tmp/a.log',
-        '--trailing',
-      ]),
+      parseVerifyArg(['--some-other', 'x', '--verify-audit-log', '/tmp/a.log', '--trailing']),
     ).toBe('/tmp/a.log')
   })
 })
@@ -6767,10 +6677,7 @@ describe('formatVerifyResult', () => {
 
   test('success case prints count + path, exit 0', async () => {
     const { formatVerifyResult } = await loadLib()
-    const out = formatVerifyResult(
-      { ok: true, eventsVerified: 42 },
-      '/tmp/audit.log',
-    )
+    const out = formatVerifyResult({ ok: true, eventsVerified: 42 }, '/tmp/audit.log')
     expect(out.exitCode).toBe(0)
     expect(out.text).toBe('OK: 42 event(s) verified in /tmp/audit.log')
   })
@@ -6931,9 +6838,7 @@ describe('decidePermissionRoute', () => {
         approvers: 1,
       }).type,
     ])
-    expect(routes).toEqual(
-      new Set(['auto_allow', 'default_human', 'deny', 'require_human']),
-    )
+    expect(routes).toEqual(new Set(['auto_allow', 'default_human', 'deny', 'require_human']))
   })
 })
 
@@ -7344,21 +7249,15 @@ describe('Epic 29-B integration — full policy chain', () => {
     })
 
     // Session A: auto-allow via pre-granted approval.
-    const decA = evaluate(
-      makeCall({ tool: 'delete_project', sessionKey: sessionA }),
-      rules,
-      now,
-      { approvals },
-    )
+    const decA = evaluate(makeCall({ tool: 'delete_project', sessionKey: sessionA }), rules, now, {
+      approvals,
+    })
     expect(decA.kind).toBe('allow')
 
     // Session B: no approval in this session → require fires.
-    const decB = evaluate(
-      makeCall({ tool: 'delete_project', sessionKey: sessionB }),
-      rules,
-      now,
-      { approvals },
-    )
+    const decB = evaluate(makeCall({ tool: 'delete_project', sessionKey: sessionB }), rules, now, {
+      approvals,
+    })
     expect(decB.kind).toBe('require')
   })
 
@@ -7524,9 +7423,7 @@ describe('verifyJournal', () => {
     const lines = content.split('\n').filter(Boolean)
     // Parse entry 5, swap one hex char in its `hash`, re-serialize.
     const parsed = JSON.parse(lines[4]!) as Record<string, unknown>
-    const badHash = (parsed.hash as string).replace(/^./, (c) =>
-      c === 'a' ? 'b' : 'a',
-    )
+    const badHash = (parsed.hash as string).replace(/^./, (c) => (c === 'a' ? 'b' : 'a'))
     parsed.hash = badHash
     lines[4] = JSON.stringify(parsed)
     writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
@@ -7748,9 +7645,7 @@ describe('boot-event anchor pinning (ccsc-lfx integration)', () => {
   })
 
   test('verifyJournal accepts a chain whose first event records its anchor', async () => {
-    const { JournalWriter, createBootAnchor, verifyJournal } = await import(
-      './journal.ts'
-    )
+    const { JournalWriter, createBootAnchor, verifyJournal } = await import('./journal.ts')
     const trustedAnchor = createBootAnchor()
     const w = await JournalWriter.open({
       path: logPath,
@@ -7779,9 +7674,7 @@ describe('boot-event anchor pinning (ccsc-lfx integration)', () => {
   })
 
   test('tampering with the anchor-in-body breaks first-event hash', async () => {
-    const { JournalWriter, createBootAnchor, verifyJournal } = await import(
-      './journal.ts'
-    )
+    const { JournalWriter, createBootAnchor, verifyJournal } = await import('./journal.ts')
     const trustedAnchor = createBootAnchor()
     const w = await JournalWriter.open({
       path: logPath,
@@ -7851,7 +7744,9 @@ describe('SessionSupervisor quarantine (S6)', () => {
     try {
       const { chmodSync } = require('node:fs')
       chmodSync(channelDir, 0o700)
-    } catch { /* best-effort */ }
+    } catch {
+      /* best-effort */
+    }
     rmSync(rawRoot, { recursive: true, force: true })
   })
 
@@ -7861,7 +7756,9 @@ describe('SessionSupervisor quarantine (S6)', () => {
   async function activateThenFailDeactivate(key: SessionKey = KEY_A) {
     const sup = createSessionSupervisor({
       stateRoot,
-      log: () => { /* silent */ },
+      log: () => {
+        /* silent */
+      },
     })
 
     // Activate (creates the session file on disk).
@@ -7915,7 +7812,7 @@ describe('SessionSupervisor quarantine (S6)', () => {
     expect(cause.message).toMatch(/EACCES|permission denied|ENOENT|EPERM/i)
   })
 
-  test('a different key is unaffected by another key\'s quarantine', async () => {
+  test("a different key is unaffected by another key's quarantine", async () => {
     const sup = await activateThenFailDeactivate(KEY_A)
     // KEY_A is quarantined, but KEY_B has never been touched.
     // Pre-create the channel dir for B so activate can write the session.
@@ -7945,7 +7842,9 @@ describe('SessionSupervisor quarantine (S6)', () => {
     const aggressiveSup = createSessionSupervisor({
       stateRoot,
       idleMs: 0,
-      log: () => { /* silent */ },
+      log: () => {
+        /* silent */
+      },
     })
     // aggressiveSup has an empty live map; reapIdle is a no-op by design.
     // The quarantine-carrying sup has no live entries either (live.delete ran).
@@ -7986,16 +7885,21 @@ describe('SessionHandle.update (ccsc-9d9)', () => {
     try {
       const { chmodSync } = require('node:fs')
       chmodSync(channelDir, 0o700)
-    } catch { /* best-effort */ }
+    } catch {
+      /* best-effort */
+    }
     rmSync(rawRoot, { recursive: true, force: true })
   })
 
   function makeSupervisor() {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { createSessionSupervisor } = require('./supervisor.ts') as typeof import('./supervisor.ts')
+    const { createSessionSupervisor } =
+      require('./supervisor.ts') as typeof import('./supervisor.ts')
     return createSessionSupervisor({
       stateRoot,
-      log: () => { /* silent */ },
+      log: () => {
+        /* silent */
+      },
       clock: () => 1_700_000_000_000,
     })
   }
@@ -8491,9 +8395,7 @@ describe('MCP tool input schemas (S5)', () => {
       expect(result.success).toBe(false)
       if (!result.success) {
         // Error path drills into the nested manifest object.
-        expect(
-          result.error.issues.some((i) => i.path[0] === 'manifest'),
-        ).toBe(true)
+        expect(result.error.issues.some((i) => i.path[0] === 'manifest')).toBe(true)
       }
     })
 
@@ -8516,9 +8418,7 @@ describe('MCP tool input schemas (S5)', () => {
       })
       expect(result.success).toBe(false)
       if (!result.success) {
-        expect(
-          result.error.issues.some((i) => i.code === 'unrecognized_keys'),
-        ).toBe(true)
+        expect(result.error.issues.some((i) => i.code === 'unrecognized_keys')).toBe(true)
       }
     })
 
@@ -8697,14 +8597,18 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
 
     // Mock supervisor that records when shutdown() is invoked.
     const mockSup: import('./supervisor.ts').SessionSupervisor = {
-      activate: async () => { throw new Error('not used') },
+      activate: async () => {
+        throw new Error('not used')
+      },
       quiesce: async () => {},
       deactivate: async () => {},
       clearQuarantine: () => {},
       reapIdle: async () => {},
       shutdown: () => {
         shutdownCalled = true
-        return new Promise<void>((res) => { shutdownResolve = res })
+        return new Promise<void>((res) => {
+          shutdownResolve = res
+        })
       },
     }
 
@@ -8737,7 +8641,10 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
     const updateStart = Date.now()
     const slowUpdate = new Promise<void>((res) => {
       setTimeout(() => {
-        handle.update((s) => ({ ...s, lastActiveAt: Date.now() })).then(res).catch(res)
+        handle
+          .update((s) => ({ ...s, lastActiveAt: Date.now() }))
+          .then(res)
+          .catch(res)
       }, 50)
     })
 
@@ -8888,7 +8795,9 @@ describe('Journal event wiring (ccsc-3fo)', () => {
           input: { channel: 'C999' },
           reason: 'outbound gate blocked: channel not delivered',
         },
-        (err) => { writeError = err },
+        (err) => {
+          writeError = err
+        },
       )
     }
 
@@ -9138,8 +9047,14 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     const calls: AuditReceiptPostArgs[] = []
     const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
-      'C1', undefined, 'Bash', undefined,
+      async (args) => {
+        calls.push(args)
+        return { ok: true, ts: '1.001' }
+      },
+      'C1',
+      undefined,
+      'Bash',
+      undefined,
       (ctx) => errors.push(ctx),
     )
     expect(calls).toHaveLength(0)
@@ -9151,8 +9066,13 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     const calls: AuditReceiptPostArgs[] = []
     const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
-      'C1', undefined, 'Bash',
+      async (args) => {
+        calls.push(args)
+        return { ok: true, ts: '1.001' }
+      },
+      'C1',
+      undefined,
+      'Bash',
       { ...baseChannel, audit: 'off' },
       (ctx) => errors.push(ctx),
     )
@@ -9164,10 +9084,17 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   test('audit: compact — posts once and returns correlationId + ts', async () => {
     const calls: AuditReceiptPostArgs[] = []
     const result = await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: '1700000000.000100' } },
-      'C_OPS', 'T_ROOT', 'Write',
+      async (args) => {
+        calls.push(args)
+        return { ok: true, ts: '1700000000.000100' }
+      },
+      'C_OPS',
+      'T_ROOT',
+      'Write',
       { ...baseChannel, audit: 'compact' },
-      () => { throw new Error('onError should not fire on success') },
+      () => {
+        throw new Error('onError should not fire on success')
+      },
     )
     expect(calls).toHaveLength(1)
     expect(calls[0]!.channel).toBe('C_OPS')
@@ -9180,10 +9107,17 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   test('audit: full — posts once with correct args and returns populated result', async () => {
     const calls: AuditReceiptPostArgs[] = []
     const result = await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: 'ts_full' } },
-      'C_SEC', 'T_AUDIT', 'Read',
+      async (args) => {
+        calls.push(args)
+        return { ok: true, ts: 'ts_full' }
+      },
+      'C_SEC',
+      'T_AUDIT',
+      'Read',
       { ...baseChannel, audit: 'full' },
-      () => { throw new Error('onError should not fire on success') },
+      () => {
+        throw new Error('onError should not fire on success')
+      },
     )
     expect(calls).toHaveLength(1)
     expect(calls[0]!.channel).toBe('C_SEC')
@@ -9198,7 +9132,9 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: false, error: 'channel_not_found' }),
-      'C1', undefined, 'Bash',
+      'C1',
+      undefined,
+      'Bash',
       { ...baseChannel, audit: 'compact' },
       (ctx) => errors.push(ctx),
     )
@@ -9212,7 +9148,9 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: false }),
-      'C1', undefined, 'Bash',
+      'C1',
+      undefined,
+      'Bash',
       { ...baseChannel, audit: 'compact' },
       (ctx) => errors.push(ctx),
     )
@@ -9224,8 +9162,12 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
   test('Slack throws — onError fires, result undefined, no throw (projection must not block exec)', async () => {
     const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
-      async () => { throw new Error('slack rate limit') },
-      'C1', undefined, 'Bash',
+      async () => {
+        throw new Error('slack rate limit')
+      },
+      'C1',
+      undefined,
+      'Bash',
       { ...baseChannel, audit: 'compact' },
       (ctx) => errors.push(ctx),
     )
@@ -9238,7 +9180,9 @@ describe('buildAndPostAuditReceipt (30-B.9)', () => {
     const errors: AuditReceiptPostError[] = []
     const result = await buildAndPostAuditReceipt(
       async () => ({ ok: true }),
-      'C1', undefined, 'Bash',
+      'C1',
+      undefined,
+      'Bash',
       { ...baseChannel, audit: 'compact' },
       (ctx) => errors.push(ctx),
     )
@@ -9464,7 +9408,10 @@ describe('SENDABLE_PARENT_DENY per-entry (ccsc-y4e)', () => {
   }
 
   // Adjacent-pair entries: a path descending through .config/<pair> blocks.
-  const pairs: Array<[string, string]> = [['.config', 'gcloud'], ['.config', 'gh']]
+  const pairs: Array<[string, string]> = [
+    ['.config', 'gcloud'],
+    ['.config', 'gh'],
+  ]
   for (const [a, b] of pairs) {
     test(`denies a benign file under ${a}/${b}/`, () => {
       const dir = join(spRoot, a, b)
@@ -9562,10 +9509,17 @@ describe('buildAndPostAuditReceipt unfurl flags (ccsc-y4e)', () => {
     // the flags. That's what this does.
     const calls: AuditReceiptPostArgs[] = []
     await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: '1.001' } },
-      'C_Y4E', 'T_Y4E', 'Bash',
+      async (args) => {
+        calls.push(args)
+        return { ok: true, ts: '1.001' }
+      },
+      'C_Y4E',
+      'T_Y4E',
+      'Bash',
       { ...baseChannel, audit: 'compact' },
-      () => { throw new Error('onError should not fire on success') },
+      () => {
+        throw new Error('onError should not fire on success')
+      },
     )
     expect(calls).toHaveLength(1)
     expect(calls[0]!.unfurl_links).toBe(false)
@@ -9575,10 +9529,17 @@ describe('buildAndPostAuditReceipt unfurl flags (ccsc-y4e)', () => {
   test('full mode disables link + media unfurls — kills the "false → true" mutants', async () => {
     const calls: AuditReceiptPostArgs[] = []
     await buildAndPostAuditReceipt(
-      async (args) => { calls.push(args); return { ok: true, ts: '2.002' } },
-      'C_Y4E', 'T_Y4E', 'Write',
+      async (args) => {
+        calls.push(args)
+        return { ok: true, ts: '2.002' }
+      },
+      'C_Y4E',
+      'T_Y4E',
+      'Write',
       { ...baseChannel, audit: 'full' },
-      () => { throw new Error('onError should not fire on success') },
+      () => {
+        throw new Error('onError should not fire on success')
+      },
     )
     expect(calls).toHaveLength(1)
     expect(calls[0]!.unfurl_links).toBe(false)
