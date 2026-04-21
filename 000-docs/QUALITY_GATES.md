@@ -20,8 +20,8 @@ One row per Quality Gate category × per primary language (TypeScript, Bun runti
 | 8b | **CI depth** | GitHub Actions | 🟢 Typecheck (required), test, CodeQL, Gemini review, Scorecard, notify-marketplace | (existing) | `.github/workflows/*` | — |
 | 9a | **SAST** | CodeQL | 🟢 `.github/workflows/codeql.yml` active | (Actions) | CI | — |
 | 9b | **SAST (alt)** | Semgrep | ⚪ Not installed; CodeQL covers | `pipx install semgrep` (user-level) | `semgrep --config=p/typescript .` as workflow step | P3 (only if CodeQL leaves a gap) |
-| 9c | **Secret scan (PR)** | gitleaks / trufflehog | 🟡 TruffleHog run ad-hoc in this audit (clean). Not wired as PR gate. | `go install github.com/gitleaks/gitleaks/v8@latest` or existing `trufflehog` binary | add as workflow step for PRs | P2 |
-| 9d | **Dep vulnerability scan** | `bun pm scan` / OSV / Snyk | 🔴 None. `bun pm scan` requires a configured scanner package in bunfig. | `bun add -D @aikidosec/bun-safe-chain` (example scanner) + configure in `bunfig.toml` | add scan step | P2 |
+| 9c | **Secret scan (PR)** | gitleaks | 🟢 `.github/workflows/secrets-scan.yml` — installs gitleaks v8.30.1, scans the PR diff (or full history on push to main), redacts findings, fails on any leak. `.gitleaksignore` carries the 7 journal-redactor test fixtures. `ccsc-bsz` closed. | (CI-side install) | `secrets-scan.yml` runs on every PR + push to main | — |
+| 9d | **Dep vulnerability scan** | `bun audit` (native) | 🟢 `.github/workflows/ci.yml` runs `bun audit --audit-level=high` against the GitHub Advisory Database. One advisory is ignored (`GHSA-j3q9-mxjg-w52f`, path-to-regexp) because it's a transitive of `@modelcontextprotocol/sdk` we can't patch from our side. `ccsc-8g6` closed. Scanner-package path via `[install.security] scanner = ...` in `bunfig.toml` remains an option when one is picked (stanza is commented in place). | (built in) | `bun audit` step in `ci.yml` | — |
 | 9e | **Container scan** | Trivy | ⚪ Not wired; Dockerfile exists | `trivy image <image>` | on release workflow | P3 |
 | 9f | **IaC scan** | Checkov / tfsec | ⚪ N/A — no Terraform/CF/Pulumi | — | — | — |
 | 10 | **Accessibility + visual** | — | ⚪ N/A — no UI | — | — | — |
@@ -41,9 +41,9 @@ One row per Quality Gate category × per primary language (TypeScript, Bun runti
 - Architecture rule formalization (Phase D PR)
 
 **P2 (filed as beads for Jeremy's call):**
-- §7b/§7c Adopt Biome repo-wide — biggest single improvement in static analysis coverage
-- §9c Wire gitleaks/trufflehog as a PR gate — currently manual
-- §9d Configure a Bun security scanner — `bun pm scan` is dormant
+- §7b/§7c Adopt Biome repo-wide — biggest single improvement in static analysis coverage (bd `ccsc-dz8`)
+- ~~§9c Wire gitleaks as a PR gate~~ — **shipped in `ccsc-bsz`**, see §9c above
+- ~~§9d Configure a Bun security scanner~~ — **shipped in `ccsc-8g6` via native `bun audit`**, see §9d above
 
 **P3 (optional — diminishing returns on a 5-file production codebase):**
 - §8 Pre-commit hooks — CI is already the gate
