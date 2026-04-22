@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/slack-channel:policy` skill — author policy rules without hand-editing `access.json`** (`ccsc-0ss`). New operator-facing skill at `skills/policy/SKILL.md` with four subcommands: `list` (tabular view of current rules), `lint` (shadow + broad-auto-approve warnings), `add <id> <effect> <json-match> [opts]`, and `remove <id>`. All writes are atomic (`access.json.tmp` → rename) with mode `0o600`. Pre-write validation runs through a new `scripts/policy-validate.ts` wrapper that imports the real `parsePolicyRules()` / `detectShadowing()` / `detectBroadAutoApprove()` from `policy.ts` — the same functions the server uses at boot — so a rule that validates clean here will load clean. Adds a duplicate-id check in the validator to match what ACCESS.md §"Safety checks" documents — server.ts `loadPolicy()` currently does not enforce this; server-side fix tracked as `ccsc-kx8`. Hot reload remains intentionally unsupported; every success message tells the operator to restart the server.
+
 ### Changed
 
 - **Tighten `crap-score` CI threshold from 85 → 30** (`ccsc-510`). Wall 5 ideal now enforced in CI. Prior threshold 85 was a regression-only gate tuned to the previous ceiling; all four outliers (`gate` 32, `handleMessage` 35, interactive-handler anon 39, MCP-dispatch anon 84) are now refactored under ccsc-53g. Current ceiling is 28 (`server.ts`) — ~2 points of headroom. Every future PR must justify any function landing above the Wall 5 ideal.

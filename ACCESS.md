@@ -284,6 +284,10 @@ A missing or empty `policy` field means "no authored rules" and is **not** an er
 
 Epic 29-B wired the loader and the `evaluate()` call into the permission-relay handler. The wiring lives in `server.ts` at the `PermissionRequestSchema` handler — see the `decidePermissionRoute()` helper in `lib.ts` for the pure decision-routing logic.
 
+### Authoring rules without hand-editing
+
+The `/slack-channel:policy` skill (`skills/policy/SKILL.md`) is the ergonomic front door to authoring rules. It wraps atomic `access.json` writes with pre-write validation via `scripts/policy-validate.ts`, which runs the same `parsePolicyRules()` + `detectShadowing()` + `detectBroadAutoApprove()` functions the server uses at boot. Subcommands: `list`, `lint`, `add <id> <effect> <json-match> [opts]`, `remove <id>`. The skill complements the hand-edit path; it does not replace it. Hot reload remains unsupported — every successful mutation ends with a "restart the server" notice.
+
 ## File attachments — sendable roots
 
 The `reply` tool can attach files to Slack messages, but only files whose

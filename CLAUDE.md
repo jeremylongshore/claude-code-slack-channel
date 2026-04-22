@@ -127,10 +127,12 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `scripts/gherkin-lint.sh` — Wall 1 Gherkin style check (mirrored from `/audit-tests` skill)
 - `scripts/harness-hash.sh` — tamper-detect pinned artifacts (mirrored from skill)
 - `scripts/bias-count.sh` — test-bias pattern scanner (mirrored from skill with pipefail fix)
+- `scripts/policy-validate.ts` — CLI wrapper around `parsePolicyRules` + `detectShadowing` + `detectBroadAutoApprove` used by `/slack-channel:policy`
 
 ### Skills & docs
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
+- `skills/policy/SKILL.md` — `/slack-channel:policy` policy-rule authoring skill (validates via `scripts/policy-validate.ts`)
 - `ACCESS.md` — access control schema documentation
 - `CHANGELOG.md` — Keep a Changelog format; every user-visible change lands with a PR entry
 
