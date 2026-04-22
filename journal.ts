@@ -36,7 +36,6 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
 import { type FileHandle, open as fsOpen, readFile } from 'node:fs/promises'
 import { z } from 'zod'
 import type { SessionKey } from './lib'
@@ -296,6 +295,66 @@ export interface WriterOptions {
  *  than allowing two writers to interleave their hash chains silently. */
 const ACTIVE_PATHS = new Set<string>()
 
+/** Chunk size for the reverse-chunk tail read in `readLastLine`. 64 KiB is
+ *  large enough that realistic audit lines (~300-2000 bytes) fit in a
+ *  single chunk, small enough that the buffer cost stays negligible even
+ *  if recovery runs on a tiny-memory machine. Lines larger than the chunk
+ *  are handled correctly by the loop — it just reads another chunk. */
+const READ_LAST_LINE_CHUNK_SIZE = 64 * 1024
+
+/** Read the last non-empty newline-delimited line from an open file
+ *  handle without loading the whole file into memory. Returns null if
+ *  the file is empty (or contains only trailing newlines). Used by
+ *  `JournalWriter.open` to recover chain state in O(last-line-size)
+ *  memory instead of O(file-size) — the original full-`readFileSync`
+ *  path stopped scaling past the low-MB range per ccsc-otd.
+ *
+ *  Reads with explicit `position` so it doesn't disturb the append
+ *  pointer of an `a+`-opened handle (writes still land at EOF via
+ *  O_APPEND).
+ */
+async function readLastLine(fh: FileHandle): Promise<string | null> {
+  const { size } = await fh.stat()
+  if (size === 0) return null
+
+  // Walk backwards from EOF in chunks, accumulating into `tail`. Stop
+  // when we find a newline that precedes non-empty content (i.e., the
+  // newline before the last line) or when we reach the start of file.
+  let tail = Buffer.alloc(0)
+  let pos = size
+  while (pos > 0) {
+    const readSize = Math.min(READ_LAST_LINE_CHUNK_SIZE, pos)
+    pos -= readSize
+    const buf = Buffer.alloc(readSize)
+    const { bytesRead } = await fh.read(buf, 0, readSize, pos)
+    if (bytesRead === 0) break // unexpected but defensive
+    tail = Buffer.concat([buf.subarray(0, bytesRead), tail])
+
+    // Trim trailing newlines (one or more) before scanning for the
+    // boundary newline so an empty last line (file ends with "\n\n")
+    // is treated as "no content on that line".
+    let end = tail.length
+    while (end > 0 && tail[end - 1] === 0x0a /* '\n' */) end--
+    if (end === 0) {
+      // Chunk(s) so far are all newlines. Keep reading earlier bytes.
+      continue
+    }
+    // Look for the nearest newline strictly before `end`. If found,
+    // the last line is the slice after it (up to `end`).
+    const nl = tail.subarray(0, end).lastIndexOf(0x0a)
+    if (nl !== -1) {
+      return tail.subarray(nl + 1, end).toString('utf8')
+    }
+    // No newline yet and we've reached start-of-file — whole file is
+    // one line. Return it (minus any trailing newlines).
+    if (pos === 0) return tail.subarray(0, end).toString('utf8')
+    // Else: line is longer than what we've read; loop and pull another
+    // chunk.
+  }
+  // Got here only if the whole file was newlines.
+  return null
+}
+
 /** Tamper-evident append-only writer. See audit-journal-architecture.md
  *  §76-161 for the full contract. One writer per process per path.
  *
@@ -369,25 +428,31 @@ export class JournalWriter {
       )
     }
 
+    // Mode 0o600 on creation; 'a+' flag sets O_RDWR|O_APPEND|O_CREAT.
+    // One FileHandle for both the tail read (to recover chain state) and
+    // every subsequent append — closes the stat-then-open TOCTOU window
+    // that a separate read-then-open pair exposes (per CodeQL
+    // js/file-system-race). O_APPEND still guarantees writes land
+    // atomically at EOF per audit-journal-architecture.md §155-160;
+    // reads use explicit `position` and don't move the append pointer.
+    //
+    // FileHandle (fs.open) rather than fs.createWriteStream because
+    // we need explicit `fh.sync()` after every write for durability;
+    // streams buffer and make that awkward. One event = one write =
+    // one fsync for this bead (ccsc-5pi.7). A higher-volume operator
+    // can relax to batch fsync in a future bead.
+    const fh = await fsOpen(opts.path, 'a+', 0o600)
+
     let lastHash: string
     let nextSeq: number
-
-    if (existsSync(opts.path)) {
-      // ccsc-otd: this reads the whole file into memory to recover the
-      // last line. Fine for a per-developer install whose journal is
-      // MB-scale; not fine at GB-scale. Follow-up replaces this with a
-      // reverse-chunked scan (64 KiB windows from EOF until the last
-      // newline). Rotation (Epic 30-B) bounds file size further; this
-      // fallback just stops being the bottleneck once files grow.
-      const content = readFileSync(opts.path, 'utf8')
-      const lines = content.split('\n').filter((line) => line.length > 0)
-      if (lines.length === 0) {
-        // File exists but is empty — treat as fresh chain. Not an error;
-        // happens when an operator pre-created the file with `touch`.
+    try {
+      const lastLine = await readLastLine(fh)
+      if (lastLine === null) {
+        // File is empty (fresh or operator-created with `touch`) —
+        // start a new chain. Not an error.
         lastHash = opts.initialPrevHash ?? sha256Hex(randomBytes(32))
         nextSeq = 1
       } else {
-        const lastLine = lines[lines.length - 1]!
         let parsed: JournalEvent
         try {
           parsed = JournalEvent.parse(JSON.parse(lastLine))
@@ -401,26 +466,23 @@ export class JournalWriter {
         lastHash = parsed.hash
         nextSeq = parsed.seq + 1
       }
-    } else {
-      lastHash = opts.initialPrevHash ?? sha256Hex(randomBytes(32))
-      nextSeq = 1
+    } catch (err) {
+      // Don't leak the file descriptor if anything in the recovery path
+      // throws. ACTIVE_PATHS hasn't been registered yet so we just close.
+      // If close itself fails, surface it to stderr (it may indicate a
+      // deeper fs problem) but still throw the original recovery error —
+      // that's the one the operator needs to fix.
+      try {
+        await fh.close()
+      } catch (closeErr) {
+        console.error(
+          `[journal] fh.close failed during open() recovery cleanup for ${opts.path}: ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+        )
+      }
+      throw err
     }
 
-    // Mode 0o600 on creation; 'a' flag sets O_APPEND|O_WRONLY|O_CREAT
-    // per audit-journal-architecture.md §155-160. POSIX guarantees
-    // O_APPEND writes land atomically at EOF even with concurrent
-    // writers — the kernel seeks to EOF and writes in one step. We
-    // still serialize via the queue for the hash chain, not for
-    // write-safety.
-    //
-    // FileHandle (fs.open) rather than fs.createWriteStream because
-    // we need explicit `fh.sync()` after every write for durability;
-    // streams buffer and make that awkward. One event = one write =
-    // one fsync for this bead (ccsc-5pi.7). A higher-volume operator
-    // can relax to batch fsync in a future bead.
-    const fh = await fsOpen(opts.path, 'a', 0o600)
     ACTIVE_PATHS.add(opts.path)
-
     return new JournalWriter(fh, lastHash, nextSeq, opts.now ?? ((): Date => new Date()), opts.path)
   }
 

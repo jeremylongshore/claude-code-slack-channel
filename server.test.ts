@@ -5646,6 +5646,116 @@ describe('JournalWriter', () => {
     ).rejects.toThrow(/valid JournalEvent/)
   })
 
+  // ── Reverse-chunk tail read (ccsc-otd) ───────────────────────────────
+  // readLastLine walks the file backwards in 64 KiB windows. These tests
+  // exercise the paths the original full-readFileSync hid: empty files,
+  // trailing-newline-only files, and multi-chunk straddle lines.
+
+  test('reopen on a pre-existing empty file starts a fresh chain', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    // Operator-typed `touch audit.log` — file exists, size 0.
+    writeFileSync(logPath, '', { mode: 0o600 })
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    try {
+      expect(w.headHash).toBe(stableAnchor)
+      expect(w.nextSequenceNumber).toBe(1)
+      const ev = await w.writeEvent(sysBoot)
+      expect(ev.seq).toBe(1)
+      expect(ev.prevHash).toBe(stableAnchor)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('reopen on a file that is only trailing newlines starts a fresh chain', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    writeFileSync(logPath, '\n\n\n', { mode: 0o600 })
+    const w = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+    })
+    try {
+      expect(w.headHash).toBe(stableAnchor)
+      expect(w.nextSequenceNumber).toBe(1)
+    } finally {
+      await w.close()
+    }
+  })
+
+  test('reopen recovers correctly when the last line straddles 64 KiB chunk boundaries', async () => {
+    // Write a chain whose body is large enough that the tail scan has to
+    // pull multiple 64 KiB chunks to find the boundary newline. We do
+    // this by writing many events until the file is comfortably over
+    // 192 KiB (three chunks). Exercises the loop in readLastLine.
+    const { JournalWriter } = await import('./journal.ts')
+    const w1 = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    let lastWritten!: Awaited<ReturnType<typeof w1.writeEvent>>
+    try {
+      // Each session.activate event is ~250-350 bytes framed. 1,000
+      // events ⇒ ~300 KiB file, well past a single 64 KiB chunk.
+      for (let i = 0; i < 1_000; i++) {
+        lastWritten = await w1.writeEvent({
+          kind: 'session.activate',
+          correlationId: `chunk-straddle-${i.toString().padStart(6, '0')}`,
+        })
+      }
+    } finally {
+      await w1.close()
+    }
+    expect(lastWritten.seq).toBe(1_000)
+
+    // Reopen and verify the recovered head is the last-written event,
+    // not something the tail scanner misattributed from an earlier chunk.
+    const w2 = await JournalWriter.open({ path: logPath })
+    try {
+      expect(w2.headHash).toBe(lastWritten.hash)
+      expect(w2.nextSequenceNumber).toBe(1_001)
+    } finally {
+      await w2.close()
+    }
+  })
+
+  test('reopen recovers when the last line itself is larger than one 64 KiB chunk', async () => {
+    // Write a single event whose framed JSON exceeds 64 KiB so the tail
+    // scanner has to read multiple chunks just to assemble the last line
+    // before finding its preceding newline. A large `correlationId`
+    // padding produces a line >64 KiB without needing new event shapes.
+    const { JournalWriter } = await import('./journal.ts')
+    const huge = 'x'.repeat(80 * 1024) // 80 KiB of body, > one chunk
+    const w1 = await JournalWriter.open({
+      path: logPath,
+      initialPrevHash: stableAnchor,
+      now: () => fixedNow,
+    })
+    let ev1!: Awaited<ReturnType<typeof w1.writeEvent>>
+    let ev2!: Awaited<ReturnType<typeof w1.writeEvent>>
+    try {
+      ev1 = await w1.writeEvent({ kind: 'session.activate', correlationId: 'small' })
+      ev2 = await w1.writeEvent({ kind: 'session.activate', correlationId: huge })
+    } finally {
+      await w1.close()
+    }
+
+    const w2 = await JournalWriter.open({ path: logPath })
+    try {
+      expect(w2.headHash).toBe(ev2.hash)
+      expect(w2.nextSequenceNumber).toBe(3)
+      // And the first event is still reachable through the chain — the
+      // writer didn't accidentally re-root.
+      expect(ev2.prevHash).toBe(ev1.hash)
+    } finally {
+      await w2.close()
+    }
+  })
+
   test('concurrent writeEvent calls serialize in call order', async () => {
     const { JournalWriter } = await import('./journal.ts')
     const w = await JournalWriter.open({

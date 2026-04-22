@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`JournalWriter.open()` — reverse-chunk tail read + single file handle** (`ccsc-otd`). Replaces the full `readFileSync` of the audit log (used only to recover `lastHash` and `nextSeq` from the last line) with a 64 KiB reverse-chunk scan from EOF backwards until the last newline boundary is found. Drops startup memory from O(file size) to O(last line size). Also unifies the previous read-then-fsOpen pair into one `fsOpen('a+', 0o600)` handle: reads use explicit `position` so they don't disturb the append pointer, and writes still go through O_APPEND (atomic EOF writes preserved). The single-handle design incidentally closes the stat-then-use TOCTOU window that triggered the earlier CodeQL `js/file-system-race` pattern on this path. Four new tests in `server.test.ts` exercise the reverse-scan edge cases (pre-existing empty file, trailing-newlines-only, last line straddling a chunk boundary, last line larger than one chunk).
+
 ### Fixed
 
 - **Server-side duplicate-policy-rule-id rejection** (`ccsc-kx8`). `ACCESS.md` §"Safety checks the loader runs" documented duplicate-id rejection as fatal at boot, but `server.ts loadPolicy()` never wired the check — only the validator script shipped with the `/slack-channel:policy` skill caught it. A policy with two rules sharing an `id` would load cleanly and the second rule would be silently unreachable (evaluator uses first-applicable). Adds `assertUniqueRuleIds()` to `policy.ts` (sibling to `detectShadowing` / `detectBroadAutoApprove`; throws rather than returning warnings, matching the documented fatal contract). `server.ts loadPolicy()` now runs it after `parsePolicyRules()` and fails boot with a descriptive error naming every duplicated id. `scripts/policy-validate.ts` swapped its local `findDuplicateIds` helper for the shared primitive so the skill and the server use one code path. Four new tests in `server.test.ts` lock the behavior.
