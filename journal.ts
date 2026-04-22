@@ -469,7 +469,16 @@ export class JournalWriter {
     } catch (err) {
       // Don't leak the file descriptor if anything in the recovery path
       // throws. ACTIVE_PATHS hasn't been registered yet so we just close.
-      await fh.close().catch(() => {})
+      // If close itself fails, surface it to stderr (it may indicate a
+      // deeper fs problem) but still throw the original recovery error —
+      // that's the one the operator needs to fix.
+      try {
+        await fh.close()
+      } catch (closeErr) {
+        console.error(
+          `[journal] fh.close failed during open() recovery cleanup for ${opts.path}: ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+        )
+      }
       throw err
     }
 
