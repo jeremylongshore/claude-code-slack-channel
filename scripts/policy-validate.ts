@@ -10,11 +10,12 @@
 //   bun scripts/policy-validate.ts --stdin                         (bare array on stdin)
 //
 // Exit codes:
-//   0 — parse OK (warnings printed to stderr; --json output on stdout)
-//   1 — parse failure (Zod error or duplicate id) or bad CLI args
+//   0 — parse + uniqueness OK (shadow / broad-auto-approve warnings, if any,
+//       are carried inside the stdout JSON — see shape below)
+//   1 — parse failure (Zod error), duplicate rule id, or bad CLI args
 //
-// stdout shape (always valid JSON):
-//   { "ok": true,  "count": N, "shadows": [...], "broads": [...], "duplicates": [] }
+// stdout shape (always a single line of valid JSON):
+//   { "ok": true,  "source": "...", "count": N, "shadows": [...], "broads": [...] }
 //   { "ok": false, "error": "<message>" }
 
 import { readFileSync } from 'node:fs'
