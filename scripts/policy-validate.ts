@@ -32,9 +32,10 @@ function die(msg: string): never {
 
 function readInput(): { source: string; raw: unknown } {
   const args = process.argv.slice(2)
-  if (args.length === 0) die('usage: policy-validate.ts <access.json> | --rules <file> | --stdin')
+  const firstArg = args[0]
+  if (!firstArg) die('usage: policy-validate.ts <access.json> | --rules <file> | --stdin')
 
-  if (args[0] === '--stdin') {
+  if (firstArg === '--stdin') {
     const body = readFileSync(0, 'utf8')
     try {
       return { source: '<stdin>', raw: JSON.parse(body) }
@@ -43,21 +44,22 @@ function readInput(): { source: string; raw: unknown } {
     }
   }
 
-  if (args[0] === '--rules') {
-    if (!args[1]) die('--rules requires a path argument')
+  if (firstArg === '--rules') {
+    const rulesPath = args[1]
+    if (!rulesPath) die('--rules requires a path argument')
     try {
-      return { source: args[1]!, raw: JSON.parse(readFileSync(args[1]!, 'utf8')) }
+      return { source: rulesPath, raw: JSON.parse(readFileSync(rulesPath, 'utf8')) }
     } catch (err) {
-      die(`cannot read ${args[1]}: ${err instanceof Error ? err.message : String(err)}`)
+      die(`cannot read ${rulesPath}: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 
   // Default: treat arg as access.json and pull its `policy` field.
   try {
-    const body = JSON.parse(readFileSync(args[0]!, 'utf8')) as Record<string, unknown>
-    return { source: args[0]!, raw: body.policy ?? [] }
+    const body = JSON.parse(readFileSync(firstArg, 'utf8')) as Record<string, unknown>
+    return { source: firstArg, raw: body.policy ?? [] }
   } catch (err) {
-    die(`cannot read ${args[0]}: ${err instanceof Error ? err.message : String(err)}`)
+    die(`cannot read ${firstArg}: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
