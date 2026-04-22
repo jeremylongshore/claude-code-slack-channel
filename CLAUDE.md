@@ -12,12 +12,12 @@ Six production source files (Bun/TypeScript, strict mode):
 
 | File | LoC | Purpose |
 |---|---|---|
-| `server.ts` | 2552 | Stateful runtime — Slack client bootstrap, MCP server, event handlers |
-| `lib.ts` | 1770 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt helpers |
-| `journal.ts` | 1103 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
-| `supervisor.ts` | 1008 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32) |
-| `policy.ts` | 605 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
-| `manifest.ts` | 582 | Bot-manifest protocol — schema, publish-side validation, subset check (Epic 31) |
+| `server.ts` | 2752 | Stateful runtime — Slack client bootstrap, MCP server, event handlers |
+| `lib.ts` | 1765 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt helpers |
+| `journal.ts` | 1083 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
+| `supervisor.ts` | 980 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32) |
+| `policy.ts` | 611 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
+| `manifest.ts` | 573 | Bot-manifest protocol — schema, publish-side validation, subset check (Epic 31) |
 
 Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
 
@@ -38,7 +38,7 @@ Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude
 ```bash
 bun install                              # Install deps
 bun run typecheck                        # TypeScript strict check (tsc --noEmit)
-bun test                                 # Run test suite (bun:test) — 669 tests
+bun test                                 # Run test suite (bun:test) — 682 tests
 bun test --timeout 15000                 # Match CI's timeout
 bun test --watch                         # Watch mode
 bun test --test-name-pattern "gate"      # Run tests matching a pattern
@@ -57,7 +57,7 @@ bunx depcruise --config .dependency-cruiser.js .   # Architecture rules (Wall 7d
 bash scripts/gherkin-lint.sh --path features/ --strict   # Wall 1 lint
 bash scripts/harness-hash.sh --verify    # Tamper check for pinned artifacts
 bun audit --audit-level=high --ignore=GHSA-j3q9-mxjg-w52f   # Dep CVE scan
-bun scripts/crap-score.ts --threshold 85 # Cyclomatic complexity gate (Wall 5)
+bun scripts/crap-score.ts --threshold 30 # Cyclomatic complexity gate (Wall 5 ideal, tightened from 85 in ccsc-510)
 bash scripts/bias-count.sh /tmp/test-scan   # Test-suite bias audit (manual)
 ```
 
@@ -109,7 +109,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `manifest.ts` — bot-manifest protocol (Epic 31): schema, `assertPublishAllowed`, `validateManifestSubset`
 
 ### Tests & acceptance contracts
-- `server.test.ts` — single-file test suite covering security-critical functions (uses `bun:test`); 669 tests, 1 405 expects. Run a subset with `bun test --test-name-pattern "<pattern>"`
+- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`); 632 tests, 1,405 expects. Total across all three test files (plus `features/gate-properties.test.ts` and `features/runner.test.ts`) is **682 tests / 4,005 expects**. Run a subset with `bun test --test-name-pattern "<pattern>"`
 - `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); five primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`
 - `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 37 scenarios against the real primitives
 
