@@ -16,6 +16,7 @@ import {
 import { z } from 'zod'
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
+import { execSync } from 'child_process'
 import { homedir } from 'os'
 import { join, resolve } from 'path'
 import {
@@ -935,6 +936,29 @@ async function handleMessage(event: unknown): Promise<void> {
         return // Don't forward as chat
       }
 
+      // Admin commands from allowlisted users — intercept before normal delivery
+      if (result.access!.allowFrom.includes(ev['user'] as string)) {
+        const cmd = msgText.toLowerCase()
+        if (cmd === '!clear' || cmd === '!restart') {
+          const tmuxSession = process.env.SLACK_TMUX_SESSION || 'slack'
+          try {
+            if (cmd === '!clear') {
+              execSync(`tmux send-keys -t ${tmuxSession} '/clear' Enter`)
+            } else {
+              execSync(`tmux send-keys -t ${tmuxSession} '/exit' Enter`)
+            }
+            await web.reactions.add({
+              channel: channelId,
+              timestamp: ev['ts'] as string,
+              name: cmd === '!clear' ? 'recycle' : 'arrows_counterclockwise',
+            })
+          } catch (err) {
+            console.error(`[slack] admin command ${cmd} failed:`, err)
+          }
+          return
+        }
+      }
+
       const access = result.access!
       const userName = await resolveUserName(ev['user'] as string)
 
@@ -985,6 +1009,14 @@ async function handleMessage(event: unknown): Promise<void> {
       if (botUserId) {
         text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
       }
+
+      // Send thinking indicator to Slack before forwarding to Claude
+      const thinkingThreadTs = (ev['thread_ts'] as string | undefined) || (ev['ts'] as string)
+      web.chat.postMessage({
+        channel: ev['channel'] as string,
+        text: '💭 Thinking...',
+        thread_ts: thinkingThreadTs,
+      }).catch(() => {})
 
       // Push into Claude Code session via MCP notification
       mcp.notification({
