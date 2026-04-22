@@ -56,8 +56,12 @@ function readInput(): { source: string; raw: unknown } {
 
   // Default: treat arg as access.json and pull its `policy` field.
   try {
-    const body = JSON.parse(readFileSync(firstArg, 'utf8')) as Record<string, unknown>
-    return { source: firstArg, raw: body.policy ?? [] }
+    const body: unknown = JSON.parse(readFileSync(firstArg, 'utf8'))
+    const policy =
+      typeof body === 'object' && body !== null && 'policy' in body
+        ? (body as { policy?: unknown }).policy
+        : undefined
+    return { source: firstArg, raw: policy ?? [] }
   } catch (err) {
     die(`cannot read ${firstArg}: ${err instanceof Error ? err.message : String(err)}`)
   }

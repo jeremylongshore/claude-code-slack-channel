@@ -5,7 +5,7 @@ version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
 license: MIT
 user-invocable: true
-argument-hint: "list | lint | add <id> <effect> <json-match> [opts] | remove <id>"
+argument-hint: "list | lint | add <id> <effect> <json-match> [--reason \"...\"] [--ttl-ms N] [--approvers N] [--priority N] | remove <id>"
 allowed-tools: [Read, Write, Edit, "Bash(cmd:bun)", "Bash(cmd:chmod)"]
 ---
 
