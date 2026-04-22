@@ -2603,6 +2603,48 @@ describe('PolicyRule schema (29-A.1)', () => {
     ])
     expect(rules).toHaveLength(2)
   })
+
+  // ── assertUniqueRuleIds — the sibling check that IS fatal (ccsc-kx8) ──
+
+  test('assertUniqueRuleIds passes on empty input', async () => {
+    const { assertUniqueRuleIds } = await loadPolicyModule()
+    expect(() => assertUniqueRuleIds([])).not.toThrow()
+  })
+
+  test('assertUniqueRuleIds passes when every id is unique', async () => {
+    const { assertUniqueRuleIds, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      { id: 'a', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'b', effect: 'deny', match: { tool: 'upload_file' }, reason: 'no uploads' },
+      { id: 'c', effect: 'require_approval', match: { tool: 'react' } },
+    ])
+    expect(() => assertUniqueRuleIds(rules)).not.toThrow()
+  })
+
+  test('assertUniqueRuleIds throws on a single duplicated id', async () => {
+    const { assertUniqueRuleIds, parsePolicyRules } = await loadPolicyModule()
+    const rules = parsePolicyRules([
+      { id: 'dupe', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'dupe', effect: 'deny', match: { tool: 'reply' }, reason: 'x' },
+    ])
+    expect(() => assertUniqueRuleIds(rules)).toThrow(/duplicate rule id\(s\): dupe/)
+  })
+
+  test('assertUniqueRuleIds enumerates every duplicated id (sorted, deduped)', async () => {
+    const { assertUniqueRuleIds, parsePolicyRules } = await loadPolicyModule()
+    // Three rules share id 'a', two share id 'b'; the error should list
+    // each duplicated id once, in sorted order, so an operator fixing a
+    // large policy sees the full set at once.
+    const rules = parsePolicyRules([
+      { id: 'b', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'a', effect: 'deny', match: { tool: 'reply' }, reason: 'x' },
+      { id: 'a', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'b', effect: 'deny', match: { tool: 'reply' }, reason: 'x' },
+      { id: 'a', effect: 'require_approval', match: { tool: 'reply' } },
+      { id: 'c', effect: 'auto_approve', match: { tool: 'react' } },
+    ])
+    expect(() => assertUniqueRuleIds(rules)).toThrow(/duplicate rule id\(s\): a, b/)
+  })
 })
 
 // ---------------------------------------------------------------------------

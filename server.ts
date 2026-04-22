@@ -70,6 +70,7 @@ import {
 import {
   type ApprovalKey,
   approvalKey,
+  assertUniqueRuleIds,
   detectBroadAutoApprove,
   detectShadowing,
   type PolicyRule,
@@ -414,6 +415,22 @@ function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
         `  File: ${ACCESS_FILE}\n` +
         `  Field: policy\n` +
         `  Fix the rules or remove the policy field to boot without enforcement.`,
+    )
+    process.exit(1)
+  }
+  // assertUniqueRuleIds (ccsc-kx8) — ACCESS.md §"Safety checks" documents
+  // duplicate-id rejection as fatal at boot; enforcing here (not in
+  // parsePolicyRules) keeps the schema-parse and uniqueness errors
+  // reportable independently. Same fail-closed shape as the parse error.
+  try {
+    assertUniqueRuleIds(parsed)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(
+      `[slack] policy rule-id uniqueness failed at boot: ${msg}\n` +
+        `  File: ${ACCESS_FILE}\n` +
+        `  Field: policy\n` +
+        `  Rename or remove the duplicate rule(s) and restart.`,
     )
     process.exit(1)
   }

@@ -19,6 +19,7 @@
 
 import { readFileSync } from 'node:fs'
 import {
+  assertUniqueRuleIds,
   detectBroadAutoApprove,
   detectShadowing,
   type PolicyRule,
@@ -67,19 +68,6 @@ function readInput(): { source: string; raw: unknown } {
   }
 }
 
-// Duplicate-id check — ACCESS.md §"Safety checks" promises this is fatal at
-// boot but server.ts doesn't actually enforce it today (ccsc-kx8). Do it here
-// so the skill catches the mismatch before the operator writes.
-function findDuplicateIds(rules: readonly PolicyRule[]): string[] {
-  const seen = new Set<string>()
-  const dupes = new Set<string>()
-  for (const rule of rules) {
-    if (seen.has(rule.id)) dupes.add(rule.id)
-    seen.add(rule.id)
-  }
-  return [...dupes]
-}
-
 const { source, raw } = readInput()
 
 let parsed: PolicyRule[]
@@ -89,9 +77,14 @@ try {
   die(`parse failed for ${source}: ${err instanceof Error ? err.message : String(err)}`)
 }
 
-const duplicates = findDuplicateIds(parsed)
-if (duplicates.length > 0) {
-  die(`duplicate rule id(s) in ${source}: ${duplicates.join(', ')}`)
+// Shared with server.ts loadPolicy() so the skill and the server use one
+// code path for the duplicate-id fatal check (ccsc-kx8 closed the drift).
+// The thrown message already starts with "duplicate rule id(s): …", so
+// prepend the source without repeating the prefix.
+try {
+  assertUniqueRuleIds(parsed)
+} catch (err) {
+  die(`${err instanceof Error ? err.message : String(err)} (in ${source})`)
 }
 
 const shadows = detectShadowing(parsed)

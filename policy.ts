@@ -150,9 +150,12 @@ export function parsePolicyRule(raw: unknown): PolicyRule {
   return PolicyRule.parse(raw)
 }
 
-/** Parse an unknown value as an array of PolicyRule. Uniqueness of `id`
- *  is NOT enforced here — that check belongs with the loader alongside
- *  shadow detection so both errors are reported together. */
+/** Parse an unknown value as an array of PolicyRule. Zod-validates the
+ *  array shape and each rule. Does NOT enforce uniqueness of `id` —
+ *  call `assertUniqueRuleIds()` for that (kept separate so the loader
+ *  can report parse + uniqueness errors independently and so pure
+ *  parse callers aren't forced to accept the throw contract of the
+ *  uniqueness check). */
 export function parsePolicyRules(raw: unknown): PolicyRule[] {
   return z.array(PolicyRule).parse(raw)
 }
@@ -441,6 +444,39 @@ function jsonEqual(a: unknown, b: unknown): boolean {
     return JSON.stringify(a) === JSON.stringify(b)
   } catch {
     return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// assertUniqueRuleIds() — load-time hard invariant per ACCESS.md §"Safety
+// checks the loader runs" and policy-evaluation-flow.md. Duplicate `id`s
+// are fatal because the evaluator walks in authored order and returns on
+// the first match, so a second rule with the same id is silently
+// unreachable — a subtle footgun the operator should see at boot, not in
+// a post-incident audit trail review.
+// ---------------------------------------------------------------------------
+
+/** Throws if two or more rules share an `id`. Error message enumerates
+ *  every duplicated id so an operator fixing a large policy sees the
+ *  full set at once. Called AFTER `parsePolicyRules()` because it
+ *  assumes the input is already schema-valid (so `rule.id` is a
+ *  non-empty string). Sibling to `detectShadowing()` and
+ *  `detectBroadAutoApprove()` — but unlike those, throws rather than
+ *  returning warnings, matching the documented "fatal at boot"
+ *  contract in ACCESS.md.
+ */
+export function assertUniqueRuleIds(rules: readonly PolicyRule[]): void {
+  const seen = new Set<string>()
+  const dupes = new Set<string>()
+  for (const rule of rules) {
+    if (seen.has(rule.id)) dupes.add(rule.id)
+    seen.add(rule.id)
+  }
+  if (dupes.size > 0) {
+    const sorted = [...dupes].sort()
+    throw new Error(
+      `duplicate rule id(s): ${sorted.join(', ')}. Every rule must have a unique id — the evaluator uses first-applicable, so a second rule with the same id is unreachable.`,
+    )
   }
 }
 
