@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-23
+
 ### Added
 
 - **`pairing.accepted` journal events via lazy allowFrom snapshot diff** (`ccsc-scv`). Closes the 19/19 audit EventKind coverage gap. The `/slack-channel:access pair <code>` skill runs in Claude's process, not the server's, so direct emit is impossible without an IPC channel. Three alternatives (fs.watch, skill-writes-journal-drain-file, relocate pairing into server.ts) were considered and all rejected — each introduces platform-variance, second-writer, or new-IPC-trust-boundary costs disproportionate to the value of one observational event. Chosen approach: `server.ts getAccess()` (already called on every inbound message) holds a module-level `prevAllowFrom` snapshot and diffs the current `allowFrom` against it on each read; every newly-added user id produces one `pairing.accepted` event with `{ user: userId }` payload. First call seeds the baseline without emitting — subsequent reads detect deltas. The diff logic lives in a pure `detectNewAllowFrom(prev, current)` primitive in `lib.ts` (10 new unit tests). Properties: platform-agnostic, first-call-safe (no boot-time event spam for pre-existing allowlist entries), tamper-resistant by construction (fires on any `allowFrom` growth regardless of path — skill, manual edit, or tampering), silent on removal (no `pairing.removed` kind exists and none invented). Design rationale documented in `000-docs/audit-journal-architecture.md §pairing-events`.
