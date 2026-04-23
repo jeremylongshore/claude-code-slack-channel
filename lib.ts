@@ -659,12 +659,9 @@ export function defaultAccess(): Access {
  *  only need the side-effect can ignore it. */
 export function pruneExpired(access: Access): Array<[string, PendingEntry]> {
   const now = Date.now()
-  const pruned: Array<[string, PendingEntry]> = []
-  for (const [code, entry] of Object.entries(access.pending)) {
-    if (entry.expiresAt <= now) {
-      pruned.push([code, entry])
-      delete access.pending[code]
-    }
+  const pruned = Object.entries(access.pending).filter(([, entry]) => entry.expiresAt <= now)
+  for (const [code] of pruned) {
+    delete access.pending[code]
   }
   return pruned
 }
