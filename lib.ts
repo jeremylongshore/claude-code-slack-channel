@@ -684,14 +684,7 @@ export function detectNewAllowFrom(
   current: readonly string[],
 ): string[] {
   if (prev === null) return []
-  const seen = new Set<string>()
-  const additions: string[] = []
-  for (const userId of current) {
-    if (prev.has(userId) || seen.has(userId)) continue
-    additions.push(userId)
-    seen.add(userId)
-  }
-  return additions
+  return [...new Set(current)].filter((userId) => !prev.has(userId))
 }
 
 export function generateCode(): string {
