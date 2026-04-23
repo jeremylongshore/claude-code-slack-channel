@@ -1381,9 +1381,7 @@ describe('pruneExpired', () => {
       },
     })
     const pruned = pruneExpired(access)
-    expect(pruned).toHaveLength(1)
-    expect(pruned[0]![0]).toBe('OLD')
-    expect(pruned[0]![1]).toEqual(oldEntry)
+    expect(pruned).toEqual([['OLD', oldEntry]])
   })
 
   test('returned entries carry chatId for journaling (ccsc-rc1)', () => {
