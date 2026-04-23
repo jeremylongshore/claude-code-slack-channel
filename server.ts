@@ -33,6 +33,7 @@ import {
   chunkText,
   decidePermissionRoute,
   defaultAccess,
+  detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
@@ -262,6 +263,14 @@ if (STATIC_MODE) {
   }
 }
 
+// Prior-read snapshot of `access.allowFrom` used to detect newly-added
+// entries and emit `pairing.accepted` on the next `getAccess()` after
+// the `/slack-channel:access pair` skill mutates the file (ccsc-scv).
+// `null` until the first call seeds the baseline — the first read
+// produces no events, later reads diff against this set. See
+// 000-docs/audit-journal-architecture.md §pairing-events.
+let prevAllowFrom: ReadonlySet<string> | null = null
+
 function getAccess(): Access {
   if (STATIC_MODE && staticAccess) return staticAccess
   const access = loadAccess()
@@ -277,6 +286,21 @@ function getAccess(): Access {
       input: { channel: entry.chatId },
     })
   }
+  // Journal each new `allowFrom` addition as pairing.accepted
+  // (ccsc-scv). Fires on any growth of the set regardless of whether
+  // the skill, a manual edit, or a tampering operation caused it —
+  // this is stronger than tracking only skill-driven changes because
+  // it still records the delta. First call seeds the baseline without
+  // emitting; subsequent calls diff against `prevAllowFrom`.
+  for (const userId of detectNewAllowFrom(prevAllowFrom, access.allowFrom)) {
+    journalWrite({
+      kind: 'pairing.accepted',
+      outcome: 'n/a',
+      actor: 'system',
+      input: { user: userId },
+    })
+  }
+  prevAllowFrom = new Set(access.allowFrom)
   return access
 }
 

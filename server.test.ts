@@ -28,6 +28,7 @@ import {
   type ChannelPolicy,
   chunkText,
   defaultAccess,
+  detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
@@ -1417,6 +1418,62 @@ describe('pruneExpired', () => {
 // ---------------------------------------------------------------------------
 // generateCode()
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// detectNewAllowFrom() — ccsc-scv pairing.accepted diff primitive
+// ---------------------------------------------------------------------------
+
+describe('detectNewAllowFrom (ccsc-scv)', () => {
+  test('returns empty when prev is null (first-call baseline seed)', () => {
+    expect(detectNewAllowFrom(null, ['U1', 'U2'])).toEqual([])
+  })
+
+  test('returns empty when current matches prev', () => {
+    const prev = new Set(['U1', 'U2'])
+    expect(detectNewAllowFrom(prev, ['U1', 'U2'])).toEqual([])
+  })
+
+  test('returns single new user when allowFrom grows by one', () => {
+    const prev = new Set(['U1'])
+    expect(detectNewAllowFrom(prev, ['U1', 'U2'])).toEqual(['U2'])
+  })
+
+  test('returns multiple new users when allowFrom grows by several', () => {
+    const prev = new Set(['U1'])
+    expect(detectNewAllowFrom(prev, ['U1', 'U2', 'U3', 'U4'])).toEqual(['U2', 'U3', 'U4'])
+  })
+
+  test('returns empty when allowFrom shrinks (removal is not acceptance)', () => {
+    const prev = new Set(['U1', 'U2', 'U3'])
+    expect(detectNewAllowFrom(prev, ['U1'])).toEqual([])
+  })
+
+  test('only reports additions when additions and removals happen together', () => {
+    const prev = new Set(['U1', 'U2'])
+    // U2 removed, U3 added
+    expect(detectNewAllowFrom(prev, ['U1', 'U3'])).toEqual(['U3'])
+  })
+
+  test('deduplicates within current (duplicate entries never double-fire)', () => {
+    const prev = new Set(['U1'])
+    // U2 appears twice — should only produce one event
+    expect(detectNewAllowFrom(prev, ['U1', 'U2', 'U2'])).toEqual(['U2'])
+  })
+
+  test('returns empty when prev is empty set and current is empty', () => {
+    expect(detectNewAllowFrom(new Set(), [])).toEqual([])
+  })
+
+  test('returns all of current when prev is empty set and current has entries', () => {
+    expect(detectNewAllowFrom(new Set(), ['U1', 'U2'])).toEqual(['U1', 'U2'])
+  })
+
+  test('preserves insertion order from current (not prev order)', () => {
+    const prev = new Set(['U1'])
+    // U3 before U2 in current — output should follow current's order
+    expect(detectNewAllowFrom(prev, ['U1', 'U3', 'U2'])).toEqual(['U3', 'U2'])
+  })
+})
 
 describe('generateCode', () => {
   test('returns 6-character string', () => {

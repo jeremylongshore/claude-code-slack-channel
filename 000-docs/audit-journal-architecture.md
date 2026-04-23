@@ -326,6 +326,138 @@ writer. No one else opens the file.
 
 ---
 
+## Pairing events (ccsc-rc1 / ccsc-scv)
+
+The journal declares three `pairing.*` event kinds. Wiring them into the
+running server is not uniform, because pairing state lives in
+`access.json` and two of the three lifecycle transitions happen outside
+the server process. The table below pins the emission site for each.
+
+| Event | Trigger | Emission site | Ships in |
+|---|---|---|---|
+| `pairing.issued` | Unknown Slack user DMs the bot; server allocates a pending code | `server.ts` pair-handler in `handleMessage` | v0.5.0 |
+| `pairing.expired` | `pending[code].expiresAt <= Date.now()` on next `getAccess()` | `server.ts getAccess()` after `pruneExpired()` | ccsc-rc1 (PR #149) |
+| `pairing.accepted` | `/slack-channel:access pair <code>` adds the sender to `allowFrom` | `server.ts getAccess()` via allowFrom snapshot diff | ccsc-scv |
+
+### Why pairing.accepted needs a diff, not a direct emit
+
+`/slack-channel:access pair <code>` is a Claude Code skill. It runs in
+Claude's process space, not in the running MCP server's process. It
+mutates `access.json` directly (atomic write, mode `0o600`) and the
+server only observes the change on its next load. There is no IPC
+channel from the skill back to the server, and inventing one would
+introduce a new trust boundary for a single observational event.
+
+Three designs were considered when scoping ccsc-scv:
+
+1. **File-watcher** — `server.ts` installs `fs.watch` on `access.json`,
+   diffs the prev/next state on each change event. Pros: responsive.
+   Cons: `fs.watch` behavior varies across platforms and filesystems
+   (FAT, SMB mounts, Docker bind-mounts), debouncing is required to
+   collapse rename-tmp-to-target saves, and a broken watcher fails
+   silently.
+2. **Skill writes a journal-drain file** — the skill appends a
+   `pairing.accepted` record to a sidecar file the server drains on
+   startup and on demand. Pros: no race, no platform variance. Cons:
+   introduces a second writer to the audit surface, complicates the
+   hash-chain story (who seals the event?), and makes the skill itself
+   a contributor to the append log.
+3. **Relocate pairing into the server process** — skill becomes a thin
+   CLI shim that signals the server (SIGUSR1 + staging file, named
+   pipe, or local HTTP) to perform the mutation. Pros: single writer.
+   Cons: largest surface area change; adds a new IPC attack vector
+   with its own gate + authorization contract; inverts the current
+   separation where the skill is the only thing that can approve
+   pairings.
+
+### The chosen approach: lazy snapshot diff in `getAccess()`
+
+`server.ts getAccess()` already runs on every inbound message (it is
+how the server observes `access.json` edits). The same hot path that
+calls `pruneExpired()` and journals `pairing.expired` can hold a
+module-level snapshot of the prior `allowFrom` set, compute the
+difference against the current one, and emit one `pairing.accepted`
+per newly-added user id.
+
+Pseudocode (see `server.ts` for the real wiring):
+
+```
+let prevAllowFrom: ReadonlySet<string> | null = null
+
+function getAccess() {
+  const access = loadAccess()
+  for (const [, entry] of pruneExpired(access)) journal(pairing.expired, ...)
+  if (prevAllowFrom !== null) {
+    for (const userId of detectNewAllowFrom(prevAllowFrom, access.allowFrom)) {
+      journal(pairing.accepted, { user: userId })
+    }
+  }
+  prevAllowFrom = new Set(access.allowFrom)
+  return access
+}
+```
+
+Properties this gives us:
+
+- **Platform-agnostic.** No filesystem watcher; the existing `loadAccess()`
+  round-trip carries the signal. Works on every supported platform and
+  every filesystem layout.
+- **First-call baseline.** The first `getAccess()` after boot seeds the
+  snapshot without emitting events; this avoids spamming the journal
+  with the entire pre-existing `allowFrom` on every process restart.
+- **Tamper-resistant by construction.** The diff fires on any
+  `allowFrom` growth, not just skill-driven additions. If an operator
+  edits `access.json` by hand or an attacker tampers with the file,
+  the server's next hot-path read sees the delta and records it. This
+  is stronger than Options 2 or 3, which are skill-/IPC-scoped.
+- **Lazy and bounded in latency.** Detection is gated by the next
+  inbound message. In practice `getAccess()` runs within seconds of
+  any meaningful activity, so the audit entry arrives close to the
+  acceptance time. The event timestamp reflects detection, not
+  acceptance; operators who need the exact acceptance moment read the
+  `access.json` mtime in parallel.
+- **Semantic on the event name.** `pairing.accepted` fires on any
+  `allowFrom` addition, regardless of which path (pair code, `access
+  add <user_id>`, or manual edit) caused it. In practice every
+  production path goes through the skill, but the event name is a
+  statement about the state transition, not the command that drove
+  it. This keeps the implementation trivial and the invariant clear:
+  *an `allowFrom` addition always produces exactly one
+  `pairing.accepted`*.
+- **Removal is silent.** Entries leaving `allowFrom` are not a pairing
+  event; no `pairing.removed` kind exists and we do not invent one.
+  The declared set stays at 19 kinds.
+
+Edge cases the implementation handles:
+
+- **Duplicates in the input array.** `access.allowFrom` is a `string[]`
+  and callers are not required to deduplicate. The snapshot + diff use
+  `Set` semantics, so a duplicate value never produces a second event.
+- **Pre-existing entries at boot.** The first `getAccess()` call
+  establishes the baseline by setting `prevAllowFrom = new Set(...)`
+  before any comparison runs. Entries present at boot produce no
+  events; only growth *after* boot is journaled.
+- **Static mode.** `getAccess()` short-circuits to the frozen
+  `staticAccess` without re-reading the file. In static mode the
+  allowlist does not grow at runtime, so no diff is needed and none is
+  performed.
+- **Concurrent boot race.** The snapshot is initialized on the first
+  `getAccess()` call, not at module load. The window between server
+  boot and first message is a window where an acceptance would be
+  missed — but this is identical to the `pairing.issued` behaviour
+  (no events fire before the socket is up), so symmetry is preserved.
+
+### The detection primitive
+
+The pure diff is factored into `detectNewAllowFrom(prev, current)` in
+`lib.ts`. It takes the prior snapshot (`ReadonlySet<string> | null`)
+and the current `allowFrom` array, and returns the new user ids. When
+`prev` is `null` (no baseline yet) it returns `[]` — the
+first-call-seeds-baseline contract lives in this function rather than
+in the server wiring.
+
+---
+
 ## Non-goals
 
 - **Not a log aggregator.** One host, one file.

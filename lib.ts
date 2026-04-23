@@ -666,6 +666,34 @@ export function pruneExpired(access: Access): Array<[string, PendingEntry]> {
   return pruned
 }
 
+/** Compute the set of user ids newly present in `current` compared to
+ *  the `prev` snapshot. Used by `server.ts getAccess()` to emit one
+ *  `pairing.accepted` event per new `allowFrom` entry between reads.
+ *
+ *  When `prev` is `null` the caller has not yet seeded a baseline —
+ *  return `[]` so the first call produces no events. Subsequent calls
+ *  diff against the previously-captured set. Duplicates in `current`
+ *  never produce a second event because Set membership is checked
+ *  against `prev` only; if a user id is already present in `prev` it
+ *  is excluded regardless of how many times it appears in `current`.
+ *
+ *  See 000-docs/audit-journal-architecture.md §pairing-events for the
+ *  full design rationale (ccsc-scv). */
+export function detectNewAllowFrom(
+  prev: ReadonlySet<string> | null,
+  current: readonly string[],
+): string[] {
+  if (prev === null) return []
+  const seen = new Set<string>()
+  const additions: string[] = []
+  for (const userId of current) {
+    if (prev.has(userId) || seen.has(userId)) continue
+    additions.push(userId)
+    seen.add(userId)
+  }
+  return additions
+}
+
 export function generateCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789' // No 0/O/1/I confusion
   let code = ''
