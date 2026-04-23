@@ -1343,6 +1343,77 @@ describe('pruneExpired', () => {
     pruneExpired(access)
     expect(Object.keys(access.pending)).toHaveLength(0)
   })
+
+  test('returns empty array when nothing expired (ccsc-rc1)', () => {
+    const access = makeAccess({
+      pending: {
+        LIVE: {
+          senderId: 'U1',
+          chatId: 'D1',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 999999,
+          replies: 1,
+        },
+      },
+    })
+    const pruned = pruneExpired(access)
+    expect(pruned).toEqual([])
+  })
+
+  test('returns [code, entry] pairs for expired entries (ccsc-rc1)', () => {
+    const oldEntry = {
+      senderId: 'U_OLD',
+      chatId: 'D_OLD',
+      createdAt: 0,
+      expiresAt: 1,
+      replies: 3,
+    }
+    const access = makeAccess({
+      pending: {
+        OLD: oldEntry,
+        FRESH: {
+          senderId: 'U_FRESH',
+          chatId: 'D_FRESH',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 999999,
+          replies: 1,
+        },
+      },
+    })
+    const pruned = pruneExpired(access)
+    expect(pruned).toHaveLength(1)
+    expect(pruned[0]![0]).toBe('OLD')
+    expect(pruned[0]![1]).toEqual(oldEntry)
+  })
+
+  test('returned entries carry chatId for journaling (ccsc-rc1)', () => {
+    const access = makeAccess({
+      pending: {
+        A: {
+          senderId: 'U_A',
+          chatId: 'D_A',
+          createdAt: 0,
+          expiresAt: 1,
+          replies: 1,
+        },
+        B: {
+          senderId: 'U_B',
+          chatId: 'D_B',
+          createdAt: 0,
+          expiresAt: 1,
+          replies: 1,
+        },
+      },
+    })
+    const pruned = pruneExpired(access)
+    const chatIds = pruned.map(([, entry]) => entry.chatId).sort()
+    expect(chatIds).toEqual(['D_A', 'D_B'])
+  })
+
+  test('returns empty array when pending is empty (ccsc-rc1)', () => {
+    const access = makeAccess()
+    expect(pruneExpired(access)).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------

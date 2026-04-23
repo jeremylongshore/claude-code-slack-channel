@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pairing.expired` journal events** (`ccsc-rc1`). `lib.ts pruneExpired()` now returns the `[code, entry]` tuples it removed (previously `void`); `server.ts getAccess()` iterates that return and emits one `pairing.expired` event per expiry (minimal-disclosure payload: `{ channel: entry.chatId }`, matching the `pairing.issued` shape). Static-mode boot-time pruning remains silent because the journal isn't open at module-load time — static mode downgrades `dmPolicy` to `allowlist`, so no new pending entries are created after boot and residue is cleared once without an audit trace (documented inline). Audit EventKind coverage moves from 17/19 to 18/19 of the v0.5.0-declared kinds — `pairing.accepted` remains unwired (tracked in `ccsc-scv`, which needs an IPC design decision since the skill runs outside the server process). Four new unit tests in `server.test.ts` cover the new return value (empty pending, nothing-expired, mixed expired/live, multiple expiries).
+
 ### Changed
 
 - **`JournalWriter.open()` — reverse-chunk tail read + single file handle** (`ccsc-otd`). Replaces the full `readFileSync` of the audit log (used only to recover `lastHash` and `nextSeq` from the last line) with a 64 KiB reverse-chunk scan from EOF backwards until the last newline boundary is found. Drops startup memory from O(file size) to O(last line size). Also unifies the previous read-then-fsOpen pair into one `fsOpen('a+', 0o600)` handle: reads use explicit `position` so they don't disturb the append pointer, and writes still go through O_APPEND (atomic EOF writes preserved). The single-handle design incidentally closes the stat-then-use TOCTOU window that triggered the earlier CodeQL `js/file-system-race` pattern on this path. Four new tests in `server.test.ts` exercise the reverse-scan edge cases (pre-existing empty file, trailing-newlines-only, last line straddling a chunk boundary, last line larger than one chunk).

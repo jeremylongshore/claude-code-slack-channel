@@ -250,6 +250,11 @@ let staticAccess: Access | null = null
 
 if (STATIC_MODE) {
   staticAccess = loadAccess()
+  // Boot-time prune: journal is not open yet at module-load time, so
+  // expiries detected here cannot emit pairing.expired. Static mode
+  // downgrades dmPolicy from 'pairing' to 'allowlist' below, so no new
+  // pending entries are created after boot — leftover entries are
+  // pre-boot residue and are cleared silently.
   pruneExpired(staticAccess)
   // Downgrade pairing to allowlist in static mode
   if (staticAccess.dmPolicy === 'pairing') {
@@ -260,7 +265,18 @@ if (STATIC_MODE) {
 function getAccess(): Access {
   if (STATIC_MODE && staticAccess) return staticAccess
   const access = loadAccess()
-  pruneExpired(access)
+  // Journal every expiry surfaced by this prune so the audit log
+  // records pairing lifecycle closure (ccsc-rc1). Matches the payload
+  // shape used by `pairing.issued` at the pair-handling site —
+  // minimal disclosure, just the originating channel.
+  for (const [, entry] of pruneExpired(access)) {
+    journalWrite({
+      kind: 'pairing.expired',
+      outcome: 'n/a',
+      actor: 'system',
+      input: { channel: entry.chatId },
+    })
+  }
   return access
 }
 

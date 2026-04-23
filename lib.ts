@@ -650,13 +650,23 @@ export function defaultAccess(): Access {
   }
 }
 
-export function pruneExpired(access: Access): void {
+/** Prune expired pending pairings and return what was removed.
+ *
+ *  Mutates `access.pending` in place by deleting entries whose
+ *  `expiresAt <= Date.now()`. Returns the `[code, entry]` tuples that
+ *  were removed so callers can journal a `pairing.expired` event per
+ *  expiry (ccsc-rc1). The return value is advisory — callers that
+ *  only need the side-effect can ignore it. */
+export function pruneExpired(access: Access): Array<[string, PendingEntry]> {
   const now = Date.now()
+  const pruned: Array<[string, PendingEntry]> = []
   for (const [code, entry] of Object.entries(access.pending)) {
     if (entry.expiresAt <= now) {
+      pruned.push([code, entry])
       delete access.pending[code]
     }
   }
+  return pruned
 }
 
 export function generateCode(): string {
