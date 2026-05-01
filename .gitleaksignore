@@ -25,3 +25,12 @@ d532b79d9dff7aaf5861289c21fed390d2ddf239:server.test.ts:aws-access-token:3470
 cfd008ff32c10937c2d1de4518cd7c3692a6ef2b:server.test.ts:jwt:5928
 # Same fixture, merged-to-main SHA from PR #143 squash/rebase:
 dd7a3aeb44cdfcdc4c1010608184a06dc3b7e797:server.test.ts:jwt:5928
+
+# bd-managed memory entries in .beads/issues.jsonl have high-entropy
+# free-text "value" fields (state observations) that gitleaks
+# fingerprints as generic-api-key. The bd hook auto-stages this file
+# on every commit. Cross-repo / structural fix tracked at OPS-x6n in
+# intentsolutions-vps-runbook (proper solution = .gitleaks.toml path
+# allowlist for ^\.beads/, doesn't require re-fingerprinting on every
+# memory change).
+14e960146b419d2ed9d3cb99e44b604b7f196d2f:.beads/issues.jsonl:generic-api-key:199
