@@ -290,3 +290,22 @@ bd close <id>         # Complete work
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+## Testing baseline (2026-05-01 — Intent Solutions Testing SOP)
+
+This repo participates in the **Intent Solutions Testing SOP** per `~/.claude/CLAUDE.md` § "Intent Solutions Testing SOP" and the VPS-as-the-home program (`OPS-5nm`, Priority 6).
+
+**Installed**: `@intentsolutions/audit-harness v0.1.0` vendored at `.audit-harness/` with wrapper at `scripts/audit-harness`. Hash-pinning + escape-scan ride along the in-repo install — never reference `~/.claude/` paths from hooks or CI.
+
+**Commands**:
+
+```bash
+scripts/audit-harness verify          # exit 2 = HARNESS_TAMPERED
+scripts/audit-harness init            # initialize / re-init hash manifest
+scripts/audit-harness list            # show pinned files
+scripts/audit-harness escape-scan --staged   # scan a diff for escape attempts
+```
+
+**Next step**: run `/audit-tests` to produce `TEST_AUDIT.md` and (if gaps) hand off to `/implement-tests`. See `000-docs/audit-harness-test-baseline-2026-05-01.md` for the per-repo baseline filed during P6.
+
+**Upgrade**: `AUDIT_HARNESS_VERSION=vX.Y.Z curl -sSL https://raw.githubusercontent.com/jeremylongshore/audit-harness/main/install.sh | bash`. Or run `/sync-testing-harness` from any session.

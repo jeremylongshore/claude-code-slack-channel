@@ -1,0 +1,28 @@
+# gitleaks config — repo-specific overrides on top of the default ruleset.
+#
+# This file is loaded by the gitleaks-action workflow when present; defaults
+# remain in effect for everything not whitelisted here.
+#
+# Why this exists
+# ===============
+# The bd (beads) pre-commit hook auto-stages `.beads/issues.jsonl` on every
+# commit so memory state syncs cross-machine. bd memory entries store
+# free-text "value" fields like state observations and design rationale,
+# which often have high enough entropy to trip gitleaks's `generic-api-key`
+# rule. Path-based allowlist beats fingerprint-by-fingerprint because
+# every new memory addition would otherwise need a new entry in
+# .gitleaksignore.
+#
+# Cross-repo tracking issue: OPS-x6n in intentsolutions-vps-runbook.
+
+title = "claude-code-slack-channel gitleaks config"
+
+[extend]
+# Inherit gitleaks's default rule set.
+useDefault = true
+
+[allowlist]
+description = "Allowlist bd memory file + intent-solutions repo-config noise"
+paths = [
+    '''^\.beads/.*''',
+]
