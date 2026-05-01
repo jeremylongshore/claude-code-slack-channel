@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# audit-harness — vendored shell wrapper (non-Node repos).
+# Mirrors the Node CLI at https://www.npmjs.com/package/@intentsolutions/audit-harness
+# but dispatches directly to the scripts in .audit-harness/scripts/.
+
+set -euo pipefail
+
+HARNESS_DIR="$(cd "$(dirname "$0")/.." && pwd)/.audit-harness"
+SCRIPTS="${HARNESS_DIR}/scripts"
+
+if [[ ! -d "${SCRIPTS}" ]]; then
+  echo "✗ audit-harness: scripts not found at ${SCRIPTS}" >&2
+  echo "  re-run the installer: curl -sSL https://raw.githubusercontent.com/jeremylongshore/audit-harness/main/install.sh | bash" >&2
+  exit 2
+fi
+
+usage() {
+  cat <<'USAGE'
+audit-harness — deterministic test-enforcement toolkit (vendored)
+
+Usage:
+  scripts/audit-harness <command> [args...]
+
+Commands:
+  verify                   Verify hash-pinned artifacts (exit 2 = HARNESS_TAMPERED)
+  init                     Initialize or re-init the .harness-hash manifest
+  list                     List currently pinned files
+  escape-scan <source>     Scan a diff for escape attempts
+  arch                     Run architecture-rule checks
+  bias                     Count test-bias patterns
+  gherkin-lint             Advisory Gherkin quality check
+  crap [args...]           CRAP scorer (requires python3 + radon/gocyclo)
+  --version, -v            Print installed version
+  --help, -h               This help
+USAGE
+}
+
+cmd="${1:-}"
+shift || true
+
+case "${cmd}" in
+  verify)       exec bash "${SCRIPTS}/harness-hash.sh" --verify "$@" ;;
+  init)         exec bash "${SCRIPTS}/harness-hash.sh" --init "$@" ;;
+  list)         exec bash "${SCRIPTS}/harness-hash.sh" --list "$@" ;;
+  escape-scan)  exec bash "${SCRIPTS}/escape-scan.sh" "$@" ;;
+  arch)         exec bash "${SCRIPTS}/arch-check.sh" "$@" ;;
+  bias)         exec bash "${SCRIPTS}/bias-count.sh" "$@" ;;
+  gherkin-lint) exec bash "${SCRIPTS}/gherkin-lint.sh" "$@" ;;
+  crap)         exec python3 "${SCRIPTS}/crap-score.py" "$@" ;;
+  --version|-v) cat "${HARNESS_DIR}/VERSION" 2>/dev/null || echo "unknown" ;;
+  --help|-h|'') usage; exit 0 ;;
+  *)
+    echo "✗ audit-harness: unknown command '${cmd}'" >&2
+    usage
+    exit 2
+    ;;
+esac
