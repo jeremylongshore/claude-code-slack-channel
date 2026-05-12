@@ -8,6 +8,25 @@
   },
   "repository": "https://github.com/jeremylongshore/claude-code-slack-channel",
   "license": "MIT",
-  "keywords": ["slack", "channel", "mcp", "socket-mode", "chatops", "claude-code"],
-  "mcpServers": ".mcp.json"
+  "keywords": [
+    "slack",
+    "channel",
+    "mcp",
+    "socket-mode",
+    "chatops",
+    "claude-code"
+  ],
+  "mcpServers": {
+    "slack": {
+      "command": "bun",
+      "args": [
+        "run",
+        "--cwd",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "--shell=bun",
+        "--silent",
+        "start"
+      ]
+    }
+  }
 }
