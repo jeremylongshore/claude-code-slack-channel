@@ -8,5 +8,6 @@
   },
   "repository": "https://github.com/jeremylongshore/claude-code-slack-channel",
   "license": "MIT",
-  "keywords": ["slack", "channel", "mcp", "socket-mode", "chatops", "claude-code"]
+  "keywords": ["slack", "channel", "mcp", "socket-mode", "chatops", "claude-code"],
+  "mcpServers": ".mcp.json"
 }

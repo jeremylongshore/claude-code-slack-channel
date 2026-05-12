@@ -41,6 +41,17 @@ jobs:
       - name: Test
         run: bun test
 
+      - name: Validate marketplace packaging contract
+        run: |
+          test -f .claude-plugin/plugin.json
+          test -f .mcp.json
+          python3 -m json.tool .claude-plugin/plugin.json > /dev/null
+          python3 -m json.tool .mcp.json > /dev/null
+          python3 -m json.tool package.json > /dev/null
+          node -e "const p=require('./package.json'); for (const f of ['.mcp.json','.claude-plugin/plugin.json','server.ts','package.json']) if (!p.files.includes(f)) throw new Error('package.json files missing '+f); if (!p.scripts.start.includes('--ignore-scripts') || !p.scripts.start.includes('>/dev/null')) throw new Error('start script must be cache/MCP safe')"
+          node -e "const m=require('./.claude-plugin/plugin.json'); if (m.mcpServers !== '.mcp.json') throw new Error('plugin manifest must reference .mcp.json so marketplace sync includes the channel launch config')"
+          node -e 'const m=require("./.mcp.json"); const s=m.mcpServers?.slack; if (s?.command !== "bun") throw new Error("slack channel must launch through bun so cache-local dependency install runs first"); if (!s.args?.includes("--cwd") || !s.args?.includes("${CLAUDE_PLUGIN_ROOT}") || !s.args?.includes("--silent") || !s.args?.includes("start")) throw new Error("slack channel launch args must run start from ${CLAUDE_PLUGIN_ROOT} silently")'
+
       - name: Coverage floor (≥95% line + function)
         run: bash scripts/coverage-floor.sh 95
 

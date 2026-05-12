@@ -53,6 +53,7 @@ my-channel/
 - Skills use `skills/<name>/SKILL.md` (directory-per-skill), NOT flat files
 - `.claude-plugin/` contains ONLY `plugin.json` — nothing else goes in there
 - All other directories (`skills/`, `commands/`, `agents/`, `hooks/`) go at the plugin root
+- Channel plugins should declare `"mcpServers": ".mcp.json"` in `plugin.json` so marketplace sync treats the hidden launch file as a required component, not an incidental dotfile
 
 ---
 
@@ -67,9 +68,12 @@ Minimal fields only. Ownership metadata lives in `package.json` and git.
   "name": "slack",
   "version": "0.1.0",
   "description": "Two-way Slack channel for Claude Code — chat from Slack DMs and channels via Socket Mode",
-  "keywords": ["slack", "channel", "mcp", "socket-mode"]
+  "keywords": ["slack", "channel", "mcp", "socket-mode"],
+  "mcpServers": ".mcp.json"
 }
 ```
+
+The `mcpServers` field is load-bearing for marketplace installs: it makes `.mcp.json` an explicitly referenced plugin component, which prevents community marketplace packaging from silently omitting the hidden file during cache sync.
 
 **Reference (Telegram):**
 ```json
@@ -116,8 +120,18 @@ Tells Claude Code how to spawn the MCP server subprocess.
   "license": "MIT",
   "type": "module",
   "bin": "./server.ts",
+  "files": [
+    ".claude-plugin/plugin.json",
+    ".mcp.json",
+    "ACCESS.md",
+    "LICENSE",
+    "README.md",
+    "bun.lock",
+    "server.ts",
+    "skills/**"
+  ],
   "scripts": {
-    "start": "bun install --no-summary && bun server.ts"
+    "start": "bun install --production --ignore-scripts --no-summary >/dev/null && bun server.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
@@ -130,7 +144,8 @@ Tells Claude Code how to spawn the MCP server subprocess.
 **Key conventions from Telegram/Discord:**
 - `name`: `claude-channel-{platform}` — NO `@anthropic` or `@org` scope (community plugins must not use Anthropic's npm scope)
 - `bin`: `"./server.ts"` — points to the server entry
-- `start` script: `"bun install --no-summary && bun server.ts"` — installs deps first (plugin cache may not have `node_modules`), then runs the server
+- `start` script: `"bun install --production --ignore-scripts --no-summary >/dev/null && bun server.ts"` — installs production deps first (plugin cache may not have `node_modules`), silences install stdout so MCP stdio is not corrupted, then runs the server
+- `files`: includes `.mcp.json` and runtime source files so npm-style or marketplace-style packaging cannot omit the channel launch config
 - Only `dependencies` needed — no `devDependencies` in the reference implementations
 - `author` and `repository` fields are optional but recommended for community plugins
 
@@ -469,9 +484,11 @@ jobs:
 ## Checklist Before Submission
 
 - [ ] `plugin.json` has `name`, `version`, `description`, `keywords`
+- [ ] `plugin.json` declares `"mcpServers": ".mcp.json"`
 - [ ] `.mcp.json` uses `${CLAUDE_PLUGIN_ROOT}` and `--silent` flag
+- [ ] `package.json` `files` includes `.mcp.json`, `.claude-plugin/plugin.json`, `server.ts`, and `skills/**`
 - [ ] `package.json` has no `@anthropic` scope, correct author/repo
-- [ ] `package.json` start script: `"bun install --no-summary && bun server.ts"`
+- [ ] `package.json` start script: `"bun install --production --ignore-scripts --no-summary >/dev/null && bun server.ts"`
 - [ ] Skills use `skills/<name>/SKILL.md` directory structure
 - [ ] Skills have `allowed-tools` in YAML array syntax
 - [ ] `server.ts` declares `claude/channel` capability

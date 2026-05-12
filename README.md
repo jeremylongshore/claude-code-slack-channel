@@ -8,7 +8,7 @@ Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channe
 
 **Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.8.0)
 
-> **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login.
+> **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login. During the preview, marketplace-installed channel plugins must be allowlisted by Claude Code; use the development-channel command below for local testing of a fork.
 
 ## How It Works
 
@@ -57,19 +57,23 @@ Pick your runtime:
 #### Option A: Bun (recommended)
 
 ```bash
+# Official/allowlisted marketplace install:
+/plugin install slack-channel@claude-code-plugins-plus
+claude --channels plugin:slack-channel@claude-code-plugins-plus
+
+# Local fork / preview testing (not allowlisted):
 bun install
-# Current (claude-code-plugins marketplace):
-claude --channels plugin:slack-channel@claude-code-plugins
-# Future (after upstream approval):
-# claude --channels plugin:slack-channel@claude-plugins-official
+claude --dangerously-load-development-channels server:slack
 ```
+
+The marketplace package must include `.mcp.json`; the plugin manifest also declares `"mcpServers": ".mcp.json"` so cache sync treats the launch config as a required plugin component. `.mcp.json` launches `bun run --cwd ${CLAUDE_PLUGIN_ROOT} --shell=bun --silent start`, and `start` installs cache-local production dependencies before running `server.ts`. Dependency-install stdout is redirected away and lifecycle scripts are skipped so they cannot corrupt the MCP stdio stream or fail because the cache is not a git checkout.
 
 #### Option B: Node.js / npx
 
 ```bash
 npm install
-# In .mcp.json, change command to: "npx", args: ["tsx", "server.ts"]
-claude --channels plugin:slack-channel@claude-code-plugins
+# For local development only: npx tsx server.ts
+claude --dangerously-load-development-channels server:slack
 ```
 
 #### Option C: Docker
@@ -77,7 +81,7 @@ claude --channels plugin:slack-channel@claude-code-plugins
 ```bash
 docker build -t claude-slack-channel .
 # In .mcp.json, change command to: "docker", args: ["run", "--rm", "-i", "-v", "~/.claude/channels/slack:/state", "claude-slack-channel"]
-claude --channels plugin:slack-channel@claude-code-plugins
+claude --dangerously-load-development-channels server:slack
 ```
 
 ### 4. Pair Your Account
