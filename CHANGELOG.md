@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`reply` tool — pass `filename` to Slack file uploads**. `server.ts` was calling `WebClient.filesUploadV2()` with `{ channel_id, file: <absolute path> }` but never setting `filename`. The `@slack/web-api` v2 upload flow does not infer the filename from the `file` path when it's a string — Slack defaults to `file.txt`, which means every uploaded asset (PNG, HTML, MD, PDF, etc.) was delivered to recipients as a `.txt` download with the wrong mimetype. Adds `filename: basename(resolved)` to the upload args so the original filename and inferred mimetype are preserved end-to-end. Imports `basename` from `node:path` (already imports `resolve` from the same module).
+
 ### Security
 
 - **Cleared 6 high-severity transitive dep CVEs** (`ccsc-7lh`). Bumped `@slack/web-api` 7.15.0 → 7.15.2 (brings axios `^1.15.0` → 1.16.1) and `@modelcontextprotocol/sdk` 1.27.1 → 1.29.0 (brings ajv with fresh fast-uri ≥3.1.2). Added a top-level `overrides` block pinning `axios ^1.16.1` and `fast-uri ^3.1.2` so the lockfile cannot regress on transitive selection. Addresses: 4 axios CVEs (GHSA-q8qp-cvcw-x6jj prototype pollution → credential injection, GHSA-pmwg-cvhr-8vh7 NO_PROXY bypass via 127.0.0.0/8, GHSA-pf86-5x62-jrwf response-tampering gadgets, GHSA-6chq-wfr3-2hj9 header injection) and 2 fast-uri CVEs (GHSA-v39h-62p7-jpjc host confusion, GHSA-q3j6-qgpj-74h6 path traversal). `bun audit --audit-level=high --ignore=GHSA-j3q9-mxjg-w52f` is now clean. All 704 tests pass; coverage, depcruise, gherkin-lint, harness-hash, crap-score gates unchanged. Unblocks CI on main, PR #161 (dependabot codeql-action bump), and PR #162 (external `reply` filename fix).
