@@ -26,3 +26,11 @@ description = "Allowlist bd memory file + intent-solutions repo-config noise"
 paths = [
     '''^\.beads/.*''',
 ]
+# GHSA-XXXX-XXXX-XXXX identifiers are public GitHub Security Advisory IDs cited
+# in CHANGELOG/PR/doc entries for dep-CVE fixes. Their xxxx-xxxx-xxxx tail has
+# enough entropy to trip the `generic-api-key` rule, but they are by definition
+# published advisory IDs, not secrets. Match the canonical GHSA pattern so we
+# don't broadly exempt random tokens.
+regexes = [
+    '''GHSA(?:-[a-z0-9]{4}){3}''',
+]
