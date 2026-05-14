@@ -550,6 +550,33 @@ let reaperTimer: ReturnType<typeof setInterval> | null = null
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
 let lastActiveThread: string | undefined
+// Sprint 5+6 reaction lifecycle: track the ts of the most-recent inbound
+// message + the current reaction emoji on it so the lifecycle helper can
+// swap reactions without the caller needing to know the previous state.
+// Single-operator deployment safe; concurrent inbounds across channels
+// would race — fine for our use, addressed in a future patch.
+let lastActiveTs: string | undefined
+let lastActiveReaction: string | undefined
+
+// Transition the inbound's ack reaction to `next`. Best-effort removes
+// whatever reaction the broker last set (tracked in module state) and
+// then best-effort adds `next`. Either Slack API call may fail (rate
+// limit, missing reaction, etc.); reactions are UX polish, so we
+// swallow errors per the non-critical pattern used by the existing
+// reactions.add at the inbound site.
+async function setInboundReaction(
+  web: WebClient,
+  channel: string,
+  ts: string,
+  next: string,
+): Promise<void> {
+  if (lastActiveReaction === next) return
+  if (lastActiveReaction) {
+    try { await web.reactions.remove({ channel, timestamp: ts, name: lastActiveReaction }) } catch { /* non-critical */ }
+  }
+  try { await web.reactions.add({ channel, timestamp: ts, name: next }) } catch { /* non-critical */ }
+  lastActiveReaction = next
+}
 
 function assertOutboundAllowed(chatId: string, threadTs: string | undefined): void {
   libAssertOutboundAllowed(chatId, threadTs, getAccess(), deliveredThreads)
@@ -963,6 +990,13 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
       unfurl_media: false,
     })
     lastTs = (res.ts as string) || lastTs
+  }
+
+  // Sprint 5+6 reaction lifecycle: transition the inbound's reaction to
+  // :white_check_mark: now that the bot has posted a reply. Best-effort;
+  // failures don't propagate.
+  if (lastActiveChannel && lastActiveTs) {
+    await setInboundReaction(ctx.web, lastActiveChannel, lastActiveTs, 'white_check_mark')
   }
 
   // Upload files if provided
@@ -1663,7 +1697,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       INBOX_DIR,
       DEFAULT_CHUNK_LIMIT,
     }
-    return handler(args, ctx)
+    try {
+      return await handler(args, ctx)
+    } catch (toolErr) {
+      // Sprint 6 reaction lifecycle: tool execution threw → :x: on the
+      // operator's inbound. Best-effort; lifecycle update must not mask
+      // the original error.
+      if (lastActiveChannel && lastActiveTs) {
+        try { await setInboundReaction(web, lastActiveChannel, lastActiveTs, 'x') } catch { /* non-critical */ }
+      }
+      throw toolErr
+    }
   }
   return {
     content: [{ type: 'text', text: `Unknown tool: ${name}` }],
@@ -1869,6 +1913,11 @@ mcp.setNotificationHandler(
         // decision is authoritative even if the user-facing notice fails.
         console.error('[slack] policy.deny notice post failed:', postErr)
       }
+      // Sprint 6 reaction lifecycle: policy denied → :no_entry: on the
+      // operator's inbound message.
+      if (lastActiveChannel && lastActiveTs) {
+        await setInboundReaction(web, lastActiveChannel, lastActiveTs, 'no_entry')
+      }
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
         params: { request_id: params.request_id, behavior: 'deny' },
@@ -1961,6 +2010,15 @@ mcp.setNotificationHandler(
         },
       ],
     })
+
+    // Sprint 6 reaction lifecycle: approval prompt posted → :warning: on
+    // the operator's inbound to surface that the turn is awaiting input.
+    // When the operator clicks Allow and the bot replies, executeReply
+    // transitions to :white_check_mark:. When they click Deny, the
+    // button handler transitions to :no_entry:.
+    if (lastActiveChannel && lastActiveTs) {
+      await setInboundReaction(web, lastActiveChannel, lastActiveTs, 'warning')
+    }
   },
 )
 
@@ -2357,9 +2415,11 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     )
   }
 
-  // Track last active channel for permission relay
+  // Track last active channel + thread + ts for permission relay and
+  // reaction lifecycle transitions (Sprint 5+6).
   lastActiveChannel = channelId
   lastActiveThread = incomingThreadTs
+  lastActiveTs = ev.ts as string
 
   // Check for permission reply before normal delivery
   const msgText = ((ev.text as string) || '').trim()
@@ -2466,17 +2526,11 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
 
   const userName = await resolveUserName(ev.user as string)
 
-  // Ack reaction
+  // Ack reaction — Sprint 5+6 lifecycle: reset state for a fresh turn
+  // then transition to the configured ackReaction (default :eyes:).
   if (access.ackReaction) {
-    try {
-      await web.reactions.add({
-        channel: ev.channel as string,
-        timestamp: ev.ts as string,
-        name: access.ackReaction,
-      })
-    } catch {
-      /* non-critical */
-    }
+    lastActiveReaction = undefined
+    await setInboundReaction(web, ev.channel as string, ev.ts as string, access.ackReaction)
   }
 
   // Build meta attributes for the <channel> tag.
