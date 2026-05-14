@@ -2496,9 +2496,9 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     ts: ev.ts as string,
   }
 
-  if (ev.thread_ts) {
-    meta.thread_ts = ev.thread_ts as string
-  }
+  // Always reply in a thread: existing anchor if any, else the
+  // inbound message's own ts so the bot starts a new thread.
+  meta.thread_ts = (ev.thread_ts as string | undefined) ?? (ev.ts as string)
 
   const evFiles = ev.files as any[] | undefined
   if (evFiles?.length) {
