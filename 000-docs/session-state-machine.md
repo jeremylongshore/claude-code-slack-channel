@@ -313,6 +313,62 @@ Existing conversation history is preserved. No re-pairing required.
 
 ---
 
+## ACP-mapping (ccsc-21x)
+
+The [Agent Client Protocol (ACP)](https://agentclientprotocol.com/protocol/prompt-turn)
+is the converging cross-ecosystem JSON-RPC 2.0 standard for agent
+control. CCSC adopts ACP **additively only** — the supervisor's internal
+vocabulary (`activate` / `quiesce` / `deactivate` / `quarantine`) is
+unchanged. A single boundary adapter in `server.ts` translates ACP
+envelopes onto existing supervisor methods.
+
+The adapter is the ONLY place ACP terminology appears in this codebase.
+A vocabulary rename would break ~704 tests and the meaning of every
+existing entry in `audit.log` files in the field. The additive shape
+also means upstream (`anthropics/claude-code#53049`) shipping external
+message injection is a single-function-edit migration, not a rewrite.
+
+### `session/cancel` → `supervisor.quiesce(key)`
+
+| ACP envelope | CCSC internal | Notes |
+|---|---|---|
+| `method: "session/cancel"` | `supervisor.quiesce(key)` | Cooperative interrupt. The supervisor's promise resolves only after every in-flight save settles, matching ACP's "agent acknowledges with `cancelled` stop reason" shape. |
+| `params.sessionId` (opaque string) | `{ channel, thread }` parsed from `"<channel>:<thread>"` | Slack channel and thread IDs contain only alphanumerics and dots — `':'` is an unambiguous delimiter. |
+| `result.stopReason: "cancelled"` (success) | quiesce promise resolved | Adapter returns the ACP success envelope after the supervisor finishes. |
+| `error.code: -32600` Invalid Request | request shape failed Zod validation | Spec-compliant fallback id is `null` when the envelope is malformed. |
+| `error.code: -32602` Invalid params | sessionId missing colon, leading colon, or trailing colon | Surfaces the precise error code before the supervisor sees a malformed key. |
+| `error.code: -32603` Internal error | `supervisor.quiesce()` rejected (quarantined, save failure) | Reason captured in `error.data.reason`. |
+
+### What this adapter does NOT do
+
+- **Does not introduce ACP into the supervisor's API surface.** No
+  method renames, no new exports from `supervisor.ts`, no parameter
+  shape changes. The adapter sits entirely in `server.ts`.
+- **Does not adopt the ACP wire format.** This adapter takes a pre-parsed
+  request object as input and returns a pre-shaped response object. The
+  surrounding code in `server.ts` is responsible for the actual transport
+  (stdio framing, JSON parsing). The migration to ACP-on-the-wire is a
+  separate epic gated on the external-IPC primitive landing in Claude
+  Code (anthropics/claude-code#53049 currently closed-as-dup).
+- **Does not change session lifecycle semantics.** ACP `session/cancel`
+  is mapped onto the existing `quiesce` step. The full FSM transitions
+  described in [§ State diagram](#state-diagram) and [§ Restart semantics](#restart-semantics)
+  are unaffected.
+
+### Future ACP methods
+
+If/when ACP adds methods we want to surface, each gets its own thin
+adapter function alongside `mapAcpSessionCancel`. The adapter file
+stays small by design — it is the boundary, not a re-implementation
+of the supervisor.
+
+This is the same shape as the existing `manifest.ts` ↔ `policy.ts`
+isolation invariant (31-A.4): translation at the boundary, internal
+vocabulary unchanged. See [`bot-manifest-protocol.md`](bot-manifest-protocol.md)
+for the precedent and the `.dependency-cruiser.js` rule that enforces it.
+
+---
+
 ## Invariants
 
 Every 32-A PR is checked against these. Drift is a review block.
@@ -329,6 +385,10 @@ Every 32-A PR is checked against these. Drift is a review block.
 6. Two threads in one channel never share a mutex.
 7. Replies carry `thread_ts`; the outbound gate enforces match.
 8. Quarantine files a beads issue; operator sees it in `bd ready`.
+9. **ACP terminology appears only in the boundary adapter.** No method
+   in `supervisor.ts` is renamed to match ACP; no ACP wire-format
+   parsing happens outside `server.ts:mapAcpSessionCancel`. The
+   adapter is the single translation point — `ccsc-21x`.
 
 ---
 

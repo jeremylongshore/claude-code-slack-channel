@@ -9824,3 +9824,343 @@ describe('buildAndPostAuditReceipt unfurl flags (ccsc-y4e)', () => {
     expect(calls[0]!.unfurl_media).toBe(false)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ACP boundary adapter — ccsc-21x
+// ---------------------------------------------------------------------------
+//
+// mapAcpSessionCancel is the ONLY ACP-aware site in the codebase. These tests
+// pin (a) the JSON-RPC 2.0 envelope shape this adapter accepts, (b) the
+// error-code semantics (-32600 / -32602 / -32603), (c) that the supervisor's
+// internal vocabulary is unchanged — the adapter calls supervisor.quiesce()
+// and translates the outcome back into ACP terminology at the boundary.
+//
+// Inlined adapter (same pattern as activateAndTouch above) to avoid
+// triggering server.ts bootstrap side-effects in the test runner. When
+// server.ts changes the function body, this test copy must be updated.
+
+const AcpSessionCancelRequestSchemaTest = z.object({
+  jsonrpc: z.literal('2.0'),
+  id: z.union([z.string(), z.number()]),
+  method: z.literal('session/cancel'),
+  params: z.object({
+    sessionId: z.string().min(3).max(128),
+  }),
+})
+
+type AcpResponseTest =
+  | { jsonrpc: '2.0'; id: string | number; result: { stopReason: 'cancelled' } }
+  | {
+      jsonrpc: '2.0'
+      id: string | number
+      error: { code: number; message: string; data?: unknown }
+    }
+
+async function mapAcpSessionCancel(
+  req: unknown,
+  sup: import('./supervisor.ts').SessionSupervisor,
+): Promise<AcpResponseTest> {
+  const parsed = AcpSessionCancelRequestSchemaTest.safeParse(req)
+  if (!parsed.success) {
+    const reqRecord = (typeof req === 'object' && req !== null ? req : {}) as Record<
+      string,
+      unknown
+    >
+    const fallbackId =
+      typeof reqRecord.id === 'string' || typeof reqRecord.id === 'number' ? reqRecord.id : null
+    return {
+      jsonrpc: '2.0',
+      id: fallbackId as string | number,
+      error: { code: -32600, message: 'Invalid Request', data: { issues: parsed.error.issues } },
+    }
+  }
+  const { id, params } = parsed.data
+  const sep = params.sessionId.indexOf(':')
+  if (sep <= 0 || sep === params.sessionId.length - 1) {
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code: -32602,
+        message: 'Invalid params: sessionId must be "<channel>:<thread>"',
+        data: { sessionId: params.sessionId },
+      },
+    }
+  }
+  const key: SessionKey = {
+    channel: params.sessionId.slice(0, sep),
+    thread: params.sessionId.slice(sep + 1),
+  }
+  try {
+    await sup.quiesce(key)
+  } catch (err) {
+    return {
+      jsonrpc: '2.0',
+      id,
+      error: {
+        code: -32603,
+        message: 'Internal error: supervisor.quiesce failed',
+        data: { reason: err instanceof Error ? err.message : String(err) },
+      },
+    }
+  }
+  return { jsonrpc: '2.0', id, result: { stopReason: 'cancelled' } }
+}
+
+describe('mapAcpSessionCancel (ccsc-21x)', () => {
+  let stateDir: string
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'ccsc-acp-'))
+  })
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true })
+  })
+
+  // -------------------------------------------------------------------------
+  // Happy path — round-trip
+  // -------------------------------------------------------------------------
+
+  test('valid request → supervisor.quiesce called → success response with stopReason="cancelled"', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const key: SessionKey = { channel: 'C001', thread: '1700000000.000100' }
+    // Activate first so quiesce has a live handle to operate on.
+    await sup.activate(key, 'U_OWNER')
+
+    const req = {
+      jsonrpc: '2.0',
+      id: 42,
+      method: 'session/cancel',
+      params: { sessionId: 'C001:1700000000.000100' },
+    }
+    const resp = await mapAcpSessionCancel(req, sup)
+
+    expect(resp.jsonrpc).toBe('2.0')
+    expect(resp.id).toBe(42)
+    expect('result' in resp).toBe(true)
+    if ('result' in resp) {
+      expect(resp.result.stopReason).toBe('cancelled')
+    }
+  })
+
+  test('string id is preserved verbatim in the response (JSON-RPC 2.0 §4)', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const key: SessionKey = { channel: 'C001', thread: '1700000000.000100' }
+    await sup.activate(key, 'U_OWNER')
+
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 'request-abc',
+        method: 'session/cancel',
+        params: { sessionId: 'C001:1700000000.000100' },
+      },
+      sup,
+    )
+
+    expect(resp.id).toBe('request-abc')
+  })
+
+  test('sessionId with thread containing dots round-trips correctly', async () => {
+    // Slack thread_ts values are of the form "1711000000.000100" — they
+    // contain a dot. The adapter splits on the FIRST colon only so dots
+    // in the thread portion are preserved.
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const key: SessionKey = { channel: 'C_DOT', thread: '1711000000.000100' }
+    await sup.activate(key, 'U_OWNER')
+
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: 'C_DOT:1711000000.000100' },
+      },
+      sup,
+    )
+
+    expect('result' in resp).toBe(true)
+  })
+
+  // -------------------------------------------------------------------------
+  // Envelope validation — -32600 Invalid Request
+  // -------------------------------------------------------------------------
+
+  test('missing jsonrpc field → -32600 Invalid Request', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      {
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: 'C001:T001' },
+      },
+      sup,
+    )
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32600)
+  })
+
+  test('wrong jsonrpc version → -32600 Invalid Request', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '1.0',
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: 'C001:T001' },
+      },
+      sup,
+    )
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32600)
+  })
+
+  test('wrong method name → -32600 Invalid Request (adapter only routes session/cancel)', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/destroy',
+        params: { sessionId: 'C001:T001' },
+      },
+      sup,
+    )
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32600)
+  })
+
+  test('missing params → -32600 Invalid Request', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel({ jsonrpc: '2.0', id: 1, method: 'session/cancel' }, sup)
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32600)
+  })
+
+  test('non-object request body → -32600 Invalid Request with id=null fallback (JSON-RPC §5.1)', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel('not an object', sup)
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) {
+      expect(resp.error.code).toBe(-32600)
+      // Spec sentinel for unknown id is null.
+      expect(resp.id).toBeNull()
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // sessionId parsing — -32602 Invalid params
+  // -------------------------------------------------------------------------
+
+  test('sessionId missing colon → -32602 Invalid params', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: 'C001-no-colon' },
+      },
+      sup,
+    )
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32602)
+  })
+
+  test('sessionId starting with colon (empty channel) → -32602 Invalid params', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: ':T001' },
+      },
+      sup,
+    )
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32602)
+  })
+
+  test('sessionId ending with colon (empty thread) → -32602 Invalid params', async () => {
+    const sup = createSessionSupervisor({ stateRoot: stateDir })
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: 'C001:' },
+      },
+      sup,
+    )
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) expect(resp.error.code).toBe(-32602)
+  })
+
+  // -------------------------------------------------------------------------
+  // Supervisor failure — -32603 Internal error
+  // -------------------------------------------------------------------------
+
+  test('supervisor.quiesce rejects → -32603 Internal error with reason captured', async () => {
+    // Build a mock supervisor whose quiesce() always rejects. Casting through
+    // `unknown` keeps the public-surface assertion tight (only the methods
+    // mapAcpSessionCancel touches need to exist).
+    const failingSup = {
+      quiesce: async () => {
+        throw new Error('quarantined session — cannot quiesce')
+      },
+    } as unknown as import('./supervisor.ts').SessionSupervisor
+
+    const resp = await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'session/cancel',
+        params: { sessionId: 'C001:T001' },
+      },
+      failingSup,
+    )
+
+    expect('error' in resp).toBe(true)
+    if ('error' in resp) {
+      expect(resp.error.code).toBe(-32603)
+      expect(resp.error.message).toContain('supervisor.quiesce failed')
+      const data = resp.error.data as { reason: string }
+      expect(data.reason).toBe('quarantined session — cannot quiesce')
+    }
+    expect(resp.id).toBe(7)
+  })
+
+  // -------------------------------------------------------------------------
+  // Internal vocabulary invariant — adapter only TRANSLATES
+  // -------------------------------------------------------------------------
+
+  test('adapter routes ACP sessionId onto SessionKey verbatim — no normalisation', async () => {
+    // Capture the key passed into supervisor.quiesce to assert the channel
+    // and thread are routed exactly as parsed. This pins the adapter as a
+    // pure boundary translator — it must not modify Slack identifiers.
+    const captured: SessionKey[] = []
+    const captureSup = {
+      quiesce: async (key: SessionKey) => {
+        captured.push({ ...key })
+      },
+    } as unknown as import('./supervisor.ts').SessionSupervisor
+
+    await mapAcpSessionCancel(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/cancel',
+        params: { sessionId: 'D0123456789:1711999999.000042' },
+      },
+      captureSup,
+    )
+
+    expect(captured).toHaveLength(1)
+    expect(captured[0]).toEqual({
+      channel: 'D0123456789',
+      thread: '1711999999.000042',
+    })
+  })
+})
