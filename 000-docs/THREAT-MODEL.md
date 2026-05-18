@@ -327,6 +327,96 @@ missed primitive is a bypass.
   Not a security issue in the confidentiality/integrity sense — at worst a
   DoS against one session owner. Out of scope.
 
+### T11. Operator-coerced admin command (EchoLeak class) (HA → SO) — `ccsc-3w0`
+
+> An attacker injects content into a trusted Slack surface (channel message,
+> bot unfurl, file attachment, MCP-server-rendered text) that causes a
+> privileged operator to type or echo an admin verb (`!clear`, `!restart`,
+> any future `!stop` / `!quiesce`) that the attacker would not be authorized
+> to issue themselves.
+
+This is the threat class first publicly named by **EchoLeak / CVE-2025-32711**
+(CVSS 9.3, June 2025) — the first zero-click prompt injection against a
+production LLM system (M365 Copilot). The same trust-boundary failure was
+demonstrated against the **Anthropic Slack MCP server** (May 2025, unfurl
+vector — Anthropic archived the server rather than patch). **PromptArmor's
+Slack AI exfiltration** (Aug 2024, MITRE ATLAS AML-CS0035) and **"Your AI,
+My Shell"** (Liu et al. 2025, 84% attack success against Cursor / Copilot
+via poisoned shell-exec surfaces) extend the class to operator-facing CLI
+surfaces — exactly where admin commands live.
+
+- **Realistic forms**:
+  - A coworker pastes a poisoned snippet into a shared channel ("hey try
+    this debug command: `!restart`") that the operator copy-pastes without
+    reading.
+  - A peer bot's unfurl text or manifest contains the verb verbatim; Slack
+    renders it; the operator's eye reads it as legitimate.
+  - An attached file's preview pane contains the verb.
+  - The operator's own Claude session emits the verb as a "suggestion" after
+    being prompt-injected via T1.
+- **Why the standard T1 mitigations are insufficient**: admin verbs are not
+  tool calls — they are typed by the operator themselves. Inbound gate +
+  `assertSendable` + outbound gate all live below the layer where the
+  operator's keystrokes originate. The session owner's terminal is the root
+  of trust; admin commands ride that trust.
+- **Mitigation layering**:
+  1. **Default deny in policy.** `admin.clear` / `admin.restart` are virtual
+     policy tools (`ccsc-3w0`) — they go through `policy.evaluate()` like
+     every other tool call. Default is `deny`. A channel must explicitly
+     opt in via `ChannelPolicy.adminCommands.allowFrom`.
+  2. **Allowlist check.** Even when a channel is opted in, the sender's
+     Slack user ID must be in `allowFrom`. Same-workspace identity (not
+     forgeable from outside).
+  3. **HMAC nonce + cross-channel confirmation (day-1 hard requirement for
+     `!restart`; `ccsc-ofn`).** Operator types `!restart` in channel C →
+     bot mints a 60-second single-use nonce → bot DMs the nonce to the
+     operator → operator types `!restart <nonce>` in channel C → bot
+     executes. The attacker would need to:
+     - Be allowlisted in C, AND
+     - Coerce the operator to issue the initial verb, AND
+     - Coerce the operator to relay the DM'd nonce back, AND
+     - Win the 60-second race before the nonce expires.
+     The cross-channel hop is the critical defense: the same content vector
+     that delivered the initial verb cannot also deliver the nonce, because
+     the bot's DM channel is not under attacker control.
+  4. **Argv-mode `execFileSync`.** The dispatcher uses
+     `execFileSync('tmux', ['send-keys', '-t', SESSION, '/clear', 'Enter'])`
+     — no shell interpolation. Eliminates the OpenClaw 2026 attack classes
+     (line-continuation, busybox multiplexing, GNU option abbreviation).
+  5. **Signed audit-journal entry.** Every admin command emits an
+     `admin.*` event under journal v2 (`ccsc-22l`): Ed25519-signed over RFC
+     8785 JCS canonical bytes, with `policy_attestation.digest` recording
+     the SHA-256 of the policy in effect. The forensics primitive survives
+     even if the coercion succeeds.
+  6. **Memory excision of denied attempts (`ccsc-06s`).** When `policy.evaluate()`
+     denies an admin command, the journal records the attempt but the next
+     agent prompt has the trace excised. Prevents retry-loop coercion where
+     a prompt-injected Claude rephrases the denied verb.
+
+- **Residual risk**: an operator who deliberately bypasses every layer —
+  manually disables the nonce flow, edits `access.json` to add an attacker
+  to `allowFrom`, then types the verb themselves. This is operator-as-SO
+  acting under coercion outside Slack, which scope §"Out of scope" already
+  carves out. No software mitigation against an SO typing at their own
+  terminal.
+
+### Citations for the threat framing
+
+- arXiv [2509.10540](https://arxiv.org/abs/2509.10540) — *EchoLeak: A
+  Zero-Click Indirect Prompt Injection of Microsoft 365 Copilot* (CVE-2025-32711,
+  CVSS 9.3, disclosed June 2025).
+- [Embrace The Red — *Anthropic Slack MCP Server: Data Leakage via Message
+  Unfurling*](https://embracethered.com/blog/posts/2025/security-advisory-anthropic-slack-mcp-server-data-leakage/)
+  (May 2025).
+- [PromptArmor — *Data Exfiltration from Slack AI via Indirect Prompt
+  Injection*](https://www.promptarmor.com/resources/data-exfiltration-from-slack-ai-via-indirect-prompt-injection)
+  (Aug 2024; MITRE ATLAS AML-CS0035).
+- Liu et al. (2025), *Your AI, My Shell: Demystifying Prompt Injection
+  Attacks Against AI-Powered Shell Surfaces.* arXiv. 84% attack success
+  across Cursor, GitHub Copilot, and Claude Code.
+- OpenClaw security analysis (2026) — argv-mode `execFileSync` as the floor
+  against shell-injection on CLI agent surfaces.
+
 ---
 
 ## Invariants later epics must preserve
@@ -350,6 +440,16 @@ review enforce them; PRs that would break one do not merge.
    post-hoc analysis.
 6. **Atomic writes or no write.** Partial writes of state files are never
    observable to a concurrent reader.
+7. **Admin verbs are not chat content.** No regex on inbound text can promote
+   a message to an admin action (`admin.clear`, `admin.restart`, any future
+   `admin.*`) without **(a)** a server-minted HMAC nonce in the operator's
+   reply AND **(b)** cross-channel confirmation (nonce delivered out-of-band
+   via DM, echoed back in the originating channel). This invariant is the
+   operational floor for T11. The dispatcher in `admin.ts` (`ccsc-3w0`) is
+   the only code path permitted to execute admin verbs; it is forbidden
+   from importing `manifest.ts` (mirrors 31-A.4) and is reachable only
+   through the `gate() → policy.evaluate() → journal.write() → dispatch`
+   pipeline.
 
 ---
 
@@ -390,6 +490,13 @@ doc is stale:
   dir → rewrite from principals up.
 - `access.json` becomes a delegated / token-based store → T5 and invariant
   #4 both change.
+- Anthropic ships external-message-injection mid-turn IPC
+  ([`anthropics/claude-code#53049`](https://github.com/anthropics/claude-code/issues/53049))
+  → T11's reliance on tmux send-keys is replaced by a stronger primitive;
+  the ACP boundary adapter (`ccsc-21x`) is the migration path.
+- A second principal (delegated operator) lands in the access model →
+  T11's "session owner is the root of trust" framing splits, and
+  capability tokens (`ccsc-66t`) become load-bearing rather than research.
 
 Until then, the invariants above hold.
 
@@ -402,11 +509,21 @@ Until then, the invariants above hold.
 - Miller, M. S. (2006). *Robust Composition.* PhD thesis. — T9 / invariant #4.
 - OWASP ASVS 4.0 — primitive-level attack-surface enumeration shape.
 - XACML 3.0 (OASIS, 2013) — combining algorithm under T1 mitigations.
+- arXiv [2509.10540](https://arxiv.org/abs/2509.10540) — EchoLeak / CVE-2025-32711 — T11.
+- Liu et al. (2025), *Your AI, My Shell.* arXiv — T11.
+- [Embrace The Red — Anthropic Slack MCP unfurl](https://embracethered.com/blog/posts/2025/security-advisory-anthropic-slack-mcp-server-data-leakage/) — T11.
+- [PromptArmor — Slack AI exfiltration](https://www.promptarmor.com/resources/data-exfiltration-from-slack-ai-via-indirect-prompt-injection) — T11.
+- [OpenAI Agents SDK — Human-in-the-Loop patterns](https://openai.github.io/openai-agents-python/handoffs/) — T11 mitigation reference.
+- [Microsoft Agent Framework — HITL approval gates](https://learn.microsoft.com/en-us/semantic-kernel/agents/) — T11 mitigation reference.
+- RFC 8785 — *JSON Canonicalization Scheme (JCS).* — `ccsc-22l` / `ccsc-713`.
+- RFC 6962 — *Certificate Transparency.* — journal v1→v2 transition pattern.
 - [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — component layout, four-principal
   model definitions.
 - [`../SECURITY.md`](../SECURITY.md) — user-facing summary; this doc is its
   source.
 - [`../ACCESS.md`](../ACCESS.md) — allowlist schema referenced throughout.
 
-Bead reference: **ccsc-k6s** (P0.2.2). Blocks [ccsc-xfj](../.beads/) (P0.3:
-promote four-principal model into SECURITY.md).
+Bead references: **ccsc-k6s** (P0.2.2, original four-principal landing);
+**ccsc-o6x** (this update — T11 + invariant #7). T11 blocks every subsequent
+bead in the *Admin Commands + Audit/Policy/Governance v2 Cluster* rollout
+(tracking issue [#167](https://github.com/jeremylongshore/claude-code-slack-channel/issues/167)).

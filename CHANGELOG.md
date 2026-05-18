@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **THREAT-MODEL.md — T11 (operator-coerced admin command, EchoLeak class) + invariant #7** (`ccsc-o6x`). Adds explicit recognition of the EchoLeak / CVE-2025-32711 threat class (zero-click prompt injection coercing a privileged operator into emitting an admin verb), with citations to PromptArmor's Slack-AI exfiltration finding (MITRE ATLAS AML-CS0035), the Anthropic Slack MCP unfurl advisory, and "Your AI, My Shell" (Liu et al. 2025, 84% attack success against CLI agent surfaces). Invariant #7 formalizes the operational floor: admin verbs cannot be promoted from chat content without a server-minted HMAC nonce + cross-channel confirmation. This is the unblock for the *Admin Commands + Audit/Policy/Governance v2 Cluster* rollout (tracking issue #167) — every subsequent design doc in the rollout cites T11. No code change; the invariants are enforced by the beads that follow (`ccsc-3w0`, `ccsc-ofn`, `ccsc-22l`, `ccsc-8pw`, `ccsc-06s`).
+
 ## [0.9.1] - 2026-05-13
 
 ### Added
