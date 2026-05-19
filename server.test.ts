@@ -9835,77 +9835,12 @@ describe('buildAndPostAuditReceipt unfurl flags (ccsc-y4e)', () => {
 // internal vocabulary is unchanged — the adapter calls supervisor.quiesce()
 // and translates the outcome back into ACP terminology at the boundary.
 //
-// Inlined adapter (same pattern as activateAndTouch above) to avoid
-// triggering server.ts bootstrap side-effects in the test runner. When
-// server.ts changes the function body, this test copy must be updated.
-
-const AcpSessionCancelRequestSchemaTest = z.object({
-  jsonrpc: z.literal('2.0'),
-  id: z.union([z.string(), z.number()]),
-  method: z.literal('session/cancel'),
-  params: z.object({
-    sessionId: z.string().min(3).max(128),
-  }),
-})
-
-type AcpResponseTest =
-  | { jsonrpc: '2.0'; id: string | number; result: { stopReason: 'cancelled' } }
-  | {
-      jsonrpc: '2.0'
-      id: string | number
-      error: { code: number; message: string; data?: unknown }
-    }
-
-async function mapAcpSessionCancel(
-  req: unknown,
-  sup: import('./supervisor.ts').SessionSupervisor,
-): Promise<AcpResponseTest> {
-  const parsed = AcpSessionCancelRequestSchemaTest.safeParse(req)
-  if (!parsed.success) {
-    const reqRecord = (typeof req === 'object' && req !== null ? req : {}) as Record<
-      string,
-      unknown
-    >
-    const fallbackId =
-      typeof reqRecord.id === 'string' || typeof reqRecord.id === 'number' ? reqRecord.id : null
-    return {
-      jsonrpc: '2.0',
-      id: fallbackId as string | number,
-      error: { code: -32600, message: 'Invalid Request', data: { issues: parsed.error.issues } },
-    }
-  }
-  const { id, params } = parsed.data
-  const sep = params.sessionId.indexOf(':')
-  if (sep <= 0 || sep === params.sessionId.length - 1) {
-    return {
-      jsonrpc: '2.0',
-      id,
-      error: {
-        code: -32602,
-        message: 'Invalid params: sessionId must be "<channel>:<thread>"',
-        data: { sessionId: params.sessionId },
-      },
-    }
-  }
-  const key: SessionKey = {
-    channel: params.sessionId.slice(0, sep),
-    thread: params.sessionId.slice(sep + 1),
-  }
-  try {
-    await sup.quiesce(key)
-  } catch (err) {
-    return {
-      jsonrpc: '2.0',
-      id,
-      error: {
-        code: -32603,
-        message: 'Internal error: supervisor.quiesce failed',
-        data: { reason: err instanceof Error ? err.message : String(err) },
-      },
-    }
-  }
-  return { jsonrpc: '2.0', id, result: { stopReason: 'cancelled' } }
-}
+// The adapter is side-effect-free, so it lives in its own module
+// (acp-adapter.ts) that the test suite imports directly. No inlined
+// duplicate. Gemini flagged the prior duplicate as a drift risk on
+// PR #172 — extracting the module + importing the production code path
+// here is the fix.
+import { mapAcpSessionCancel } from './acp-adapter.ts'
 
 describe('mapAcpSessionCancel (ccsc-21x)', () => {
   let stateDir: string

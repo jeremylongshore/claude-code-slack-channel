@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **ACP adapter extracted from `server.ts` into `acp-adapter.ts`** (`ccsc-21x` follow-up). Addresses Gemini review on PR #172: (1) the inlined test duplicate of `mapAcpSessionCancel` was a drift risk — extracting the adapter into a side-effect-free module lets `server.test.ts` import the production code path directly; (2) `AcpResponse.id` widened to `string | number | null` to be fully JSON-RPC 2.0 §5.1 compliant (the spec requires `null` when an error occurs detecting the request id) — the two unsafe `as string | number` casts are removed. Coverage went up (98.47% → 98.72% line / 98.82% → 99.02% func) because tests now exercise the real adapter, not a copy. No behavior change.
+
 ### Added
 
 - **ACP boundary adapter — `mapAcpSessionCancel` in `server.ts`** (`ccsc-21x`). Adds a thin JSON-RPC 2.0 adapter that translates Agent Client Protocol [`session/cancel`](https://agentclientprotocol.com/protocol/prompt-turn) requests onto the existing `supervisor.quiesce(key)` call. Additive only — the supervisor's internal vocabulary (`activate` / `quiesce` / `deactivate` / `quarantine`) is unchanged, no method renames, no parameter shape changes. The adapter is the ONLY place ACP terminology appears in the codebase (mirrors the 31-A.4 isolation pattern between `manifest.ts` and `policy.ts`). Returns `{ result: { stopReason: 'cancelled' } }` on success; surfaces `-32600` Invalid Request / `-32602` Invalid params / `-32603` Internal error per JSON-RPC 2.0. Forward-compat for the day Anthropic ships external-message-injection mid-turn (`anthropics/claude-code#53049`) — the migration becomes a single function edit, not a vocabulary rename that would break ~704 tests and the meaning of existing `audit.log` files. Adds 13 round-trip tests + § ACP-mapping addendum to `000-docs/session-state-machine.md` + new invariant #9 ("ACP terminology appears only in the boundary adapter").
