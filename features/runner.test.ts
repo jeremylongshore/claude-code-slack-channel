@@ -27,6 +27,7 @@ import {
   registerSendableSteps,
   type SendableFixtures,
 } from './steps/sendable.ts'
+import { registerTierShadowSteps } from './steps/tier-shadow.ts'
 
 // ---------------------------------------------------------------------------
 // Load .feature files
@@ -116,6 +117,20 @@ afterAll(() => {
   const feature = loadFeature('audit_chain_verifier.feature')
   const registry = new StepRegistry()
   registerJournalSteps(registry)
+  validateRegistry(feature, registry)
+
+  const runFeature = buildRunner(feature, registry)
+  runFeature(describe, test, beforeEach)
+}
+
+// ---------------------------------------------------------------------------
+// 6. Tier-shadow detection — detectShadowing() in policy.ts (ccsc-4g8)
+// ---------------------------------------------------------------------------
+
+{
+  const feature = loadFeature('tier-shadow.feature')
+  const registry = new StepRegistry()
+  registerTierShadowSteps(registry)
   validateRegistry(feature, registry)
 
   const runFeature = buildRunner(feature, registry)

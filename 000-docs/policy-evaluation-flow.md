@@ -234,6 +234,59 @@ Warnings do **not** block startup; they go to stderr and the audit log.
 Operators see them during local development and in CI. Fail-closed is
 reserved for monotonicity violations.
 
+### Cross-tier intersection (ccsc-4g8)
+
+The within-tier subset check above catches the classic "first rule
+swallows the second" shadow. It cannot, by construction, catch a
+second class that appears once `MatchSpec.tier` lands: two rules
+in **different** tiers whose matches share a concrete call.
+
+```
+cross-tier shadow:
+  R_lower (tier != admin, effect = auto_approve)
+  R_admin (tier = admin, effect = deny)
+  ∃ a concrete tool call C such that match(R_lower, C) ∧ match(R_admin, C)
+```
+
+The Workspace `auto_approve` and Admin `deny` aren't in a subset
+relationship — each constrains different fields. But they do intersect
+on Bash + C001 + session_owner. Once `ccsc-8pw` lands and `evaluate()`
+acts on tier precedence, the Admin deny wins — but the audit trail (the
+policy file as humans read it) makes the conflict look like the
+Workspace rule is in effect. The lint surfaces the intersection so the
+operator must resolve the ambiguity explicitly: narrow the lower-tier
+match, retier the rule, or remove one of the two.
+
+The check is **asymmetric**. Only the dangerous direction is flagged:
+a lower-tier `auto_approve` intersecting a higher-tier `deny`. The
+reverse — an Admin `auto_approve` intersecting a Workspace `deny` —
+is the *intended* tier semantics ("Admin overrides this") and is not
+warned.
+
+Intersection logic (`matchesIntersect` in policy.ts):
+
+| Field | Both unset | One unset, one set | Both set |
+|---|---|---|---|
+| `tool` | intersect | intersect | must be equal |
+| `channel` | intersect | intersect | must be equal |
+| `thread_ts` | intersect | intersect | must be equal |
+| `actor` | intersect | intersect | must be equal |
+| `pathPrefix` | intersect | intersect | one must prefix the other |
+| `argEquals` | intersect | intersect | shared keys must agree; disjoint keys ignored |
+
+`tier` itself is **excluded** from intersection — it's provenance, not
+call-space identity. Two rules in different tiers CAN match the same
+call; that's the whole reason cross-tier shadow exists as a category.
+
+The `ShadowWarning` shape gains a `crossTier: boolean` field:
+
+- `crossTier: false` — classic within-tier subset shadow (existing
+  behavior, backward-compatible default).
+- `crossTier: true` — cross-tier intersection between a non-Admin
+  `auto_approve` and an Admin `deny`.
+
+Both kinds emit the same warning-not-block discipline.
+
 ---
 
 ## Monotonicity invariant

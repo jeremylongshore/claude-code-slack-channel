@@ -10099,3 +10099,199 @@ describe('mapAcpSessionCancel (ccsc-21x)', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Tier-shadow detection — direct unit tests (ccsc-4g8)
+// ---------------------------------------------------------------------------
+//
+// The .feature scenarios exercise the integration; these unit tests pin
+// the matchesIntersect branches directly so a future refactor can't
+// silently lose a false-return without a test breaking. Targets the
+// branches the feature file leaves uncovered: thread_ts mismatch,
+// disjoint-pathPrefix both-set, argEquals-disagree-on-shared-key,
+// argEquals-agree-on-shared-key, and effectiveTier defaulting.
+
+import {
+  detectShadowing as detectShadowingDirect,
+  effectiveTier,
+  matchesIntersect,
+  type PolicyRule,
+} from './policy.ts'
+
+describe('matchesIntersect (ccsc-4g8) — direct branch coverage', () => {
+  test('thread_ts mismatch — non-intersecting', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', thread_ts: '1700000000.000100' },
+        { tool: 'Bash', thread_ts: '1700000000.999999' },
+      ),
+    ).toBe(false)
+  })
+
+  test('thread_ts only on one side — intersects', () => {
+    expect(
+      matchesIntersect({ tool: 'Bash', thread_ts: '1700000000.000100' }, { tool: 'Bash' }),
+    ).toBe(true)
+  })
+
+  test('disjoint pathPrefix on both sides — non-intersecting', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Write', pathPrefix: '/home/a' },
+        { tool: 'Write', pathPrefix: '/home/b' },
+      ),
+    ).toBe(false)
+  })
+
+  test('one pathPrefix prefixes the other — intersects', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Write', pathPrefix: '/home/jeremy' },
+        { tool: 'Write', pathPrefix: '/home/jeremy/projects' },
+      ),
+    ).toBe(true)
+  })
+
+  test('equal pathPrefix — intersects', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Write', pathPrefix: '/home/jeremy/projects' },
+        { tool: 'Write', pathPrefix: '/home/jeremy/projects' },
+      ),
+    ).toBe(true)
+  })
+
+  test('argEquals disagreement on shared key — non-intersecting', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'rm' } },
+      ),
+    ).toBe(false)
+  })
+
+  test('argEquals agreement on shared key — intersects', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+      ),
+    ).toBe(true)
+  })
+
+  test('argEquals on disjoint keys — intersects', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', argEquals: { cwd: '/tmp' } },
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+      ),
+    ).toBe(true)
+  })
+
+  test('argEquals only on one side — intersects', () => {
+    expect(matchesIntersect({ tool: 'Bash', argEquals: { cmd: 'ls' } }, { tool: 'Bash' })).toBe(
+      true,
+    )
+  })
+
+  test('tier is excluded from intersection check', () => {
+    // Two rules in different tiers but identical match payload — they
+    // DO intersect (that's the whole point of cross-tier shadow detection).
+    expect(
+      matchesIntersect({ tool: 'Bash', tier: 'workspace' }, { tool: 'Bash', tier: 'admin' }),
+    ).toBe(true)
+  })
+})
+
+describe('effectiveTier (ccsc-4g8)', () => {
+  test('defaults to "default" when tier is absent', () => {
+    const rule: PolicyRule = {
+      id: 'r',
+      priority: 100,
+      effect: 'auto_approve',
+      match: { tool: 'Bash' },
+    }
+    expect(effectiveTier(rule)).toBe('default')
+  })
+
+  test('returns the declared tier', () => {
+    const rule: PolicyRule = {
+      id: 'r',
+      priority: 100,
+      effect: 'auto_approve',
+      match: { tool: 'Bash', tier: 'admin' },
+    }
+    expect(effectiveTier(rule)).toBe('admin')
+  })
+})
+
+describe('detectShadowing (ccsc-4g8) — backward compatibility', () => {
+  test('within-tier subset still detected and marked crossTier: false', () => {
+    // A pair that exists in the existing test corpus to make sure the
+    // crossTier field defaults to `false` and the existing warning shape
+    // is preserved. Down-stream code that already checked the shape
+    // continues to work.
+    const rules: PolicyRule[] = [
+      { id: 'r1', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      {
+        id: 'r2',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', channel: 'C001' },
+      },
+    ]
+    const warnings = detectShadowingDirect(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.crossTier).toBe(false)
+    expect(warnings[0]!.later).toBe('r2')
+    expect(warnings[0]!.earlier).toBe('r1')
+  })
+
+  test('cross-tier warning shape carries crossTier: true and a tier-aware message', () => {
+    const rules: PolicyRule[] = [
+      {
+        id: 'admin-deny',
+        priority: 100,
+        effect: 'deny',
+        reason: 'admin-locked',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+      {
+        id: 'workspace-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', tier: 'workspace' },
+      },
+    ]
+    const warnings = detectShadowingDirect(rules)
+    const crossTier = warnings.filter((w) => w.crossTier === true)
+    expect(crossTier).toHaveLength(1)
+    expect(crossTier[0]!.message).toContain('cross-tier shadow')
+    expect(crossTier[0]!.message).toContain("'workspace'-tier")
+    expect(crossTier[0]!.message).toContain("'admin'-tier")
+    expect(crossTier[0]!.later).toBe('workspace-allow')
+    expect(crossTier[0]!.earlier).toBe('admin-deny')
+  })
+
+  test('admin-tier auto_approve does NOT trigger cross-tier warning against workspace deny', () => {
+    // Intended direction: Admin tier overrides lower tiers, not the
+    // other way around. This is the asymmetry the lint encodes.
+    const rules: PolicyRule[] = [
+      {
+        id: 'admin-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+      {
+        id: 'workspace-deny',
+        priority: 100,
+        effect: 'deny',
+        reason: 'workspace policy',
+        match: { tool: 'Bash', tier: 'workspace' },
+      },
+    ]
+    const warnings = detectShadowingDirect(rules)
+    expect(warnings.filter((w) => w.crossTier === true)).toEqual([])
+  })
+})
