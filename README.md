@@ -1,6 +1,6 @@
 # claude-code-slack-channel v0.9.1
 
-Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative policy engine; every gate decision lands in a hash-chained tamper-evident audit journal — per-thread session isolation, identity-aware permission gates, five-layer prompt-injection defense, built for workspaces where multiple agents share space with humans.
+Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative policy engine; every gate decision lands in a hash-chained tamper-evident audit journal — per-thread session isolation, identity-aware permission gates, five-layer prompt-injection defense.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
