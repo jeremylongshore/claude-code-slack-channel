@@ -86,9 +86,10 @@ export async function mapAcpSessionCancel(
     // JSON-RPC 2.0 §5.1: when the request object is invalid the id may be
     // unknown. We surface the id when one was provided (string|number) and
     // fall back to `null` (the spec-defined sentinel) otherwise.
-    const reqRecord = (typeof req === 'object' && req !== null ? req : {}) as Record<string, unknown>
+    const candidateId =
+      typeof req === 'object' && req !== null ? (req as Record<string, unknown>).id : undefined
     const fallbackId =
-      typeof reqRecord.id === 'string' || typeof reqRecord.id === 'number' ? reqRecord.id : null
+      typeof candidateId === 'string' || typeof candidateId === 'number' ? candidateId : null
     return {
       jsonrpc: '2.0',
       id: fallbackId,
