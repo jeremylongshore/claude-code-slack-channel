@@ -45,6 +45,11 @@ PATTERNS=(
   ".c8rc.json"
   "stryker.conf.json"
   "stryker.config.js"
+  # RFC 8785 JCS interop vectors (ccsc-713) — silent edits would let an
+  # incompatible canonicalJson change land without breaking signature
+  # verification on existing audit logs. Pin them with the same tamper-
+  # evident discipline as the .feature files.
+  "features/jcs-vectors.json"
 )
 
 collect_files() {

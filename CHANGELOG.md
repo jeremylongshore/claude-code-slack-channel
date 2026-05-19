@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **RFC 8785 JCS interop test + pinned vector suite** (`ccsc-713`). Adds `features/jcs-vectors.json` (30 supported vectors + 5 throws-vectors, every entry annotated with the RFC 8785 section it exercises) and `features/jcs-interop.test.ts` running each vector through `canonicalJson()` (journal.ts:668) with byte-exact equality assertions. Vector file pinned in `.harness-hash` so any edit requires explicit `--init` (same tamper-evident discipline as `.feature` files). Closes the divergence gate that journal v2 (`ccsc-22l`) needs: when events are signed with Ed25519, third-party verifiers compute canonical bytes against our published public key — byte-divergence between implementations would silently break verification. Documents the narrower input domain we support (integer-only, BMP-only) via 5 throws-vectors that assert rejection. § "Canonicalization interop" added to `000-docs/audit-journal-architecture.md`. 40 new tests, all green; total now 757.
+
 ### Changed
 
 - **ACP adapter extracted from `server.ts` into `acp-adapter.ts`** (`ccsc-21x` follow-up). Addresses Gemini review on PR #172: (1) the inlined test duplicate of `mapAcpSessionCancel` was a drift risk — extracting the adapter into a side-effect-free module lets `server.test.ts` import the production code path directly; (2) `AcpResponse.id` widened to `string | number | null` to be fully JSON-RPC 2.0 §5.1 compliant (the spec requires `null` when an error occurs detecting the request id) — the two unsafe `as string | number` casts are removed. Coverage went up (98.47% → 98.72% line / 98.82% → 99.02% func) because tests now exercise the real adapter, not a copy. No behavior change.
