@@ -94,6 +94,46 @@ the journal is not what we're after.
 `canonicalJson()` is the standard JCS (RFC 8785) form so two independent
 implementations compute the same hash.
 
+### Canonicalization interop (ccsc-713)
+
+`canonicalJson()` (journal.ts:668) implements RFC 8785 over a **narrower
+input domain** than the full spec. The journal's event schema is
+deliberately ASCII-/integer-/BMP-only — every field is one of:
+
+- hex digests (lowercase ASCII), ISO-8601 timestamps (ASCII), Slack IDs
+  (alphanumeric ASCII), or operator-authored reason strings (ASCII)
+- integers (`seq`, schema versions)
+- booleans, `null`, sorted-key objects, order-preserving arrays
+
+Anything outside this domain — non-integer numbers, `Infinity` / `NaN`,
+`undefined`, symbols, functions, bigints, non-BMP strings — is rejected
+at canonicalize time with a thrown error. The narrower domain is the
+trade we make for keeping the canonicalizer tiny (~25 LoC) without
+sacrificing RFC 8785 compatibility within the supported subset.
+
+**Why this matters for journal v2 (`ccsc-22l`)**: when events are signed
+with Ed25519, third-party verifiers compute the same canonical bytes
+and check the signature against our published public key. Byte-divergence
+between our canonicalizer and theirs would silently break verification.
+The fixture-pinned interop test (`features/jcs-interop.test.ts` against
+`features/jcs-vectors.json`) is the gate that catches such divergence
+on every PR.
+
+**Vector suite**: `features/jcs-vectors.json` carries 30 supported
+vectors + 5 throws-vectors, every entry annotated with the RFC 8785
+section it exercises. The file is hash-pinned in `.harness-hash` — silent
+edits would let an "innocent" refactor of `canonicalJson()` change the
+canonical form without breaking the spec gate. Re-pinning requires
+`bash scripts/harness-hash.sh --init` (engineer-mediated, not automated).
+
+**Vector provenance**: RFC 8785 itself (the Appendix B test data referenced
+inline in each vector's `origin` field) plus one synthetic vector that
+exercises the actual `JournalEvent` shape that v2 events will sign. We
+do not copy the RFC's vectors verbatim because (a) several use non-integer
+numbers our canonicalizer rejects and (b) some target full-JSON
+canonicalization beyond our integer-only domain. We pin the subset that
+applies to our schema and document the rest as throws-cases.
+
 ### What tampering does and does not detect
 
 Detects:
