@@ -65,6 +65,15 @@ export const EventKind = z.enum([
   'gate.outbound.deny',
   'policy.allow',
   'policy.deny',
+  // Emitted immediately after `policy.deny` (ccsc-06s) to record that the
+  // dispatcher minimised the response delivered to Claude — i.e., the MCP
+  // notification carried only `behavior: 'deny'` with no rule id, no
+  // reason, no input echo. The full denial detail remains in the
+  // preceding `policy.deny` event for forensic review; the agent context
+  // sees only that the call was denied. Order-of-operations invariant:
+  // `policy.deny` is fully journaled BEFORE this event is written, and
+  // both are journaled BEFORE the MCP notification is sent.
+  'policy.deny.context_stripped',
   'policy.require',
   'policy.approved',
   'exfil.block',
