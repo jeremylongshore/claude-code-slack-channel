@@ -93,6 +93,19 @@ export const EventKind = z.enum([
   // switch to new_public_key for every subsequent event. See
   // 000-docs/key-management.md § Rotation.
   'system.key_rotation',
+  // Admin verbs (ccsc-3w0). Emitted on every operator-initiated
+  // admin command — !clear (reversible) and !restart (destructive,
+  // nonce-gated). See admin.ts dispatcher and ACCESS.md § HMAC nonce.
+  // The .denied variants record refused attempts (allowlist miss,
+  // nonce verification failure). The .challenge variant records that
+  // a nonce was minted + DM'd to the operator — without recording the
+  // nonce itself (journal-read attacker would otherwise have a free
+  // replay credential).
+  'admin.clear',
+  'admin.clear.denied',
+  'admin.restart',
+  'admin.restart.denied',
+  'admin.restart.challenge',
   // Bot-manifest protocol (Epic 31-A). Emitted on every read_peer_manifests
   // call so manifest activity is forensically visible even when cached;
   // see 000-docs/bot-manifest-protocol.md §163-166.

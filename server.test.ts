@@ -5541,15 +5541,22 @@ describe('JournalEvent', () => {
     const kinds = EventKind.options
     // 19 original kinds + manifest.read + manifest.read.cached (Epic
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
-    // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s). If this
-    // number drifts, update the doc count in journal.ts's header
-    // comment too — both must agree.
-    expect(kinds).toHaveLength(24)
+    // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
+    // 5 admin.* kinds (ccsc-3w0: admin.clear, admin.clear.denied,
+    // admin.restart, admin.restart.denied, admin.restart.challenge).
+    // If this number drifts, update the doc count in journal.ts's
+    // header comment too — both must agree.
+    expect(kinds).toHaveLength(29)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
     expect(kinds).toContain('system.key_rotation')
     expect(kinds).toContain('policy.deny.context_stripped')
+    expect(kinds).toContain('admin.clear')
+    expect(kinds).toContain('admin.clear.denied')
+    expect(kinds).toContain('admin.restart')
+    expect(kinds).toContain('admin.restart.denied')
+    expect(kinds).toContain('admin.restart.challenge')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -11435,5 +11442,498 @@ describe('ccsc-ofn — secondary-index correctness (Gemini #179 fix)', () => {
     // the size() diagnostic to assert total bounded growth.
     const total = store.size()
     expect(total).toBeLessThanOrEqual(1000 + MAX_LIVE_NONCES_PER_USER)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ccsc-3w0 — admin commands (parser, dispatcher, virtual-tool invariant)
+// ---------------------------------------------------------------------------
+
+describe('ccsc-3w0 — parseAdminCommand', () => {
+  const envelope = {
+    channelId: 'C_OPS',
+    requestedBy: 'U_ALICE',
+    threadTs: '1700000000.000100',
+    messageTs: '1700000000.000100',
+  }
+
+  test('parses !clear into AdminClearCommand', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    const cmd = parseAdminCommand('!clear', envelope)
+    expect(cmd).toEqual({ kind: 'clear', ...envelope })
+  })
+
+  test('parses !restart (no nonce) into AdminRestartCommand with nonce=undefined', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    const cmd = parseAdminCommand('!restart', envelope)
+    expect(cmd).toEqual({ kind: 'restart', nonce: undefined, ...envelope })
+  })
+
+  test('parses !restart <nonce> with the nonce captured', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    const cmd = parseAdminCommand('!restart deadbeefcafebabe', envelope)
+    expect(cmd).toEqual({
+      kind: 'restart',
+      nonce: 'deadbeefcafebabe',
+      ...envelope,
+    })
+  })
+
+  test('rejects !clear with an extra argument (typo guard)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!clear extra', envelope)).toBeNull()
+  })
+
+  test('trims surrounding whitespace', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('  !clear  ', envelope)).toEqual({ kind: 'clear', ...envelope })
+  })
+
+  test('returns null for non-admin text (normal chat passes through)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('hello world', envelope)).toBeNull()
+    expect(parseAdminCommand('!unknown', envelope)).toBeNull()
+    expect(parseAdminCommand('!clear-style', envelope)).toBeNull()
+    expect(parseAdminCommand('not !clear', envelope)).toBeNull()
+  })
+
+  test('input MUST be mention-stripped — does NOT match raw <@U_BOT> !clear', async () => {
+    // The contract is: the dispatcher caller strips mentions before
+    // passing text in (via stripBotMention in lib.ts). The parser
+    // does NOT itself strip — it operates on the pre-normalized form
+    // so the responsibility split is clear and one-direction.
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('<@U_BOT> !clear', envelope)).toBeNull()
+  })
+})
+
+describe('ccsc-3w0 — stripBotMention (Gemini #1 from original PR #157)', () => {
+  test('strips leading <@U_BOT> mention with trailing whitespace', async () => {
+    const { stripBotMention } = await import('./lib.ts')
+    expect(stripBotMention('<@U_BOT> !clear', 'U_BOT')).toBe('!clear')
+    expect(stripBotMention('<@U_BOT>  !clear', 'U_BOT')).toBe('!clear')
+    expect(stripBotMention('<@U_BOT>\n!clear', 'U_BOT')).toBe('!clear')
+  })
+
+  test('returns text unchanged when no leading mention present', async () => {
+    const { stripBotMention } = await import('./lib.ts')
+    expect(stripBotMention('!clear', 'U_BOT')).toBe('!clear')
+    expect(stripBotMention('hello <@U_BOT>', 'U_BOT')).toBe('hello <@U_BOT>')
+  })
+
+  test('returns text unchanged when bot id is empty', async () => {
+    const { stripBotMention } = await import('./lib.ts')
+    expect(stripBotMention('<@U_BOT> !clear', '')).toBe('<@U_BOT> !clear')
+  })
+
+  test('only strips the matching bot id — leaves other mentions alone', async () => {
+    const { stripBotMention } = await import('./lib.ts')
+    expect(stripBotMention('<@U_OTHER> !clear', 'U_BOT')).toBe('<@U_OTHER> !clear')
+  })
+
+  test('handles round-trip parser composition — gates and admin parser see same text', async () => {
+    const { stripBotMention } = await import('./lib.ts')
+    const { parseAdminCommand } = await import('./admin.ts')
+    const envelope = {
+      channelId: 'C_OPS',
+      requestedBy: 'U_ALICE',
+      threadTs: '1700000000.000100',
+      messageTs: '1700000000.000100',
+    }
+    const text = '<@U_BOT> !restart abc123'
+    const stripped = stripBotMention(text, 'U_BOT')
+    expect(parseAdminCommand(stripped, envelope)).toEqual({
+      kind: 'restart',
+      nonce: 'abc123',
+      ...envelope,
+    })
+  })
+})
+
+describe('ccsc-3w0 — dispatchAdminCommand !clear', () => {
+  test('happy path: allowlist passes → journal → quiesce → tmux → react', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const tmuxCalls: Array<readonly string[]> = []
+    const reactions: string[] = []
+    let quiesceCalled = false
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'clear',
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {
+          quiesceCalled = true
+        },
+        sendTmuxKeys: createRecordingSendKeys(tmuxCalls),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async (e) => {
+          reactions.push(e)
+        },
+      },
+    )
+
+    expect(result).toEqual({ kind: 'executed', verb: 'clear' })
+    expect(journal.length).toBeGreaterThanOrEqual(1)
+    expect(journal[0]!.kind).toBe('admin.clear')
+    expect(quiesceCalled).toBe(true)
+    expect(tmuxCalls).toEqual([['/clear', 'Enter']])
+    expect(reactions).toEqual(['recycle'])
+  })
+
+  test('non-allowlisted user → denied with journal admin.clear.denied, no execution', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const tmuxCalls: Array<readonly string[]> = []
+    const reactions: string[] = []
+    let quiesceCalled = false
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'clear',
+        channelId: 'C_OPS',
+        requestedBy: 'U_RANDO',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => false,
+        journalWrite: async (input) => {
+          journal.push(input)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {
+          quiesceCalled = true
+        },
+        sendTmuxKeys: createRecordingSendKeys(tmuxCalls),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async (e) => {
+          reactions.push(e)
+        },
+      },
+    )
+
+    expect(result.kind).toBe('denied')
+    expect(journal[0]!.kind).toBe('admin.clear.denied')
+    expect(quiesceCalled).toBe(false)
+    expect(tmuxCalls).toEqual([])
+    expect(reactions).toEqual([])
+  })
+
+  test('ordering invariant: journal completes BEFORE quiesce + tmux + react', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const order: string[] = []
+
+    await dispatchAdminCommand(
+      {
+        kind: 'clear',
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async () => {
+          order.push('journal')
+        },
+        quiesceAndDeactivate: async () => {
+          order.push('quiesce')
+        },
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async () => {
+          order.push('react')
+        },
+      },
+    )
+
+    // Journal first; quiesce, tmux (no recording entry), react after.
+    expect(order[0]).toBe('journal')
+    expect(order.indexOf('journal')).toBeLessThan(order.indexOf('quiesce'))
+    expect(order.indexOf('quiesce')).toBeLessThan(order.indexOf('react'))
+  })
+
+  test('broken journal does NOT block execution (audit-resilience)', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    let quiesceCalled = false
+    const tmuxCalls: Array<readonly string[]> = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'clear',
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async () => {
+          throw new Error('disk full')
+        },
+        quiesceAndDeactivate: async () => {
+          quiesceCalled = true
+        },
+        sendTmuxKeys: createRecordingSendKeys(tmuxCalls),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('executed')
+    expect(quiesceCalled).toBe(true)
+    expect(tmuxCalls).toEqual([['/clear', 'Enter']])
+  })
+})
+
+describe('ccsc-3w0 — dispatchAdminCommand !restart (challenge phase)', () => {
+  test('no nonce → mints challenge, journals admin.restart.challenge, returns challenge_issued', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const tmuxCalls: Array<readonly string[]> = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'restart',
+        nonce: undefined,
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys(tmuxCalls),
+        issueChallenge: async () => ({ nonce: 'a1b2c3d4e5f6g7h8', expiresAt: 1_000_060 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('challenge_issued')
+    if (result.kind === 'challenge_issued') {
+      expect(result.nonce).toBe('a1b2c3d4e5f6g7h8')
+      expect(result.expiresAt).toBe(1_000_060)
+    }
+    expect(journal.find((j) => j.kind === 'admin.restart.challenge')).toBeDefined()
+    // Challenge phase does NOT execute the verb
+    expect(tmuxCalls).toEqual([])
+  })
+
+  test('journal does NOT record the nonce itself (ccsc-ofn invariant)', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const journal: Array<Record<string, unknown>> = []
+
+    await dispatchAdminCommand(
+      {
+        kind: 'restart',
+        nonce: undefined,
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'SECRET_NONCE', expiresAt: 1_000_060 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async () => {},
+      },
+    )
+
+    // The nonce MUST NOT appear in any journal event (defeats replay
+    // if a journal reader could harvest it). expiresAt is fine to
+    // record — it's not a credential.
+    const challengeEvent = journal.find((j) => j.kind === 'admin.restart.challenge')!
+    expect(JSON.stringify(challengeEvent)).not.toContain('SECRET_NONCE')
+  })
+})
+
+describe('ccsc-3w0 — dispatchAdminCommand !restart (redemption phase)', () => {
+  test('valid nonce → executes restart with journal + tmux /exit + react', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const tmuxCalls: Array<readonly string[]> = []
+    const reactions: string[] = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'restart',
+        nonce: 'a1b2c3d4e5f6g7h8',
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys(tmuxCalls),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({
+          ok: true,
+          challenge: {
+            nonce: 'a1b2c3d4e5f6g7h8',
+            userId: 'U_ALICE',
+            channelId: 'C_OPS',
+            expiresAt: 1_000_060,
+            consumed: true,
+          },
+        }),
+        postReaction: async (e) => {
+          reactions.push(e)
+        },
+      },
+    )
+
+    expect(result).toEqual({ kind: 'executed', verb: 'restart' })
+    expect(journal.find((j) => j.kind === 'admin.restart')).toBeDefined()
+    expect(tmuxCalls).toEqual([['/exit', 'Enter']])
+    expect(reactions).toEqual(['arrows_counterclockwise'])
+  })
+
+  test.each([
+    ['unknown' as const, 'unknown'],
+    ['expired' as const, 'expired'],
+    ['replay' as const, 'replay'],
+    ['wrong-channel' as const, 'wrong-channel'],
+    ['wrong-user' as const, 'wrong-user'],
+  ])('invalid nonce (reason=%s) → denied with admin.restart.denied, no execution', async (reason) => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const tmuxCalls: Array<readonly string[]> = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'restart',
+        nonce: 'bogus_nonce',
+        channelId: 'C_OPS',
+        requestedBy: 'U_ALICE',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys(tmuxCalls),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason }),
+        postReaction: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('denied')
+    if (result.kind === 'denied') {
+      expect(result.reason).toContain(reason)
+    }
+    expect(journal[0]!.kind).toBe('admin.restart.denied')
+    expect(tmuxCalls).toEqual([])
+  })
+
+  test('!restart with nonce but non-allowlisted user → denied at allowlist gate (nonce not even verified)', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    let verifyCalled = false
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'restart',
+        nonce: 'a1b2c3d4e5f6g7h8',
+        channelId: 'C_OPS',
+        requestedBy: 'U_RANDO',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => false,
+        journalWrite: async () => undefined,
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => {
+          verifyCalled = true
+          return { ok: false, reason: 'unknown' }
+        },
+        postReaction: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('denied')
+    // Allowlist gate short-circuits — verification is never attempted.
+    // Prevents an attacker who's NOT on the allowlist from probing the
+    // nonce store via the verify response code.
+    expect(verifyCalled).toBe(false)
+  })
+})
+
+describe('ccsc-3w0 — tmux helpers', () => {
+  test('createTmuxSendKeys refuses an empty session name (boot-time fail-loud)', async () => {
+    const { createTmuxSendKeys } = await import('./admin.ts')
+    expect(() => createTmuxSendKeys('')).toThrow('sessionName is empty')
+  })
+
+  test('createRecordingSendKeys captures keys as a separate array (snapshot)', async () => {
+    const { createRecordingSendKeys } = await import('./admin.ts')
+    const recorder: Array<readonly string[]> = []
+    const send = createRecordingSendKeys(recorder)
+    send(['/clear', 'Enter'])
+    send(['/exit', 'Enter'])
+    expect(recorder).toEqual([
+      ['/clear', 'Enter'],
+      ['/exit', 'Enter'],
+    ])
+  })
+})
+
+describe('ccsc-3w0 — virtual-tool invariant (admin.* MUST NOT be MCP tools)', () => {
+  test('no registered MCP tool name in server.ts starts with "admin."', async () => {
+    // The plan's locked decision #6: admin.clear / admin.restart are
+    // VIRTUAL policy tools, NOT registered MCP tools. Claude cannot
+    // invoke them by tool call; only operator Slack commands trigger
+    // them. This test pins that invariant by scanning server.ts for
+    // any registered tool name starting with `admin.`.
+    const src = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    // The toolSchemas declaration lists every registered tool by key.
+    // ListToolsRequest handler enumerates them by `name: '...'`. Scan
+    // both surfaces.
+    const nameRegistrations = src.match(/name:\s*['"]admin\.[a-z_.]+['"]/g) ?? []
+    expect(nameRegistrations).toEqual([])
+    // Also scan the toolSchemas object — keys that look like
+    // `admin.something:` would be tools too.
+    const toolSchemasBlock = src.match(/export const toolSchemas = \{[\s\S]*?\}/)?.[0] ?? ''
+    expect(toolSchemasBlock).not.toMatch(/^\s*admin\./m)
   })
 })

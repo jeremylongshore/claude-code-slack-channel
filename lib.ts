@@ -63,6 +63,13 @@ export interface ChannelPolicy {
    *  (redaction lives in the 30-A journal layer). Projection failures
    *  are log-only and never block tool execution. */
   audit?: AuditMode
+  /** Admin commands (`!clear` / `!restart`) opt-in for this channel
+   *  (ccsc-3w0). Default-safe: absent → no admin verbs in this
+   *  channel regardless of who types them. The `allowFrom` array
+   *  here is independent of the channel's regular `allowFrom` —
+   *  admin verbs are a tighter privilege and require explicit
+   *  per-channel + per-user opt-in. */
+  adminCommands?: { allowFrom: string[] }
 }
 
 export interface PendingEntry {
@@ -1253,6 +1260,30 @@ function isMentioned(event: Record<string, unknown>, botUserId: string): boolean
   if (!botUserId) return false
   const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
+}
+
+/** Strip a leading `<@U_BOT>` mention (with optional trailing
+ *  whitespace) from a message body. Used by the admin-command parser
+ *  (ccsc-3w0) so it sees normalized text — `<@U_BOT> !clear` and
+ *  `!clear` both reach `parseAdminCommand` as `!clear`.
+ *
+ *  This is the Gemini #1 finding from PR #157 (gog5-ops). Without
+ *  stripping, the admin-command regex `^!(clear|restart)$` would fail
+ *  to match on `requireMention=true` channels where every operator
+ *  message carries the bot mention.
+ *
+ *  Conservative: only strips a SINGLE leading mention of this bot.
+ *  Doesn't normalize quoted/escaped mentions or rewrite mid-body
+ *  occurrences. Adjacent whitespace after the mention is trimmed.
+ *
+ *  @param text       Raw event.text
+ *  @param botUserId  The current bot's Slack user_id (e.g., 'U_BOT123')
+ */
+export function stripBotMention(text: string, botUserId: string): string {
+  if (botUserId.length === 0) return text
+  const prefix = `<@${botUserId}>`
+  if (!text.startsWith(prefix)) return text
+  return text.slice(prefix.length).replace(/^\s+/, '')
 }
 
 // ---------------------------------------------------------------------------

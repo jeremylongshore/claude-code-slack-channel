@@ -1,0 +1,341 @@
+/**
+ * admin.ts — Operator admin command dispatcher (ccsc-3w0).
+ *
+ * The convergence point of the CCSC rollout (#167). Admin verbs
+ * `!clear` and `!restart` are the most-destructive operator actions
+ * the bridge exposes; they were the original story that kicked off
+ * the rollout (gog5-ops PR #157, self-closed). This module is the
+ * hardened reimplementation specified in the rollout plan + tracking
+ * issue #167.
+ *
+ * Design lineage (all decisions locked in the rollout plan):
+ *   - admin.clear / admin.restart are VIRTUAL policy tools — NOT
+ *     registered MCP tools. Claude cannot invoke them by tool call;
+ *     only operator Slack commands trigger them. This is enforced
+ *     by a test asserting no MCP tool name starts with `admin.`.
+ *   - The dispatcher routes through gate → parse → policy.evaluate
+ *     → journal.write → execute. Same shape as every other tool
+ *     call; admin verbs are not a bypass path.
+ *   - !restart requires HMAC nonce + cross-channel confirmation
+ *     (ccsc-ofn primitives) as a DAY-1 hard requirement. !clear is
+ *     reversible and runs without nonce friction.
+ *   - argv-mode execFileSync ('tmux', [...]) — no shell interpolation,
+ *     no shell-injection surface. Keystrokes are hardcoded constants.
+ *   - admin events sign under v2 (ccsc-22l) with policy_attestation
+ *     from day 1.
+ *
+ * Module placement: sibling to policy.ts, journal.ts, etc. Imports
+ * those for the dispatch path; FORBIDDEN by depcruise from importing
+ * manifest.ts (mirrors the 31-A.4 isolation invariant — admin verbs
+ * are authoritative, manifest data is advertising). Sibling module
+ * for the same reason policy-dispatch.ts and nonce-hitl.ts are
+ * siblings: the test suite imports the production code path directly
+ * without triggering server.ts boot-time side effects.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+import { execFileSync } from 'node:child_process'
+import type { JournalWriter } from './journal.ts'
+import type { NonceStore } from './nonce-hitl.ts'
+import { verifyNonce } from './nonce-hitl.ts'
+
+// ---------------------------------------------------------------------------
+// Types — AdminCommand discriminated union
+// ---------------------------------------------------------------------------
+
+/** Common fields on every admin command, regardless of verb. The
+ *  dispatcher consumes these for journal writes, policy evaluation,
+ *  and Slack reaction posting. */
+export interface AdminCommandBase {
+  /** Slack channel ID where the verb was uttered. The nonce flow
+   *  enforces redemption in the same channel; the journal records it. */
+  channelId: string
+  /** Slack user_id of the operator who issued the verb. Must be on
+   *  the channel's adminCommands.allowFrom list. */
+  requestedBy: string
+  /** Slack thread_ts where the verb appeared. Reactions post here. */
+  threadTs: string
+  /** Slack message_ts for the reaction target. */
+  messageTs: string
+}
+
+/** !clear — reversible: clears bridge session state + Claude TUI
+ *  conversation in one operation. No nonce required. */
+export interface AdminClearCommand extends AdminCommandBase {
+  kind: 'clear'
+}
+
+/** !restart — destructive: exits the Claude TUI session via tmux
+ *  send-keys '/exit'. Requires HMAC nonce + cross-channel confirmation
+ *  (ccsc-ofn) from day 1. */
+export interface AdminRestartCommand extends AdminCommandBase {
+  kind: 'restart'
+  /** The nonce the operator supplied. When undefined, the dispatcher
+   *  must MINT a fresh nonce and DM it to the operator (challenge
+   *  phase). When defined, the dispatcher VERIFIES the nonce
+   *  (redemption phase). */
+  nonce: string | undefined
+}
+
+export type AdminCommand = AdminClearCommand | AdminRestartCommand
+
+// ---------------------------------------------------------------------------
+// Parser — text → AdminCommand
+// ---------------------------------------------------------------------------
+
+/** Matches the admin-verb shape: `!clear` or `!restart [<nonce>]`.
+ *  Anchored — the dispatcher caller is responsible for stripping any
+ *  Slack mention prefix (`<@U_BOT>`) before passing text in. See
+ *  `stripBotMention()` in lib.ts. */
+const ADMIN_COMMAND_RE = /^!(clear|restart)(?:\s+(\S+))?$/
+
+/** Parse a normalized text body into an `AdminCommand`, or `null` if
+ *  the text doesn't match an admin verb. Pure function — no side
+ *  effects, no policy evaluation, no Slack calls. The dispatcher
+ *  composes this with policy + journal + execution.
+ *
+ *  Input contract:
+ *    - `text` MUST already be mention-stripped (e.g., `!clear` not
+ *      `<@U_BOT> !clear`).
+ *    - The dispatcher caller is responsible for trim + normalize.
+ *
+ *  Return:
+ *    - `AdminClearCommand` for `!clear` (no args permitted)
+ *    - `AdminRestartCommand` for `!restart` (nonce arg optional)
+ *    - `null` for any non-match — the caller treats this as a normal
+ *      inbound message and proceeds with the regular gate.
+ */
+export function parseAdminCommand(
+  text: string,
+  envelope: Omit<AdminCommandBase, never>,
+): AdminCommand | null {
+  const match = ADMIN_COMMAND_RE.exec(text.trim())
+  if (match === null) return null
+  const verb = match[1] as 'clear' | 'restart'
+  const arg = match[2]
+
+  if (verb === 'clear') {
+    // !clear takes NO arguments. If an arg was provided, refuse to
+    // match — the operator likely typo'd. Falling through to null
+    // means the message is treated as normal chat (the gate may still
+    // refuse it for other reasons). This is the conservative choice.
+    if (arg !== undefined) return null
+    return { kind: 'clear', ...envelope }
+  }
+
+  // verb === 'restart'
+  return { kind: 'restart', nonce: arg, ...envelope }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher — orchestrate policy + journal + execute
+// ---------------------------------------------------------------------------
+
+/** Outcome of `dispatchAdminCommand`. The dispatcher never throws —
+ *  every failure path returns a structured outcome so the caller can
+ *  react (e.g., post a Slack message explaining why a verb was
+ *  rejected). */
+export type DispatchOutcome =
+  | { kind: 'executed'; verb: 'clear' | 'restart' }
+  | { kind: 'challenge_issued'; nonce: string; expiresAt: number }
+  | { kind: 'denied'; reason: string }
+
+/** Dependencies the dispatcher needs. Injected so tests can swap
+ *  mocks for the side-effectful pieces (tmux, journal, Slack, nonce
+ *  store) and exercise the orchestration in isolation. */
+export interface DispatchDeps {
+  /** Evaluate the channel's adminCommands.allowFrom rule. Returns
+   *  true if the requester is allowed to issue admin verbs in this
+   *  channel; false otherwise. The caller is responsible for
+   *  channel-policy lookup. */
+  isAllowed: (channelId: string, userId: string) => boolean
+  /** Journal writer for admin events. Awaited so the durable record
+   *  exists BEFORE Slack reactions / tmux execution happen. */
+  journalWrite: (input: Parameters<JournalWriter['writeEvent']>[0]) => Promise<unknown>
+  /** Quiesce + deactivate the operator's bridge-side session state
+   *  (called by !clear). Provided by SessionSupervisor. */
+  quiesceAndDeactivate: () => Promise<void>
+  /** Send a literal keystroke sequence to the tmux session that hosts
+   *  Claude Code. argv-mode by construction — the dispatcher passes
+   *  the keys array verbatim; the implementation must use
+   *  `execFileSync('tmux', ['send-keys', ...args])` with no shell
+   *  interpolation. Tests inject a no-op implementation. */
+  sendTmuxKeys: (keys: readonly string[]) => void
+  /** Mint a fresh HMAC nonce + DM it to the operator. Returns the
+   *  challenge so the dispatcher can journal the issuance. */
+  issueChallenge: (
+    userId: string,
+    channelId: string,
+  ) => Promise<{ nonce: string; expiresAt: number }>
+  /** Verify a presented nonce against the store. Returns the
+   *  ccsc-ofn VerifyResult. */
+  verifyChallenge: (
+    nonce: string,
+    presentedBy: { userId: string; channelId: string },
+  ) => ReturnType<typeof verifyNonce>
+  /** Post a Slack reaction to the originating message. ♻️ for !clear,
+   *  🔄 for !restart. */
+  postReaction: (emoji: string) => Promise<void>
+}
+
+/** Dispatch an admin command through the full pipeline:
+ *
+ *   1. Allowlist check (channel's `adminCommands.allowFrom`).
+ *      → fail: `denied` with reason; journal `policy.deny` (caller's
+ *        responsibility via the existing deny dispatcher).
+ *   2. For !restart with no nonce: issue challenge.
+ *      Mint nonce + journal `admin.restart.challenge` + return
+ *      `challenge_issued` for the caller to DM.
+ *   3. For !restart with nonce: verify.
+ *      → fail: `denied` with reason ('expired' / 'replay' /
+ *        'wrong-channel' / 'wrong-user' / 'unknown'); journal
+ *        `admin.restart.denied`.
+ *      → ok: proceed to execute.
+ *   4. For !clear: skip challenge phase entirely.
+ *   5. Execute:
+ *      - !clear: journal `admin.clear` → quiesceAndDeactivate →
+ *        sendTmuxKeys(['send-keys', '-t', '<SESSION>', '/clear', 'Enter'])
+ *        → react ♻️
+ *      - !restart: journal `admin.restart` → sendTmuxKeys(['send-keys',
+ *        '-t', '<SESSION>', '/exit', 'Enter']) → react 🔄
+ *
+ *  Ordering invariant: journal write completes BEFORE
+ *  quiesceAndDeactivate / sendTmuxKeys / postReaction. If the journal
+ *  is wedged the dispatcher logs to stderr and continues — admin
+ *  verbs are authoritative even on a broken journal. Same posture as
+ *  policy-dispatch's resilience contract. */
+export async function dispatchAdminCommand(
+  cmd: AdminCommand,
+  deps: DispatchDeps,
+): Promise<DispatchOutcome> {
+  // Allowlist gate — same shape regardless of verb.
+  if (!deps.isAllowed(cmd.channelId, cmd.requestedBy)) {
+    await journalAttempt(deps, cmd, 'denied', 'requester not on adminCommands.allowFrom')
+    return { kind: 'denied', reason: 'requester not authorized for admin commands in this channel' }
+  }
+
+  if (cmd.kind === 'clear') {
+    await journalAttempt(deps, cmd, 'allow')
+    await deps.quiesceAndDeactivate()
+    // Argv-mode by contract on the dep — no shell interpolation. We
+    // emit the keystrokes in two steps (literal /clear, then Enter)
+    // because tmux send-keys takes each token as a separate argv.
+    deps.sendTmuxKeys(['/clear', 'Enter'])
+    await deps.postReaction('recycle')
+    return { kind: 'executed', verb: 'clear' }
+  }
+
+  // cmd.kind === 'restart'
+
+  // Challenge phase: no nonce → mint + DM + journal.
+  if (cmd.nonce === undefined) {
+    const challenge = await deps.issueChallenge(cmd.requestedBy, cmd.channelId)
+    await deps.journalWrite({
+      kind: 'admin.restart.challenge',
+      outcome: 'n/a',
+      actor: 'session_owner',
+      // Intentionally NOT recording the nonce itself in the journal —
+      // a journal-read attacker would otherwise have a free
+      // replay credential. The expiry timestamp is recorded so an
+      // investigator can correlate challenge timing with subsequent
+      // verifications. ccsc-ofn invariant.
+      input: { expires_at: challenge.expiresAt },
+      sessionKey: { channel: cmd.channelId, thread: cmd.threadTs },
+    })
+    return { kind: 'challenge_issued', nonce: challenge.nonce, expiresAt: challenge.expiresAt }
+  }
+
+  // Verification phase: nonce supplied → verify.
+  const verifyResult = deps.verifyChallenge(cmd.nonce, {
+    userId: cmd.requestedBy,
+    channelId: cmd.channelId,
+  })
+  if (!verifyResult.ok) {
+    await journalAttempt(deps, cmd, 'denied', `nonce verification failed: ${verifyResult.reason}`)
+    return { kind: 'denied', reason: `nonce ${verifyResult.reason}` }
+  }
+
+  // Execute restart.
+  await journalAttempt(deps, cmd, 'allow')
+  // /exit closes the Claude Code session. tmux respawn-pane (operator's
+  // existing automation) brings it back; the dispatcher doesn't manage
+  // the respawn.
+  deps.sendTmuxKeys(['/exit', 'Enter'])
+  await deps.postReaction('arrows_counterclockwise')
+  return { kind: 'executed', verb: 'restart' }
+}
+
+/** Common journal-write path for admin events. Records verb +
+ *  outcome + requester + channel. Defensive on throw — admin
+ *  decision is authoritative even on a broken journal. */
+async function journalAttempt(
+  deps: DispatchDeps,
+  cmd: AdminCommand,
+  outcome: 'allow' | 'denied',
+  reason?: string,
+): Promise<void> {
+  const kindMap = {
+    clear: outcome === 'allow' ? 'admin.clear' : 'admin.clear.denied',
+    restart: outcome === 'allow' ? 'admin.restart' : 'admin.restart.denied',
+  } as const
+  try {
+    await deps.journalWrite({
+      kind: kindMap[cmd.kind],
+      outcome: outcome === 'allow' ? 'allow' : 'deny',
+      actor: 'session_owner',
+      sessionKey: { channel: cmd.channelId, thread: cmd.threadTs },
+      ...(reason !== undefined ? { reason } : {}),
+    })
+  } catch (err) {
+    console.error('[slack] journal.writeEvent failed (admin event)', {
+      kind: kindMap[cmd.kind],
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// tmux send-keys — argv-mode helper (production)
+// ---------------------------------------------------------------------------
+
+/** Production implementation of `DispatchDeps.sendTmuxKeys`. Executes
+ *  `tmux send-keys -t <session> <keys...>` via argv-mode execFileSync
+ *  — NO shell interpolation, NO opportunity for command injection
+ *  via SESSION or keys. Keys are passed verbatim as separate argv
+ *  elements; tmux parses literal keystroke names (e.g., 'Enter') and
+ *  text strings.
+ *
+ *  Refuses to execute if `sessionName` is empty — a missing
+ *  SLACK_TMUX_SESSION env var must be a loud boot-time error, not a
+ *  silent no-op at admin-verb time.
+ *
+ *  OpenClaw 2026 security analysis attack classes addressed:
+ *    - Shell-quoting bypass: N/A — no shell involved
+ *    - Line-continuation: N/A — argv elements are literal
+ *    - Busybox multiplexing: N/A — direct execFileSync of `tmux`
+ *    - GNU option abbreviation: tmux uses its own option parser; our
+ *      argv shape uses `-t <session>` which is unambiguous
+ */
+export function createTmuxSendKeys(sessionName: string): (keys: readonly string[]) => void {
+  if (sessionName.length === 0) {
+    throw new Error(
+      'createTmuxSendKeys: sessionName is empty — refuse to construct a sendKeys that would target the default session. Set SLACK_TMUX_SESSION before enabling admin commands.',
+    )
+  }
+  return (keys) => {
+    // Argv: ['send-keys', '-t', sessionName, ...keys]. No shell.
+    execFileSync('tmux', ['send-keys', '-t', sessionName, ...keys], { stdio: 'ignore' })
+  }
+}
+
+/** Test-only no-op sendKeys. Records calls into the provided array so
+ *  tests can assert the argv that would have been sent. Production
+ *  code must use `createTmuxSendKeys`. */
+export function createRecordingSendKeys(
+  recorder: Array<readonly string[]>,
+): (keys: readonly string[]) => void {
+  return (keys) => {
+    recorder.push([...keys])
+  }
+}

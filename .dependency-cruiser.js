@@ -49,6 +49,21 @@ export default {
       from: { path: '^journal\\.ts$' },
       to: { path: '^policy\\.ts$' },
     },
+    {
+      name: 'no-admin-imports-manifest',
+      severity: 'error',
+      comment:
+        'ccsc-3w0 invariant — admin.ts must not import from manifest.ts. ' +
+        'Admin verbs (!clear / !restart) are authoritative operator actions; ' +
+        'the manifest module is advertising-only ("advertisements are not ' +
+        'grants" — Miller 2006, see 000-docs/bot-manifest-protocol.md). ' +
+        'If admin.ts imported manifest.ts, a peer bot that advertises a ' +
+        'capability could influence admin dispatch — exactly the bypass the ' +
+        '31-A.4 invariant exists to prevent. Same isolation pattern as ' +
+        'no-policy-imports-manifest, applied to the admin module.',
+      from: { path: '^admin\\.ts$' },
+      to: { path: '^manifest\\.ts$' },
+    },
   ],
   options: {
     tsConfig: {

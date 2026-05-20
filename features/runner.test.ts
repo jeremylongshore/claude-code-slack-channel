@@ -18,6 +18,7 @@ import { afterAll, beforeEach, describe, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { buildRunner, parseFeature, StepRegistry, validateRegistry } from './runner.ts'
+import { registerAdminSteps } from './steps/admin.ts'
 import { registerGateSteps } from './steps/gate.ts'
 import { cleanupJournalFixtures, registerJournalSteps } from './steps/journal.ts'
 import { registerOutboundSteps } from './steps/outbound.ts'
@@ -131,6 +132,20 @@ afterAll(() => {
   const feature = loadFeature('tier-shadow.feature')
   const registry = new StepRegistry()
   registerTierShadowSteps(registry)
+  validateRegistry(feature, registry)
+
+  const runFeature = buildRunner(feature, registry)
+  runFeature(describe, test, beforeEach)
+}
+
+// ---------------------------------------------------------------------------
+// 7. Admin commands — dispatchAdminCommand() in admin.ts (ccsc-3w0)
+// ---------------------------------------------------------------------------
+
+{
+  const feature = loadFeature('admin_commands.feature')
+  const registry = new StepRegistry()
+  registerAdminSteps(registry)
   validateRegistry(feature, registry)
 
   const runFeature = buildRunner(feature, registry)
