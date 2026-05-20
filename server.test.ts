@@ -10845,6 +10845,28 @@ describe('crypto.ts primitives (ccsc-22l)', () => {
     expect(parsed.seed).toBe(kp.seed)
   })
 
+  test('parseKeyPairYaml strips trailing inline comments (post-Gemini robustness)', async () => {
+    const { generateKeyPair, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    // Inline comment appended to the seed line — engineer-edit pattern
+    // ("which rotation is this?") that would otherwise break base64
+    // decoding downstream.
+    const yaml = `seed: ${kp.seed} # rotation note\ncreated_at: ${kp.createdAt} # generated today\n`
+    const parsed = parseKeyPairYaml(yaml)
+    expect(parsed.seed).toBe(kp.seed)
+    expect(parsed.createdAt).toBe(kp.createdAt)
+  })
+
+  test('derivePublicKey verifies the SPKI prefix before slicing (post-Gemini robustness)', async () => {
+    // Positive test: well-formed key derivation should still work after
+    // the prefix check. This pins the happy path; the negative path
+    // (Node returning a non-Ed25519 SPKI) cannot be triggered without
+    // mocking node:crypto, which is outside the unit test envelope.
+    const { generateKeyPair, derivePublicKey } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    expect(() => derivePublicKey(kp.seed)).not.toThrow()
+  })
+
   test('parseKeyPairYaml rejects missing seed', async () => {
     const { parseKeyPairYaml } = await import('./crypto.ts')
     expect(() => parseKeyPairYaml('created_at: 2026-01-01T00:00:00Z\n')).toThrow(

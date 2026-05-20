@@ -113,10 +113,16 @@ export function parseKeyPairYaml(yamlText: string): Ed25519KeyPair {
     const colonIdx = line.indexOf(':')
     if (colonIdx <= 0) continue
     const key = line.slice(0, colonIdx).trim()
-    const value = line
-      .slice(colonIdx + 1)
-      .trim()
-      .replace(/^["']|["']$/g, '')
+    let value = line.slice(colonIdx + 1).trim()
+    // Strip trailing inline comments. Defensive — the SOPS round-trip
+    // doesn't emit comments, but engineer-edited files sometimes do
+    // (e.g., `seed: <base64> # rotation 2026-08-15`) and the comment
+    // would otherwise break base64 / date parsing downstream.
+    const hashIdx = value.indexOf('#')
+    if (hashIdx >= 0) {
+      value = value.slice(0, hashIdx).trim()
+    }
+    value = value.replace(/^["']|["']$/g, '')
     fields.set(key, value)
   }
 
@@ -267,6 +273,17 @@ export function derivePublicKey(seedB64: string): string {
   })
   const pubKeyDer = createPublicKey(privateKey).export({ format: 'der', type: 'spki' })
   // SPKI prefix is 12 bytes; strip it to get the raw 32-byte public key.
+  // Verify the prefix bytes match the expected Ed25519 SPKI envelope
+  // before slicing — guards against future Node crypto API changes
+  // that might return a different DER framing. Without this check, a
+  // changed framing would silently return wrong bytes that "verify"
+  // against signatures produced by the same wrong-bytes path,
+  // breaking interop with every other RFC 8032 implementation.
+  if (!pubKeyDer.subarray(0, SPKI_ED25519_PREFIX.length).equals(SPKI_ED25519_PREFIX)) {
+    throw new Error(
+      'derivePublicKey: exported SPKI does not match expected Ed25519 prefix (RFC 8410)',
+    )
+  }
   const rawPub = pubKeyDer.subarray(SPKI_ED25519_PREFIX.length)
   if (rawPub.length !== 32) {
     throw new Error(
