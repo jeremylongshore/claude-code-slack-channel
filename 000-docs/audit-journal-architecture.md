@@ -274,6 +274,105 @@ Why separate the projection?
 
 ---
 
+## Signed events — journal v2 (ccsc-22l)
+
+Journal v2 layers Ed25519 signing on top of the hash chain. The schema
+bump is **additive only**:
+
+| Field | v1 | v2 |
+|---|---|---|
+| `v` | `1` | `2` |
+| `signature` | absent | base64-encoded 64-byte Ed25519 over canonical bytes |
+| `policy_attestation` | absent | `{ digest: <sha256-hex>, alg: 'sha256' }` |
+
+The `signature` signs the same canonical bytes the `hash` covers
+(`canonicalJson(event minus hash minus signature)`). Hash and
+signature are independent attestations of the same payload, not
+nested — the hash protects the chain order, the signature protects
+the writer identity.
+
+`policy_attestation.digest` is computed by `policyDigest()` in
+`policy.ts` (SHA-256 of `canonicalJson(sortedById(rules))`). It ties
+every event to the policy in effect when the writer wrote it — without
+it, an audit reader can tell THAT a decision happened but not UNDER
+WHAT RULES.
+
+### Module ownership (`no-journal-imports-policy` invariant)
+
+`journal.ts` MUST NOT import from `policy.ts`. The digest crosses the
+module boundary as an opaque 64-char hex string — `journal.ts` treats
+it as a primitive. The reverse direction (`policy.ts` importing
+`canonicalJson` from `journal.ts`) is permitted: both modules need
+the same canonicalizer to agree on byte form. The invariant is
+enforced by `.dependency-cruiser.js`.
+
+### Writer modes
+
+| Boot config | Writer emits |
+|---|---|
+| `signingKey: undefined` (no SOPS key, or `--no-audit-signing`) | v1 events (backward-compatible) |
+| `signingKey: <Ed25519KeyPair>` | v2 events with `signature` |
+| `signingKey: <kp>, policyDigest: <hex>` | v2 events with `signature` + `policy_attestation` |
+
+`JournalWriter.setPolicyDigest(digest)` updates the attestation on
+subsequent events when the operator hot-reloads policy. Calling it on
+an unsigned writer is a no-op.
+
+### Verifier (`verifyJournal(path, opts)`)
+
+`opts.initialPublicKey` is the operator's published key (the one pinned
+in the external gist per `key-management.md`). The verifier walks the
+chain and:
+
+1. Checks the schema version transition: v1 → v2 contiguous is
+   permitted; v2 → v1 after a v2 event is a **rollback tamper signal**
+   and fails verification.
+2. For v2 events that carry a `signature`, verifies it against the
+   currently-active public key. The verifier swaps keys on every
+   accepted `system.key_rotation` event — that event itself must
+   verify under the OLD key, after which `input.new_public_key`
+   becomes active.
+3. A v2 event with a `signature` but no verifier-provided key fails
+   loudly (you cannot verify a signed chain without the key).
+4. A v2 event WITHOUT a `signature` while the verifier holds a key is
+   rejected (unsigned event smuggled into a signed chain).
+
+### `system.key_rotation` event
+
+| Field | Value |
+|---|---|
+| `v` | `2` |
+| `kind` | `'system.key_rotation'` |
+| `actor` | `'session_owner'` |
+| `input.old_public_key` | base64 of the retiring key |
+| `input.new_public_key` | base64 of the incoming key |
+| `input.rotation_reason` | `'scheduled-90day'` / `'compromise-suspected'` / `'operator-initiated'` |
+| `signature` | signed under the OLD key |
+
+The verifier uses the old key to verify this event, then switches to
+`input.new_public_key` for every subsequent event. This is the
+same pattern RFC 6962 Certificate Transparency uses for log-key
+rotation: the rotation itself is part of the auditable record,
+signed by the authority that's stepping down.
+
+### Backward-compatible reading
+
+The verifier accepts any of:
+- All v1 chain (no public key needed)
+- All v2 chain with `initialPublicKey`
+- v1-then-v2 contiguous transition with `initialPublicKey` (the
+  cutover lands as the operator boots into signed mode)
+
+Mixed v2-then-v1 is rejected — the only legitimate way a chain
+contains a v1 event after a v2 event is a downgrade attack, so it's a
+tamper signal.
+
+See `000-docs/key-management.md` for the operational doc on key
+storage (SOPS+age), rotation cadence (90 days), and recovery
+procedures.
+
+---
+
 ## Verification command
 
 Epic 30-A ships `verifyJournal(path)` as an exported function from

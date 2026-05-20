@@ -17,9 +17,11 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createHash } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 import { z } from 'zod'
+import { canonicalJson } from './journal.ts'
 
 // ---------------------------------------------------------------------------
 // MatchSpec — which tool calls a rule applies to.
@@ -381,6 +383,12 @@ export interface EvaluateOptions {
  *    - `deny` (rule = 'default') if `call.tool` is in requireAuthoredPolicy
  *    - `allow` (rule undefined) otherwise
  */
+/** Tier evaluation order, strictest first (ccsc-8pw). Admin wins over
+ *  User wins over Workspace wins over Default. When at least one rule
+ *  in a higher tier matches, that tier's decision is the result; lower
+ *  tiers are not consulted. */
+const TIER_PRIORITY: readonly PolicyTier[] = ['admin', 'user', 'workspace', 'default']
+
 export function evaluate(
   call: ToolCall,
   rules: readonly PolicyRule[],
@@ -390,31 +398,48 @@ export function evaluate(
   const approvals = opts.approvals ?? new Map<ApprovalKey, { ttlExpires: number }>()
   const requireAuthored = opts.requireAuthoredPolicy ?? DEFAULT_REQUIRE_AUTHORED_POLICY
 
-  for (const rule of rules) {
-    if (!matchApplies(rule.match, call)) continue
+  // Tier-aware combining algorithm (ccsc-8pw): strictest-tier-wins,
+  // then first-applicable within tier.
+  //
+  // Backward compatibility: when no rule declares a tier, every rule
+  // lives in the 'default' tier. The for-loop below walks admin → user
+  // → workspace → default; with no rules in admin/user/workspace, only
+  // default runs, and `default` walks every rule in the order the
+  // operator authored them — exactly the v0.5.x behavior. Existing
+  // tests and existing access.json files continue to behave identically.
+  //
+  // When tiers ARE used, every rule in a higher tier is considered before
+  // any rule in a lower tier. A `deny` in Admin always beats an
+  // `auto_approve` in Workspace AND an `auto_approve` in Admin always
+  // beats a `deny` in Workspace (the intentional "Admin overrides" path).
+  for (const tier of TIER_PRIORITY) {
+    for (const rule of rules) {
+      if (effectiveTier(rule) !== tier) continue
+      if (!matchApplies(rule.match, call)) continue
 
-    switch (rule.effect) {
-      case 'auto_approve':
-        return { kind: 'allow', rule: rule.id }
-      case 'deny':
-        return { kind: 'deny', rule: rule.id, reason: rule.reason }
-      case 'require_approval': {
-        const approval = approvals.get(approvalKey(rule.id, call.sessionKey))
-        if (approval && approval.ttlExpires > now) {
+      switch (rule.effect) {
+        case 'auto_approve':
           return { kind: 'allow', rule: rule.id }
-        }
-        return {
-          kind: 'require',
-          rule: rule.id,
-          approver: 'human_approver',
-          ttlMs: rule.ttlMs,
-          approvers: rule.approvers,
+        case 'deny':
+          return { kind: 'deny', rule: rule.id, reason: rule.reason }
+        case 'require_approval': {
+          const approval = approvals.get(approvalKey(rule.id, call.sessionKey))
+          if (approval && approval.ttlExpires > now) {
+            return { kind: 'allow', rule: rule.id }
+          }
+          return {
+            kind: 'require',
+            rule: rule.id,
+            approver: 'human_approver',
+            ttlMs: rule.ttlMs,
+            approvers: rule.approvers,
+          }
         }
       }
     }
   }
 
-  // No rule matched — default branch.
+  // No rule in any tier matched — default branch.
   if (requireAuthored.has(call.tool)) {
     return {
       kind: 'deny',
@@ -496,6 +521,32 @@ export function assertUniqueRuleIds(rules: readonly PolicyRule[]): void {
       `duplicate rule id(s): ${sorted.join(', ')}. Every rule must have a unique id — the evaluator uses first-applicable, so a second rule with the same id is unreachable.`,
     )
   }
+}
+
+// ---------------------------------------------------------------------------
+// policyDigest() — SHA-256 attestation hash for journal v2 (ccsc-22l)
+// ---------------------------------------------------------------------------
+
+/** Compute a deterministic SHA-256 hash over the canonical JCS form
+ *  of the active PolicyRule[]. Used by the journal writer to populate
+ *  `policy_attestation.digest` on every v2 event.
+ *
+ *  Determinism contract: the same rule set (regardless of input array
+ *  order) produces the same digest. We sort by `id` before
+ *  canonicalizing so the digest depends on the rule SET, not the
+ *  AUTHORING ORDER. This matters because `evaluate()` is order-
+ *  sensitive (first-applicable) but the digest is a content fingerprint
+ *  — two operators who arrive at the same set of rules via different
+ *  edit paths should land on the same digest.
+ *
+ *  Why this lives in policy.ts rather than journal.ts: the digest is
+ *  derived from PolicyRule shapes, which are policy's domain. journal.ts
+ *  treats the digest as an opaque 64-char hex string — see the
+ *  `no-journal-imports-policy` invariant. The digest crosses the
+ *  module boundary as a primitive, not as a structured policy object. */
+export function policyDigest(rules: readonly PolicyRule[]): string {
+  const sorted = [...rules].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  return createHash('sha256').update(canonicalJson(sorted)).digest('hex')
 }
 
 // ---------------------------------------------------------------------------

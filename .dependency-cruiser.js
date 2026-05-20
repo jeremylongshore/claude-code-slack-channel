@@ -33,6 +33,22 @@ export default {
       from: { path: '^policy\\.ts$' },
       to: { path: '^manifest\\.ts$' },
     },
+    {
+      name: 'no-journal-imports-policy',
+      severity: 'error',
+      comment:
+        'ccsc-22l invariant — journal.ts must not import from policy.ts. The ' +
+        '`policy_attestation.digest` field is an opaque 64-char hex string ' +
+        'computed by policy.ts:policyDigest() and passed into the journal ' +
+        'writer as a primitive. If journal.ts imported policy.ts, the ' +
+        'forensic record would become coupled to policy-engine internals ' +
+        '— breaking the "journal is the system-of-record" invariant. The ' +
+        'reverse direction (policy.ts importing canonicalJson from ' +
+        'journal.ts) is permitted: policy needs the same canonicalizer to ' +
+        'compute its digest deterministically.',
+      from: { path: '^journal\\.ts$' },
+      to: { path: '^policy\\.ts$' },
+    },
   ],
   options: {
     tsConfig: {

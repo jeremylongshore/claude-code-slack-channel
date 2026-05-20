@@ -91,13 +91,35 @@ compound logic is expressed by authoring multiple rules.
 
 ---
 
-## Combining algorithm: first-applicable (XACML)
+## Combining algorithm: strictest-tier-wins, then first-applicable (ccsc-8pw)
 
-The evaluator scans the policy list in authored order and returns on the
-first rule whose `match` matches the call. No scoring, no weighting, no
-"most specific wins."
+The evaluator combines rules in two passes:
 
-**Why first-applicable:**
+1. **Strictest-tier-wins across tiers.** Tiers are evaluated in order
+   `admin → user → workspace → default`. For each tier, the evaluator
+   walks rules in that tier in authored order (first-applicable). The
+   first matching rule's effect is the decision; lower tiers are not
+   consulted.
+2. **First-applicable within a tier.** Within a single tier, the v0.5.x
+   semantic still holds — the operator scans top-to-bottom, the first
+   matching rule wins, no scoring or weighting.
+
+This is the **tier-aware** form of the original first-applicable
+algorithm. When no rule declares a tier, every rule lives in
+`'default'` and the behavior collapses to the original single-tier
+first-applicable. Backward compatibility is structural: existing
+`access.json` files load and evaluate identically.
+
+**Why two passes:**
+
+| Property | Original | Tier-aware |
+|---|---|---|
+| Readability | top-to-bottom | top-to-bottom within tier; tier label is the section header |
+| Asymmetric override | not expressible | admin auto_approve overrides workspace deny (intended); admin deny overrides workspace auto_approve (intended) |
+| Footgun protection | shadow lint within authored order | shadow lint within authored order + cross-tier intersection lint (ccsc-4g8) for the silent-override case |
+| Multi-operator deployment | re-author every rule per operator | declare provenance via `tier`; cohort/enterprise contexts decode naturally |
+
+**Why first-applicable within a tier:**
 
 1. **Readability under review.** An operator authoring rules by hand can
    predict the outcome by reading top-to-bottom. No mental model of
@@ -108,6 +130,19 @@ first rule whose `match` matches the call. No scoring, no weighting, no
 3. **Monotonicity.** Appending a new rule at the end can never weaken the
    policy — a later rule only fires when every earlier rule misses. New
    rules are safe edits.
+
+**Tier semantics:**
+
+- `'default'` — un-tiered rules. Behaves identically to v0.5.x.
+- `'workspace'` — rules attached to the Slack workspace (multi-channel scope).
+- `'user'` — rules attached to a specific operator identity.
+- `'admin'` — rules from the operator/security authority; overrides everything below.
+
+The tiers are **opaque to the engine** beyond their ordinal precedence
+— the engine doesn't know what "admin" means socially, only that admin
+rules are consulted first. This keeps the model deployable in any
+context that wants override layering (cohort, enterprise, partner
+engagement).
 
 The default when no rule matches is **deny-by-omission** for tools listed
 in `requireAuthoredPolicy`, and **allow** for others. The default set
