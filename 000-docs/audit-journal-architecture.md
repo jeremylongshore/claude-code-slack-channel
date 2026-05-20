@@ -597,6 +597,53 @@ in the server wiring.
 
 ---
 
+## Admin verb events (ccsc-3w0)
+
+Operator-initiated admin commands (`!clear`, `!restart`) emit five
+distinct EventKinds. Each is journaled BEFORE side effects (tmux
+send-keys, supervisor.quiesce, Slack reaction) so the durable record
+exists even if the side effects fail.
+
+| EventKind | Emitted by | Carries | When |
+|---|---|---|---|
+| `admin.clear` | `dispatchAdminCommand` | `sessionKey: { channel, thread }`, `actor: 'session_owner'` | `!clear` accepted (allowlist pass) |
+| `admin.clear.denied` | `dispatchAdminCommand` | same + `reason` | `!clear` rejected (allowlist miss) |
+| `admin.restart` | `dispatchAdminCommand` | `sessionKey`, `actor` | `!restart` redeemed (nonce verified) |
+| `admin.restart.denied` | `dispatchAdminCommand` | same + `reason` (allowlist miss OR nonce-verification failure) | `!restart` rejected |
+| `admin.restart.challenge` | `dispatchAdminCommand` | `sessionKey`, `input.expires_at` | `!restart` first phase — nonce minted + DM'd |
+
+### Nonce is never journaled
+
+`admin.restart.challenge` records the challenge expiry timestamp but
+**NOT** the nonce value. A journal-read attacker who could harvest the
+nonce would have a free replay credential. The expiry is recorded so
+an investigator can correlate challenge timing with subsequent
+verifications (`admin.restart` or `admin.restart.denied` events
+follow within the TTL).
+
+Verified by test `server.test.ts §"ccsc-3w0 — journal does NOT record
+the nonce itself"`.
+
+### admin.* are signed under v2 from day 1
+
+Per the rollout's locked design: every admin event signs with the
+operator's Ed25519 audit key (ccsc-22l) and carries
+`policy_attestation` with the active policy digest. A future operator
+auditing "did I really run this !restart?" can verify the signature
+plus prove what policy was in effect at the moment.
+
+### Module-boundary invariant — admin.ts ⊥ manifest.ts
+
+`admin.ts` MUST NOT import from `manifest.ts`. Admin verbs are
+authoritative operator actions; the manifest module is advertising-
+only ("advertisements are not grants"). If `admin.ts` imported
+`manifest.ts`, a peer bot that advertises a capability could influence
+admin dispatch — exactly the bypass the 31-A.4 invariant exists to
+prevent. Enforced by `.dependency-cruiser.js` rule
+`no-admin-imports-manifest`.
+
+---
+
 ## Non-goals
 
 - **Not a log aggregator.** One host, one file.

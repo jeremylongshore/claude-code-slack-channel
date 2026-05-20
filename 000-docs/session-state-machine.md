@@ -369,6 +369,56 @@ for the precedent and the `.dependency-cruiser.js` rule that enforces it.
 
 ---
 
+## Admin-verb entry points (ccsc-3w0)
+
+The `dispatchAdminCommand` function in `admin.ts` is a NEW external
+entry point into the supervisor's lifecycle. It calls
+`quiesceAndDeactivate()` on `!clear` — the only non-inbound caller of
+that operation. The flow:
+
+```
+operator types `!clear` in Slack channel C
+   │
+   ▼
+gate() normalizes text, allowlist check passes
+   │
+   ▼
+parseAdminCommand(text, envelope) → AdminClearCommand
+   │
+   ▼
+dispatchAdminCommand(cmd, deps)
+   │
+   ├─ isAllowed(channelId, userId)        — channel adminCommands gate
+   ├─ journalWrite('admin.clear')          — durable record FIRST
+   ├─ deps.quiesceAndDeactivate()          — supervisor quiesce + deactivate
+   ├─ deps.sendTmuxKeys(['/clear', 'Enter']) — Claude TUI clears
+   └─ deps.postReaction('recycle')         — Slack ♻️ on the trigger msg
+```
+
+`!restart` follows the same shape but adds the HMAC nonce + cross-
+channel handshake (ccsc-ofn) between `journalWrite` and `sendTmuxKeys`.
+
+### Why admin verbs touch the supervisor
+
+The supervisor's `activate` / `quiesce` / `deactivate` API was
+designed for inbound-message lifecycle: a new message activates a
+session, idle reaping deactivates it. Admin verbs are the FIRST
+non-inbound caller — the operator explicitly asks for state reset.
+The supervisor's contract was already total ("any sequence of
+activate/quiesce/deactivate must be safe"); admin verbs don't expand
+the contract, they just exercise the explicit-deactivate branch the
+idle reaper already uses.
+
+### Why dispatch lives in `admin.ts`, not `supervisor.ts`
+
+Supervisor stays in its layer — it owns the FSM, not the operator
+verb language. `admin.ts` is the boundary translator: parses operator
+text into supervisor calls, the same way `mapAcpSessionCancel` in
+`server.ts` parses ACP envelopes into supervisor calls. One module
+per external dialect.
+
+---
+
 ## Invariants
 
 Every 32-A PR is checked against these. Drift is a review block.
