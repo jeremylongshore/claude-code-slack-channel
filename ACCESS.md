@@ -328,3 +328,106 @@ SLACK_SENDABLE_ROOTS=/Users/you/projects/report-outputs:/tmp/claude-artifacts
 If the reply tool tries to attach a path outside the allowlist (or on the
 denylist), the upload is blocked with a generic error that names WHICH
 check failed but does not echo the attempted path.
+
+---
+
+## HMAC nonce + cross-channel HITL for destructive admin verbs (ccsc-ofn)
+
+Destructive admin commands — `!restart` today, future `!stop` — require
+**cross-channel confirmation**. Same-channel verb matching alone, even
+gated by `allowFrom`, is not sufficient against the EchoLeak threat class
+(see [`000-docs/THREAT-MODEL.md`](000-docs/THREAT-MODEL.md) T11): an
+attacker who can inject content into the operator's trusted Slack
+surface could craft both the verb AND a fake confirmation prompt response.
+The two-step handshake closes that.
+
+### Flow
+
+```
+Step 1 — operator triggers
+  Channel C:  Jeremy: !restart
+                       │
+                       ▼
+  Server: mintNonce(userId='U_JEREMY', channelId='C') → nonce='a1b2c3d4e5f6g7h8'
+  Server: chat.postMessage({ channel: 'U_JEREMY', text: 'Confirm with: !restart a1b2c3d4e5f6g7h8' })
+                       │
+                       ▼
+Step 2 — out-of-band delivery
+  DM channel D (private): bot DMs the nonce to U_JEREMY
+
+Step 3 — operator redeems
+  Channel C:  Jeremy: !restart a1b2c3d4e5f6g7h8
+                       │
+                       ▼
+  Server: verifyNonce('a1b2c3d4e5f6g7h8', { userId: 'U_JEREMY', channelId: 'C' }, store)
+                       │
+                       ▼
+  ✓ nonce exists           ✓ not expired (within 60s TTL)
+  ✓ not consumed (single-use)
+  ✓ userId matches        ✓ channelId matches origin
+                       │
+                       ▼
+  Server: execute !restart, journal admin.restart event under v2 signing
+```
+
+### Why each property matters
+
+| Property | What it prevents |
+|---|---|
+| **Nonce delivered out-of-band (DM)** | A content vector that injected the verb into channel C cannot also inject the nonce into a private DM. The bot's authenticated identity gates the DM. |
+| **Redemption in original channel** | Pasting the nonce in the DM does NOT redeem it. An attacker who somehow reads the DM still cannot replay the nonce — they'd have to also post in channel C as the operator. |
+| **userId binding** | Even allowlisted teammates cannot consume someone else's nonce. The verb-issuer must be the redeemer. |
+| **Single-use (consumed flag)** | Replay attacks fail; each nonce works exactly once. |
+| **60s TTL** | A compromised state file decays fast. Long enough for an operator to read the DM and paste; short enough that stale nonces don't accumulate. |
+| **64-bit entropy** | Random-guess is computationally infeasible (`2^64 / 60s ≈ 3.1×10^17 attempts/sec`). |
+| **Constant-time comparison** | Defense-in-depth against timing side channels; not load-bearing at this entropy but cheap. |
+| **Per-user cap (`MAX_LIVE_NONCES_PER_USER = 3`)** | An attacker who can spam the verb trigger cannot grow the store unboundedly; oldest live nonce evicts. |
+
+### What is NOT mitigated
+
+- **Operator-as-attacker**: an operator who voluntarily types `!restart`,
+  reads the DM, and pastes the nonce back is who the system trusts. No
+  software can refuse a legitimate operator's keystrokes.
+- **Compromised operator account**: if the attacker controls the
+  operator's Slack identity, they receive the DM and complete the
+  handshake. The mitigation is account hygiene (Slack 2FA, etc.) — out
+  of scope for the bridge.
+- **Restart loss**: process restart drops every pending nonce. This is
+  intentional — persisting nonces across restarts would defeat the
+  "compromised state file decays fast" property. An operator who
+  triggers `!restart`, the bridge restarts, then they try to redeem
+  with the old nonce will see "unknown" and need to re-trigger.
+
+### Verb scope
+
+The nonce flow applies to **destructive verbs only**:
+
+| Verb | Nonce required? | Rationale |
+|---|---|---|
+| `!clear` | No | Reversible — clears bridge session state + Claude TUI conversation; operator can resume |
+| `!restart` | Yes | Destructive — exits the Claude process; any in-flight work is lost |
+| `!mute <agent>` (future, ccsc-gjm) | No | Reversible — peer-bot drop for a TTL; auto-clears |
+| `!stop` (future) | Yes | Destructive — would halt mid-tool-call |
+
+This trade is explicit: friction is reserved for verbs whose accidental
+firing is expensive. `!clear` runs unguarded because a stray `!clear`
+costs the operator a re-paste; `!restart` runs nonce-gated because a
+stray `!restart` costs minutes of work.
+
+### Implementation
+
+Primitives live in `nonce-hitl.ts` (sibling module — pure, testable
+without `server.ts` boot path):
+
+- `createMemoryNonceStore()` — in-memory store with per-user cap
+- `mintNonce(userId, channelId, store, now?, ttlMs?, rng?)` — generates,
+  registers, returns the challenge
+- `verifyNonce(presentedNonce, { userId, channelId }, store, now?)` —
+  redeems, returns structured `ok` | `unknown` | `expired` | `replay` |
+  `wrong-channel` | `wrong-user`
+
+The dispatcher in `admin.ts` (ccsc-3w0) composes these with Slack DM
+delivery — that module is the integration point, not this one.
+
+See [`000-docs/THREAT-MODEL.md`](000-docs/THREAT-MODEL.md) T11 +
+invariant #7 for the threat model the nonce flow addresses.

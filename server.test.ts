@@ -11087,3 +11087,266 @@ describe('ccsc-06s — recordPolicyDenyToJournal', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// ccsc-ofn — HMAC nonce + cross-channel HITL primitives
+// ---------------------------------------------------------------------------
+//
+// Tests the nonce-hitl.ts module directly (it's a sibling module, no
+// server.ts boot path needed). Covers mint, verify happy/replay/expiry/
+// wrong-channel/wrong-user, single-use enforcement, per-user cap, and
+// pruneExpired sweep.
+
+describe('ccsc-ofn — mintNonce', () => {
+  test('returns a 16-char lowercase hex nonce', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    expect(c.nonce).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  test('registers the challenge in the store under its nonce', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    expect(store.get(c.nonce)).toEqual(c)
+  })
+
+  test('expiresAt = now + ttlMs (deterministic clock)', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000, 60_000)
+    expect(c.expiresAt).toBe(1_000_000 + 60_000)
+  })
+
+  test('fresh challenge is not consumed', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    expect(c.consumed).toBe(false)
+  })
+
+  test('different mints produce different nonces (probabilistic, but 2^64 collision space)', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const seen = new Set<string>()
+    for (let i = 0; i < 100; i++) {
+      seen.add(mintNonce('U_ALICE', 'C_OPS', store).nonce)
+    }
+    expect(seen.size).toBe(100)
+  })
+
+  test('caps per-user live nonces at MAX_LIVE_NONCES_PER_USER, evicting oldest', async () => {
+    const { mintNonce, createMemoryNonceStore, MAX_LIVE_NONCES_PER_USER } = await import(
+      './nonce-hitl.ts'
+    )
+    const store = createMemoryNonceStore()
+    let t = 1_000_000
+    const minted: string[] = []
+    // Mint cap + 2 nonces with increasing expiresAt
+    for (let i = 0; i < MAX_LIVE_NONCES_PER_USER + 2; i++) {
+      const c = mintNonce('U_ALICE', 'C_OPS', store, () => t)
+      minted.push(c.nonce)
+      t += 1000
+    }
+    // Store should hold exactly MAX_LIVE_NONCES_PER_USER entries for this user
+    let aliceCount = 0
+    for (let i = 0; i < minted.length; i++) {
+      if (store.get(minted[i]!) !== undefined) aliceCount += 1
+    }
+    expect(aliceCount).toBe(MAX_LIVE_NONCES_PER_USER)
+    // The oldest two (lowest indices) should have been evicted
+    expect(store.get(minted[0]!)).toBeUndefined()
+    expect(store.get(minted[1]!)).toBeUndefined()
+    // The newest MAX_LIVE_NONCES_PER_USER should survive
+    expect(store.get(minted[minted.length - 1]!)).toBeDefined()
+  })
+
+  test('per-user cap is per-user — Alice exceeding does not evict Bob', async () => {
+    const { mintNonce, createMemoryNonceStore, MAX_LIVE_NONCES_PER_USER } = await import(
+      './nonce-hitl.ts'
+    )
+    const store = createMemoryNonceStore()
+    const bobNonce = mintNonce('U_BOB', 'C_OPS', store).nonce
+    for (let i = 0; i < MAX_LIVE_NONCES_PER_USER + 5; i++) {
+      mintNonce('U_ALICE', 'C_OPS', store)
+    }
+    // Bob's challenge survives — per-user cap isolation
+    expect(store.get(bobNonce)).toBeDefined()
+  })
+})
+
+describe('ccsc-ofn — verifyNonce (happy path)', () => {
+  test('valid (nonce, userId, channelId) returns ok and marks consumed', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    const r = verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.challenge.consumed).toBe(true)
+  })
+
+  test('verification returns the full challenge for audit', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000)
+    const r = verifyNonce(
+      c.nonce,
+      { userId: 'U_ALICE', channelId: 'C_OPS' },
+      store,
+      () => 1_000_001,
+    )
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.challenge.userId).toBe('U_ALICE')
+      expect(r.challenge.channelId).toBe('C_OPS')
+    }
+  })
+})
+
+describe('ccsc-ofn — verifyNonce (failure modes)', () => {
+  test('unknown nonce — reason: "unknown"', async () => {
+    const { verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const r = verifyNonce('deadbeefcafebabe', { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('unknown')
+  })
+
+  test('expired nonce — reason: "expired"', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000, 60_000)
+    // Redeem past expiry
+    const r = verifyNonce(
+      c.nonce,
+      { userId: 'U_ALICE', channelId: 'C_OPS' },
+      store,
+      () => 1_060_001,
+    )
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('expired')
+  })
+
+  test('exact-at-expiry — reason: "expired" (boundary condition)', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000, 60_000)
+    // Exactly at expiry is treated as expired (per `<=` semantics)
+    const r = verifyNonce(
+      c.nonce,
+      { userId: 'U_ALICE', channelId: 'C_OPS' },
+      store,
+      () => 1_060_000,
+    )
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('expired')
+  })
+
+  test('replay after successful redemption — reason: "replay"', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    // First redemption succeeds
+    const r1 = verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r1.ok).toBe(true)
+    // Second redemption is rejected
+    const r2 = verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r2.ok).toBe(false)
+    if (!r2.ok) expect(r2.reason).toBe('replay')
+  })
+
+  test('wrong user — reason: "wrong-user" (cross-operator redemption blocked)', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    const r = verifyNonce(c.nonce, { userId: 'U_BOB', channelId: 'C_OPS' }, store)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('wrong-user')
+  })
+
+  test('wrong channel — reason: "wrong-channel" (cross-channel property)', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    // Pasting the nonce in the DM channel (where it was delivered)
+    // does NOT redeem it. The redemption must occur in the channel
+    // where the original verb was uttered.
+    const r = verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'D_ALICE_DM' }, store)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('wrong-channel')
+  })
+
+  test('rejected verification does NOT mark the challenge consumed', async () => {
+    // A failed redemption attempt must leave the challenge available
+    // for the legitimate operator to retry within the TTL — otherwise
+    // an attacker could "burn" challenges by attempting replays.
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store)
+    verifyNonce(c.nonce, { userId: 'U_BOB', channelId: 'C_OPS' }, store) // wrong-user
+    verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'C_OTHER' }, store) // wrong-channel
+    // Legitimate operator can still redeem
+    const r = verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r.ok).toBe(true)
+  })
+})
+
+describe('ccsc-ofn — pruneExpired sweep', () => {
+  test('removes expired entries and returns the count', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000, 60_000)
+    mintNonce('U_BOB', 'C_OPS', store, () => 1_000_000, 60_000)
+    mintNonce('U_CARL', 'C_OPS', store, () => 1_500_000, 60_000)
+    // Sweep at t=1_080_000 — Alice and Bob's TTLs have passed (expires at
+    // 1_060_000), Carl's hasn't (expires at 1_560_000)
+    const removed = store.pruneExpired(1_080_000)
+    expect(removed).toBe(2)
+    expect(store.size()).toBe(1)
+  })
+
+  test('no-op when no entries are expired', async () => {
+    const { mintNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000)
+    const removed = store.pruneExpired(1_000_001)
+    expect(removed).toBe(0)
+    expect(store.size()).toBe(1)
+  })
+
+  test('after prune, verify on an expired nonce returns "unknown" not "expired"', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const c = mintNonce('U_ALICE', 'C_OPS', store, () => 1_000_000, 60_000)
+    store.pruneExpired(2_000_000)
+    const r = verifyNonce(c.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('unknown') // pruned, not just expired
+  })
+})
+
+describe('ccsc-ofn — store independence (multiple operators, multiple channels)', () => {
+  test('two operators with distinct challenges do not interfere', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const alice = mintNonce('U_ALICE', 'C_OPS', store)
+    const bob = mintNonce('U_BOB', 'C_OPS', store)
+    // Alice redeems hers
+    const r1 = verifyNonce(alice.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store)
+    expect(r1.ok).toBe(true)
+    // Bob can still redeem his — Alice's consumption did not affect him
+    const r2 = verifyNonce(bob.nonce, { userId: 'U_BOB', channelId: 'C_OPS' }, store)
+    expect(r2.ok).toBe(true)
+  })
+
+  test('one operator with challenges in two channels — channels are independent', async () => {
+    const { mintNonce, verifyNonce, createMemoryNonceStore } = await import('./nonce-hitl.ts')
+    const store = createMemoryNonceStore()
+    const a = mintNonce('U_ALICE', 'C_OPS', store)
+    const b = mintNonce('U_ALICE', 'C_INFRA', store)
+    // Redeem each in its own channel
+    expect(verifyNonce(a.nonce, { userId: 'U_ALICE', channelId: 'C_OPS' }, store).ok).toBe(true)
+    expect(verifyNonce(b.nonce, { userId: 'U_ALICE', channelId: 'C_INFRA' }, store).ok).toBe(true)
+  })
+})
