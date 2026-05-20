@@ -5543,10 +5543,10 @@ describe('JournalEvent', () => {
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
     // 5 admin.* kinds (ccsc-3w0: admin.clear, admin.clear.denied,
-    // admin.restart, admin.restart.denied, admin.restart.challenge).
-    // If this number drifts, update the doc count in journal.ts's
-    // header comment too — both must agree.
-    expect(kinds).toHaveLength(29)
+    // admin.restart, admin.restart.denied, admin.restart.challenge) +
+    // system.stream_finalize (ccsc-ele). If this number drifts,
+    // update the doc count in journal.ts's header comment too.
+    expect(kinds).toHaveLength(30)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -5557,6 +5557,7 @@ describe('JournalEvent', () => {
     expect(kinds).toContain('admin.restart')
     expect(kinds).toContain('admin.restart.denied')
     expect(kinds).toContain('admin.restart.challenge')
+    expect(kinds).toContain('system.stream_finalize')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -11935,5 +11936,450 @@ describe('ccsc-3w0 — virtual-tool invariant (admin.* MUST NOT be MCP tools)', 
     // `admin.something:` would be tools too.
     const toolSchemasBlock = src.match(/export const toolSchemas = \{[\s\S]*?\}/)?.[0] ?? ''
     expect(toolSchemasBlock).not.toMatch(/^\s*admin\./m)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ccsc-ele — streamReply (progressive Slack reply via chat.update)
+// ---------------------------------------------------------------------------
+
+describe('ccsc-ele — streamReply happy path', () => {
+  test('short text (single chunk): one postMessage, no updates, finalize event', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const posts: Array<Record<string, unknown>> = []
+    const updates: Array<Record<string, unknown>> = []
+
+    const result = await streamReply(
+      { channel: 'C_OPS', threadTs: '1700000000.000100', text: 'short reply', chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async (a) => {
+          posts.push(a)
+          return { ts: '1700000001.000200' }
+        },
+        updateMessage: async (a) => {
+          updates.push(a)
+        },
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('completed')
+    if (result.kind === 'completed') {
+      expect(result.chunksSent).toBe(1)
+      expect(result.ts).toBe('1700000001.000200')
+    }
+    expect(posts.length).toBe(1)
+    expect(updates.length).toBe(0) // no updates for single-chunk
+    // Two journal events: allow at start + finalize at end. No per-chunk.
+    expect(journal.length).toBe(2)
+    expect(journal[0]!.kind).toBe('gate.outbound.allow')
+    expect(journal[1]!.kind).toBe('system.stream_finalize')
+  })
+
+  test('long text (multiple chunks): one post + N-1 updates, progressive reveal', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const posts: Array<{ text: string }> = []
+    const updates: Array<{ ts: string; text: string }> = []
+    const sleepCalls: number[] = []
+
+    // 1500 chars / chunkSize 500 → 3 chunks
+    const longText = 'x'.repeat(1500)
+    const result = await streamReply(
+      { channel: 'C_OPS', text: longText, chunkSize: 500, rateLimitMs: 1000 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async (a) => {
+          posts.push({ text: a.text })
+          return { ts: '1700000001.000200' }
+        },
+        updateMessage: async (a) => {
+          updates.push({ ts: a.ts, text: a.text })
+        },
+        journalWrite: async () => undefined,
+        sleep: async (ms) => {
+          sleepCalls.push(ms)
+        },
+      },
+    )
+
+    expect(result.kind).toBe('completed')
+    if (result.kind === 'completed') expect(result.chunksSent).toBe(3)
+    // Initial post: first 500 chars
+    expect(posts[0]!.text.length).toBe(500)
+    // Two subsequent updates with running cumulative text (1000, 1500)
+    expect(updates.length).toBe(2)
+    expect(updates[0]!.text.length).toBe(1000)
+    expect(updates[1]!.text.length).toBe(1500)
+    // chat.update targets the cached ts from postMessage — invariant
+    expect(updates[0]!.ts).toBe('1700000001.000200')
+    expect(updates[1]!.ts).toBe('1700000001.000200')
+    // Rate limit respected between chunks: 2 sleeps for 3 chunks
+    expect(sleepCalls).toEqual([1000, 1000])
+  })
+
+  test('pre-committed hash matches finalize event input', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const text = 'hello world this is a test message'
+
+    await streamReply(
+      { channel: 'C_OPS', text, chunkSize: 10 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => ({ ts: '1.0' }),
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    // gate.outbound.allow carries the hash; system.stream_finalize echoes the same hash
+    const allowInput = journal[0]!.input as Record<string, unknown>
+    const finalizeInput = journal[journal.length - 1]!.input as Record<string, unknown>
+    expect(allowInput.full_text_hash).toBeTruthy()
+    expect(finalizeInput.committed_hash).toBe(allowInput.full_text_hash)
+  })
+
+  test('expected_chunks in allow event matches chunks_sent in finalize event', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    const longText = 'x'.repeat(2500)
+
+    await streamReply(
+      { channel: 'C_OPS', text: longText, chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => ({ ts: '1.0' }),
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    const allowInput = journal[0]!.input as Record<string, unknown>
+    const finalizeInput = journal[journal.length - 1]!.input as Record<string, unknown>
+    expect(allowInput.expected_chunks).toBe(5)
+    expect(finalizeInput.chunks_sent).toBe(5)
+  })
+})
+
+describe('ccsc-ele — streamReply gate-rejected at start', () => {
+  test('assertOutboundAllowed throws at start → no post, no journal, gate_rejected_at_start', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    let posted = false
+
+    const result = await streamReply(
+      { channel: 'C_REMOVED', text: 'hello' },
+      {
+        assertOutboundAllowed: () => {
+          throw new Error('channel not in allowlist')
+        },
+        postMessage: async () => {
+          posted = true
+          return { ts: '1.0' }
+        },
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('gate_rejected_at_start')
+    if (result.kind === 'gate_rejected_at_start') {
+      expect(result.reason).toContain('not in allowlist')
+    }
+    expect(posted).toBe(false)
+    expect(journal.length).toBe(0)
+  })
+})
+
+describe('ccsc-ele — streamReply mid-stream failure', () => {
+  test('channel removed mid-stream → gate throws on a later chunk → failed_mid_stream + finalize with reason', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    let gateCalls = 0
+
+    const result = await streamReply(
+      { channel: 'C_OPS', text: 'x'.repeat(1500), chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {
+          gateCalls += 1
+          // Allow chunk 1; reject chunks 2+ (channel removed mid-stream)
+          if (gateCalls > 1) {
+            throw new Error('Outbound gate: channel C_OPS removed')
+          }
+        },
+        postMessage: async () => ({ ts: '1.0' }),
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('failed_mid_stream')
+    if (result.kind === 'failed_mid_stream') {
+      // First chunk landed, then gate rejected
+      expect(result.chunksSent).toBe(1)
+      expect(result.reason).toContain('removed')
+    }
+    // gate.outbound.allow + system.stream_finalize (with deny outcome)
+    const finalize = journal.find((j) => j.kind === 'system.stream_finalize')!
+    expect(finalize.outcome).toBe('deny')
+    expect(finalize.reason).toContain('removed')
+  })
+
+  test('updateMessage rejects (e.g. Slack 429) → failed_mid_stream + finalize records the reason', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+
+    const result = await streamReply(
+      { channel: 'C_OPS', text: 'x'.repeat(1500), chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => ({ ts: '1.0' }),
+        updateMessage: async () => {
+          throw new Error('rate_limited')
+        },
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('failed_mid_stream')
+    if (result.kind === 'failed_mid_stream') {
+      expect(result.reason).toContain('rate_limited')
+    }
+    const finalize = journal.find((j) => j.kind === 'system.stream_finalize')!
+    expect(finalize.reason).toContain('rate_limited')
+  })
+})
+
+describe('ccsc-ele — streamReply invariants', () => {
+  test('all chat.update calls reuse the cached ts from postMessage (cached-ts invariant)', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const updates: string[] = []
+
+    await streamReply(
+      { channel: 'C_OPS', text: 'x'.repeat(2000), chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => ({ ts: 'CACHED_TS' }),
+        updateMessage: async (a) => {
+          updates.push(a.ts)
+        },
+        journalWrite: async () => undefined,
+        sleep: async () => {},
+      },
+    )
+
+    // Every update targets the cached ts — never recomputed, never
+    // taken from caller input
+    expect(updates.every((ts) => ts === 'CACHED_TS')).toBe(true)
+  })
+
+  test('exactly ONE gate.outbound.allow + ONE system.stream_finalize regardless of chunk count', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+
+    await streamReply(
+      // 10,000 chars / 500 = 20 chunks
+      { channel: 'C_OPS', text: 'x'.repeat(10_000), chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => ({ ts: '1.0' }),
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    const allowEvents = journal.filter((j) => j.kind === 'gate.outbound.allow')
+    const finalizeEvents = journal.filter((j) => j.kind === 'system.stream_finalize')
+    expect(allowEvents).toHaveLength(1)
+    expect(finalizeEvents).toHaveLength(1)
+    expect(journal).toHaveLength(2)
+  })
+
+  test('sleep precedes each chat.update (rate-limit invariant)', async () => {
+    const { streamReply } = await import('./stream-reply.ts')
+    const order: string[] = []
+
+    await streamReply(
+      { channel: 'C_OPS', text: 'x'.repeat(1500), chunkSize: 500, rateLimitMs: 250 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => {
+          order.push('post')
+          return { ts: '1.0' }
+        },
+        updateMessage: async () => {
+          order.push('update')
+        },
+        journalWrite: async () => undefined,
+        sleep: async () => {
+          order.push('sleep')
+        },
+      },
+    )
+
+    // post → sleep → update → sleep → update
+    expect(order).toEqual(['post', 'sleep', 'update', 'sleep', 'update'])
+  })
+
+  test('broken journal at stream START rejects — refuses to post without durable audit', async () => {
+    // Design choice: a journal failure at stream START aborts the
+    // stream before any Slack content posts. Posting bytes that
+    // can't be journaled is the worse outcome — operators rely on
+    // the journal to reconstruct what was sent.
+    const { streamReply } = await import('./stream-reply.ts')
+    let posted = false
+
+    await expect(
+      streamReply(
+        { channel: 'C_OPS', text: 'x'.repeat(1500), chunkSize: 500 },
+        {
+          assertOutboundAllowed: () => {},
+          postMessage: async () => {
+            posted = true
+            return { ts: '1.0' }
+          },
+          updateMessage: async () => {},
+          journalWrite: async () => {
+            throw new Error('disk full')
+          },
+          sleep: async () => {},
+        },
+      ),
+    ).rejects.toThrow('disk full')
+    // No Slack content posted — the rejection happens before postMessage
+    expect(posted).toBe(false)
+  })
+
+  test('broken journal at FINALIZE does NOT block completion (chunks already sent)', async () => {
+    // Once the chunks have landed in Slack, a journal failure on the
+    // finalize event is just an audit gap — the chunks themselves
+    // cannot be unwound. streamReply swallows the finalize-write
+    // error (logged to stderr) and returns the result the stream
+    // actually achieved.
+    const { streamReply } = await import('./stream-reply.ts')
+    let writeCount = 0
+
+    const result = await streamReply(
+      { channel: 'C_OPS', text: 'x'.repeat(1500), chunkSize: 500 },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => ({ ts: '1.0' }),
+        updateMessage: async () => {},
+        journalWrite: async () => {
+          writeCount += 1
+          // Allow the first write (gate.outbound.allow); fail on
+          // finalize. streamReply catches the finalize-write error
+          // and still returns completed.
+          if (writeCount > 1) throw new Error('disk full on finalize')
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('completed')
+    if (result.kind === 'completed') expect(result.chunksSent).toBe(3)
+  })
+})
+
+describe('ccsc-ele — Gemini #181 review fixes', () => {
+  test('empty text is rejected at gate-rejected-at-start (no crash, no journal, no post)', async () => {
+    // Gemini high-priority finding: chunkText('') returns [] which
+    // would crash at chunks[0]!. Guard added.
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    let posted = false
+
+    const result = await streamReply(
+      { channel: 'C_OPS', text: '' },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => {
+          posted = true
+          return { ts: '1.0' }
+        },
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('gate_rejected_at_start')
+    if (result.kind === 'gate_rejected_at_start') {
+      expect(result.reason).toContain('empty text')
+    }
+    expect(posted).toBe(false)
+    expect(journal.length).toBe(0)
+  })
+
+  test('postMessage failure after allow event STILL emits finalize event (invariant holds on early failure)', async () => {
+    // Gemini high-priority finding: postMessage rejection between
+    // gate.outbound.allow and any chunks would leave the journal
+    // with one allow + zero finalize, breaking the "exactly TWO
+    // events per stream" invariant. Fixed by wrapping postMessage
+    // in try/catch + writing finalize before re-throw.
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+
+    await expect(
+      streamReply(
+        { channel: 'C_OPS', text: 'x'.repeat(500) },
+        {
+          assertOutboundAllowed: () => {},
+          postMessage: async () => {
+            throw new Error('Slack unreachable')
+          },
+          updateMessage: async () => {},
+          journalWrite: async (i) => {
+            journal.push(i as Record<string, unknown>)
+            return undefined
+          },
+          sleep: async () => {},
+        },
+      ),
+    ).rejects.toThrow('Slack unreachable')
+
+    // Both events present — invariant holds.
+    const allow = journal.find((j) => j.kind === 'gate.outbound.allow')
+    const finalize = journal.find((j) => j.kind === 'system.stream_finalize')
+    expect(allow).toBeDefined()
+    expect(finalize).toBeDefined()
+    expect(finalize!.outcome).toBe('deny')
+    expect(finalize!.reason as string).toContain('Slack unreachable')
+    // chunks_sent: 0 — postMessage never returned a successful ts
+    expect((finalize!.input as { chunks_sent: number }).chunks_sent).toBe(0)
   })
 })

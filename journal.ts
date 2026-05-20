@@ -93,6 +93,14 @@ export const EventKind = z.enum([
   // switch to new_public_key for every subsequent event. See
   // 000-docs/key-management.md § Rotation.
   'system.key_rotation',
+  // Stream finalize (ccsc-ele). Emitted exactly once per logical
+  // stream after the last chat.update lands. Carries the
+  // pre-committed full-text hash + chunks_sent count. The single
+  // gate.outbound.allow at stream start + this finalize event are
+  // the ONLY journal entries per stream — no per-chunk events
+  // (would cause O(n²) canonicalize cost on the chain). See
+  // 000-docs/audit-journal-architecture.md § Streaming reply.
+  'system.stream_finalize',
   // Admin verbs (ccsc-3w0). Emitted on every operator-initiated
   // admin command — !clear (reversible) and !restart (destructive,
   // nonce-gated). See admin.ts dispatcher and ACCESS.md § HMAC nonce.

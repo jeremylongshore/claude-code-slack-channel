@@ -597,6 +597,66 @@ in the server wiring.
 
 ---
 
+## Streaming reply (ccsc-ele)
+
+Long Claude replies stream into Slack progressively via `chat.update`:
+the user sees the message body grow in real time. Implemented in
+`stream-reply.ts:streamReply()`.
+
+### Journal contract — exactly two events per stream
+
+| Phase | EventKind | When | Body |
+|---|---|---|---|
+| Stream start | `gate.outbound.allow` | Before any Slack call, after pre-flight gate | `input.full_text_hash` (SHA-256 of complete text), `input.expected_chunks`, `input.stream: true` |
+| Stream end | `system.stream_finalize` | After last chunk lands (success or mid-stream failure) | `input.ts` (cached message ts), `input.chunks_sent`, `input.committed_hash`. `outcome: 'allow'` on success, `'deny'` on mid-stream failure with `reason` |
+
+**Critical: NO per-chunk events.** Recording each chunk would cause
+O(n²) canonicalize cost on the hash chain and introduce a finalization
+race where chunk-N's event might land before chunk-(N-1)'s. The
+pre-committed hash + matching finalize hash is the integrity property:
+a verifier replaying the chain can confirm the message that was sent
+matches the hash committed at start — without needing intermediate
+state.
+
+### Cached-ts invariant
+
+`chat.update` calls reuse the `ts` returned by the initial
+`chat.postMessage`. The dispatcher never recomputes the ts, never
+takes it from caller input. Pinned by test.
+
+### Per-chunk gate check
+
+`assertOutboundAllowed` runs on EVERY chunk, not just the initial.
+The journal events stay at one-per-stream, but the gate's defensive
+check happens every time. If the channel is removed from access
+mid-stream:
+
+1. Gate throws on the next chunk's check
+2. streamReply catches the throw
+3. `system.stream_finalize` is written with `outcome: 'deny'` and
+   the reason
+4. Stream returns `failed_mid_stream` with chunks-sent count
+
+This addresses verification plan item #8 ("`chat.update` after channel
+removal still rejected") without per-chunk event noise.
+
+### Rate-limit awareness
+
+Slack's `chat.update` is Tier 4: 1 req/sec per channel. Default
+`rateLimitMs = 1000`. `streamReply` sleeps between chunks; the sleep
+is injected as a dep so tests bypass wall-clock waits.
+
+### Audit-resilience asymmetry
+
+| Where journal throws | Behavior | Rationale |
+|---|---|---|
+| `gate.outbound.allow` at start | streamReply REJECTS — no Slack post happens | Posting content that can't be journaled is the worse outcome; aborting before postMessage is the safer fail |
+| `system.stream_finalize` at end | streamReply catches, logs to stderr, returns `completed` anyway | Chunks already landed in Slack — they can't be unwound. A missing finalize event is an audit gap, not a correctness break |
+
+Pinned by two distinct tests.
+
+---
+
 ## Admin verb events (ccsc-3w0)
 
 Operator-initiated admin commands (`!clear`, `!restart`) emit five
