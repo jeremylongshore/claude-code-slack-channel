@@ -35,10 +35,13 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import type { JournalWriter } from './journal.ts'
 import type { NonceStore } from './nonce-hitl.ts'
 import { verifyNonce } from './nonce-hitl.ts'
+
+const execFileAsync = promisify(execFile)
 
 // ---------------------------------------------------------------------------
 // Types — AdminCommand discriminated union
@@ -108,7 +111,7 @@ const ADMIN_COMMAND_RE = /^!(clear|restart)(?:\s+(\S+))?$/
  */
 export function parseAdminCommand(
   text: string,
-  envelope: Omit<AdminCommandBase, never>,
+  envelope: AdminCommandBase,
 ): AdminCommand | null {
   const match = ADMIN_COMMAND_RE.exec(text.trim())
   if (match === null) return null
@@ -159,9 +162,11 @@ export interface DispatchDeps {
   /** Send a literal keystroke sequence to the tmux session that hosts
    *  Claude Code. argv-mode by construction — the dispatcher passes
    *  the keys array verbatim; the implementation must use
-   *  `execFileSync('tmux', ['send-keys', ...args])` with no shell
-   *  interpolation. Tests inject a no-op implementation. */
-  sendTmuxKeys: (keys: readonly string[]) => void
+   *  `execFile('tmux', ['send-keys', ...args])` with no shell
+   *  interpolation. Returns a Promise so the dispatcher does not
+   *  block the event loop on synchronous process execution (Gemini
+   *  review on PR #180). Tests inject a Promise-returning no-op. */
+  sendTmuxKeys: (keys: readonly string[]) => Promise<void>
   /** Mint a fresh HMAC nonce + DM it to the operator. Returns the
    *  challenge so the dispatcher can journal the issuance. */
   issueChallenge: (
@@ -221,7 +226,7 @@ export async function dispatchAdminCommand(
     // Argv-mode by contract on the dep — no shell interpolation. We
     // emit the keystrokes in two steps (literal /clear, then Enter)
     // because tmux send-keys takes each token as a separate argv.
-    deps.sendTmuxKeys(['/clear', 'Enter'])
+    await deps.sendTmuxKeys(['/clear', 'Enter'])
     await deps.postReaction('recycle')
     return { kind: 'executed', verb: 'clear' }
   }
@@ -261,7 +266,7 @@ export async function dispatchAdminCommand(
   // /exit closes the Claude Code session. tmux respawn-pane (operator's
   // existing automation) brings it back; the dispatcher doesn't manage
   // the respawn.
-  deps.sendTmuxKeys(['/exit', 'Enter'])
+  await deps.sendTmuxKeys(['/exit', 'Enter'])
   await deps.postReaction('arrows_counterclockwise')
   return { kind: 'executed', verb: 'restart' }
 }
@@ -300,42 +305,48 @@ async function journalAttempt(
 // ---------------------------------------------------------------------------
 
 /** Production implementation of `DispatchDeps.sendTmuxKeys`. Executes
- *  `tmux send-keys -t <session> <keys...>` via argv-mode execFileSync
- *  — NO shell interpolation, NO opportunity for command injection
- *  via SESSION or keys. Keys are passed verbatim as separate argv
- *  elements; tmux parses literal keystroke names (e.g., 'Enter') and
- *  text strings.
+ *  `tmux send-keys -t <session> <keys...>` via argv-mode async
+ *  `execFile` (promisified) — NO shell interpolation, NO opportunity
+ *  for command injection via SESSION or keys, AND does not block the
+ *  Node event loop while tmux runs. Keys are passed verbatim as
+ *  separate argv elements; tmux parses literal keystroke names
+ *  (e.g., 'Enter') and text strings.
  *
- *  Refuses to execute if `sessionName` is empty — a missing
+ *  Refuses to construct if `sessionName` is empty — a missing
  *  SLACK_TMUX_SESSION env var must be a loud boot-time error, not a
  *  silent no-op at admin-verb time.
  *
  *  OpenClaw 2026 security analysis attack classes addressed:
  *    - Shell-quoting bypass: N/A — no shell involved
  *    - Line-continuation: N/A — argv elements are literal
- *    - Busybox multiplexing: N/A — direct execFileSync of `tmux`
+ *    - Busybox multiplexing: N/A — direct execFile of `tmux`
  *    - GNU option abbreviation: tmux uses its own option parser; our
  *      argv shape uses `-t <session>` which is unambiguous
  */
-export function createTmuxSendKeys(sessionName: string): (keys: readonly string[]) => void {
+export function createTmuxSendKeys(
+  sessionName: string,
+): (keys: readonly string[]) => Promise<void> {
   if (sessionName.length === 0) {
     throw new Error(
       'createTmuxSendKeys: sessionName is empty — refuse to construct a sendKeys that would target the default session. Set SLACK_TMUX_SESSION before enabling admin commands.',
     )
   }
-  return (keys) => {
+  return async (keys) => {
     // Argv: ['send-keys', '-t', sessionName, ...keys]. No shell.
-    execFileSync('tmux', ['send-keys', '-t', sessionName, ...keys], { stdio: 'ignore' })
+    // execFileAsync returns { stdout, stderr } — we discard both; the
+    // tmux send-keys exit code surfaces as a rejection.
+    await execFileAsync('tmux', ['send-keys', '-t', sessionName, ...keys])
   }
 }
 
 /** Test-only no-op sendKeys. Records calls into the provided array so
  *  tests can assert the argv that would have been sent. Production
- *  code must use `createTmuxSendKeys`. */
+ *  code must use `createTmuxSendKeys`. Returns a resolved Promise so
+ *  the dispatcher's await pattern works uniformly. */
 export function createRecordingSendKeys(
   recorder: Array<readonly string[]>,
-): (keys: readonly string[]) => void {
-  return (keys) => {
+): (keys: readonly string[]) => Promise<void> {
+  return async (keys) => {
     recorder.push([...keys])
   }
 }

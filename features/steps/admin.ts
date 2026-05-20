@@ -95,7 +95,7 @@ function buildDeps(c: AdminContext): DispatchDeps {
       c.order.push('quiesce')
       c.quiesceCalled = true
     },
-    sendTmuxKeys: (keys) => {
+    sendTmuxKeys: async (keys) => {
       c.order.push('tmux')
       c.tmuxCalls.push([...keys])
     },
