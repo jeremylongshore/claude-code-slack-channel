@@ -575,6 +575,28 @@ function journalWrite(
   })
 }
 
+// ccsc-06s — policy.deny context-stripping helpers extracted to
+// policy-dispatch.ts so the test suite can import the production code
+// path directly. server.ts has boot-time side effects (process.exit on
+// missing .env) that prevent direct import in the test runner; the
+// helpers are pure, so a sibling module is the right shape. Imported
+// locally for use in the deny dispatcher AND re-exported so callers
+// that pull the dispatch surface from server's public exports still
+// resolve. Mirrors the acp-adapter.ts pattern (PR #173).
+import {
+  buildDenyNotificationParams,
+  type DenyNotificationParams,
+  type PolicyDenyDetail,
+  recordPolicyDenyToJournal,
+} from './policy-dispatch.ts'
+
+export {
+  buildDenyNotificationParams,
+  type DenyNotificationParams,
+  type PolicyDenyDetail,
+  recordPolicyDenyToJournal,
+}
+
 // ---------------------------------------------------------------------------
 // Gate function (wires up getAccess/saveAccess/botUserId for production use)
 // ---------------------------------------------------------------------------
@@ -1843,17 +1865,46 @@ mcp.setNotificationHandler(
     }
 
     if (route.type === 'deny') {
-      // No Block Kit, no pendingPermissions entry — the decision is final.
-      journalWrite({
-        kind: 'policy.deny',
-        outcome: 'deny',
-        actor: 'claude_process',
-        sessionKey: policySessionKey,
-        toolName: params.tool_name,
-        input: policyInput,
-        ruleId: route.ruleId,
-        reason: route.reason,
-      })
+      // ccsc-06s — context-stripping invariant:
+      //
+      // Ordering (verified by test in server.test.ts §"policy.deny.context_stripped"):
+      //   1. Write `policy.deny` with FULL detail (input, ruleId, reason) to
+      //      the audit journal. This is the forensic record.
+      //   2. Write `policy.deny.context_stripped` to record that the
+      //      response delivered to Claude was minimised.
+      //   3. Post the user-visible Slack notice (operator sees the reason
+      //      in their thread; bot self-echo filtering keeps Claude from
+      //      reading it back via inbound).
+      //   4. Send the MCP notification to Claude. The notification body
+      //      carries ONLY { request_id, behavior: 'deny' } — no rule id,
+      //      no reason text, no input echo. This is the "stripping" — by
+      //      design, Claude learns the call was denied but learns nothing
+      //      that could fuel a retry-rephrase loop.
+      //
+      // The reason this matters: a denied call is itself a signal. If
+      // Claude learns "I tried X with input Y and was denied with rule
+      // 'no-bash-rm'", the model can rephrase to dodge the specific rule.
+      // Minimising the response delivered to Claude — while keeping the
+      // full forensic record server-side — is the information-flow
+      // boundary Gemini CLI's policy engine documents in
+      // docs/reference/policy-engine.md. CCSC's MCP-bridge architecture
+      // makes the full memory excision Gemini does in-process
+      // impossible (Claude Code owns the conversation history), but the
+      // minimal-response form is what we CAN enforce. See
+      // 000-docs/policy-evaluation-flow.md § Context-stripping.
+      // Two-event journal sequence + minimal MCP notification — see
+      // `recordPolicyDenyToJournal` and `buildDenyNotificationParams`
+      // above. Awaited so the journal entries are durable before the
+      // MCP notification informs Claude that the call was denied.
+      if (journal !== null) {
+        await recordPolicyDenyToJournal((input) => journal!.writeEvent(input), {
+          sessionKey: policySessionKey,
+          toolName: params.tool_name,
+          input: policyInput,
+          ruleId: route.ruleId,
+          reason: route.reason,
+        })
+      }
       const safeTool = escMrkdwn(params.tool_name)
       const safeReason = escMrkdwn(route.reason)
       try {
@@ -1869,9 +1920,13 @@ mcp.setNotificationHandler(
         // decision is authoritative even if the user-facing notice fails.
         console.error('[slack] policy.deny notice post failed:', postErr)
       }
+      // MCP notification body built via `buildDenyNotificationParams` to
+      // pin the shape against future drift. The literal `behavior:
+      // 'deny'` + the absence of any other field is what makes this the
+      // ccsc-06s minimisation surface.
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
-        params: { request_id: params.request_id, behavior: 'deny' },
+        params: buildDenyNotificationParams(params.request_id),
       })
       return
     }

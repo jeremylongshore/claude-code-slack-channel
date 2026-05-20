@@ -5541,13 +5541,15 @@ describe('JournalEvent', () => {
     const kinds = EventKind.options
     // 19 original kinds + manifest.read + manifest.read.cached (Epic
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
-    // (ccsc-22l). If this number drifts, update the doc count in
-    // journal.ts's header comment too — both must agree.
-    expect(kinds).toHaveLength(23)
+    // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s). If this
+    // number drifts, update the doc count in journal.ts's header
+    // comment too — both must agree.
+    expect(kinds).toHaveLength(24)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
     expect(kinds).toContain('system.key_rotation')
+    expect(kinds).toContain('policy.deny.context_stripped')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -10916,5 +10918,172 @@ describe('crypto.ts primitives (ccsc-22l)', () => {
     expect(yaml).toContain('created_at:')
     expect(yaml).toContain('purpose: round-trip')
     expect(parseKeyPairYaml(yaml).seed).toBe(kp.seed)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ccsc-06s — policy.deny context-stripping invariants
+// ---------------------------------------------------------------------------
+//
+// Two helpers carry the invariant:
+//   1. buildDenyNotificationParams(request_id) — produces the MCP
+//      notification body that Claude observes. Must contain ONLY
+//      request_id + behavior:'deny' so the model learns nothing that
+//      seeds a retry-rephrase loop.
+//   2. recordPolicyDenyToJournal(writeEvent, detail) — writes the
+//      FULL-detail policy.deny event first, then the
+//      policy.deny.context_stripped marker. The forensic record keeps
+//      everything; the agent-facing response keeps nothing.
+
+describe('ccsc-06s — buildDenyNotificationParams', () => {
+  test('returns exactly { request_id, behavior: "deny" } — no rule id, no reason, no input echo', async () => {
+    const { buildDenyNotificationParams } = await import('./policy-dispatch.ts')
+    const params = buildDenyNotificationParams('req-001')
+    expect(params.request_id).toBe('req-001')
+    expect(params.behavior).toBe('deny')
+    // The runtime body must carry only those two keys. Index signature
+    // exists for MCP SDK compatibility but the literal runtime shape
+    // is what enforces the ccsc-06s minimisation invariant.
+    expect(Object.keys(params).sort()).toEqual(['behavior', 'request_id'])
+  })
+
+  test('preserves request_id verbatim — no trimming, no normalisation', async () => {
+    const { buildDenyNotificationParams } = await import('./policy-dispatch.ts')
+    const weird = '  req-with-spaces  '
+    expect(buildDenyNotificationParams(weird).request_id).toBe(weird)
+  })
+
+  test('different request_ids produce different params (helper is not memoised)', async () => {
+    const { buildDenyNotificationParams } = await import('./policy-dispatch.ts')
+    const a = buildDenyNotificationParams('req-a')
+    const b = buildDenyNotificationParams('req-b')
+    expect(a.request_id).toBe('req-a')
+    expect(b.request_id).toBe('req-b')
+    expect(a).not.toBe(b)
+  })
+})
+
+describe('ccsc-06s — recordPolicyDenyToJournal', () => {
+  test('writes policy.deny first with full detail, then policy.deny.context_stripped with no retry-aiding fields', async () => {
+    const { recordPolicyDenyToJournal } = await import('./policy-dispatch.ts')
+    const writes: Array<{ kind: string; ruleId?: string; reason?: string; input?: unknown }> = []
+    const fakeWrite = async (input: Record<string, unknown>) => {
+      writes.push({
+        kind: input.kind as string,
+        ruleId: input.ruleId as string | undefined,
+        reason: input.reason as string | undefined,
+        input: input.input,
+      })
+      return { ok: true } as unknown
+    }
+    await recordPolicyDenyToJournal(fakeWrite, {
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      toolName: 'Bash',
+      input: { cmd: 'rm -rf /' },
+      ruleId: 'no-destructive-bash',
+      reason: 'Bash rm is blocked by workspace policy',
+    })
+    // Two events in exact order
+    expect(writes).toHaveLength(2)
+    expect(writes[0]!.kind).toBe('policy.deny')
+    expect(writes[1]!.kind).toBe('policy.deny.context_stripped')
+    // First event keeps the FULL forensic detail
+    expect(writes[0]!.ruleId).toBe('no-destructive-bash')
+    expect(writes[0]!.reason).toBe('Bash rm is blocked by workspace policy')
+    expect(writes[0]!.input).toEqual({ cmd: 'rm -rf /' })
+    // Second event keeps NONE of the retry-aiding detail
+    expect(writes[1]!.ruleId).toBeUndefined()
+    expect(writes[1]!.reason).toBeUndefined()
+    expect(writes[1]!.input).toBeUndefined()
+  })
+
+  test('ordering invariant — second write is never enqueued before first awaits', async () => {
+    const { recordPolicyDenyToJournal } = await import('./policy-dispatch.ts')
+    const observed: string[] = []
+    let firstSettled = false
+    const fakeWrite = async (input: Record<string, unknown>) => {
+      observed.push(input.kind as string)
+      if (input.kind === 'policy.deny') {
+        // Force first write to be pending for a tick so any
+        // out-of-order helper would visibly start the second write
+        // before this one resolves.
+        await Promise.resolve()
+        firstSettled = true
+      }
+      if (input.kind === 'policy.deny.context_stripped') {
+        // When the second write runs, the first MUST have settled.
+        expect(firstSettled).toBe(true)
+      }
+      return { ok: true } as unknown
+    }
+    await recordPolicyDenyToJournal(fakeWrite, {
+      toolName: 'Bash',
+      input: { cmd: 'ls' },
+      ruleId: 'r',
+      reason: 'r',
+    })
+    expect(observed).toEqual(['policy.deny', 'policy.deny.context_stripped'])
+  })
+
+  test('first write throwing does NOT block the second — audit-resilience invariant', async () => {
+    // A broken journal MUST NOT cause subsequent events to be skipped.
+    // The dispatcher still proceeds to send the minimal MCP notification
+    // (policy decision is authoritative even on journal failure), so the
+    // second event needs to be attempted whether or not the first
+    // succeeded — both attempts surface as stderr noise to operators.
+    const { recordPolicyDenyToJournal } = await import('./policy-dispatch.ts')
+    const observed: string[] = []
+    const fakeWrite = async (input: Record<string, unknown>) => {
+      observed.push(input.kind as string)
+      if (input.kind === 'policy.deny') throw new Error('disk full')
+      return { ok: true } as unknown
+    }
+    await recordPolicyDenyToJournal(fakeWrite, {
+      toolName: 'Bash',
+      input: {},
+      ruleId: 'r',
+      reason: 'r',
+    })
+    // Both kinds were attempted — the helper does not short-circuit
+    // on the first write's failure.
+    expect(observed).toEqual(['policy.deny', 'policy.deny.context_stripped'])
+  })
+
+  test('writes propagate to a real JournalWriter in correct order (integration)', async () => {
+    const { recordPolicyDenyToJournal } = await import('./policy-dispatch.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const dir = mkdtempSync(join(tmpdir(), 'ccsc-06s-'))
+    const path = join(dir, 'audit.log')
+    try {
+      const w = await JournalWriter.open({ path })
+      await recordPolicyDenyToJournal((input) => w.writeEvent(input), {
+        sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+        toolName: 'Write',
+        input: { path: '/etc/passwd' },
+        ruleId: 'no-system-writes',
+        reason: 'system paths are protected',
+      })
+      await w.close()
+      // Read the journal back and confirm both events landed in order.
+      const raw = readFileSync(path, 'utf8')
+      const lines = raw.split('\n').filter((l) => l.length > 0)
+      expect(lines).toHaveLength(2)
+      const first = JSON.parse(lines[0]!)
+      const second = JSON.parse(lines[1]!)
+      expect(first.kind).toBe('policy.deny')
+      expect(first.ruleId).toBe('no-system-writes')
+      expect(first.reason).toBe('system paths are protected')
+      expect(first.input).toEqual({ path: '/etc/passwd' })
+      expect(second.kind).toBe('policy.deny.context_stripped')
+      expect(second.ruleId).toBeUndefined()
+      expect(second.reason).toBeUndefined()
+      expect(second.input).toBeUndefined()
+      // Chain still verifies — the new event kind doesn't break the
+      // hash chain.
+      const result = await verifyJournal(path)
+      expect(result.ok).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

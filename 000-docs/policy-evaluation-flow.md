@@ -347,6 +347,84 @@ removal. The check catches only *accidental* weakening from additions.
 
 ---
 
+## Context-stripping on policy.deny (ccsc-06s)
+
+Gemini CLI's policy engine ([docs/reference/policy-engine.md](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/policy-engine.md))
+documents a stronger information-flow boundary than first-applicable
+alone: when policy denies a tool call, the denied call is **excised
+from the agent's context window** so the model cannot rephrase the
+call to dodge the rule on subsequent turns. CCSC adopts the spirit of
+this pattern, adapted for its MCP-bridge architecture.
+
+### What CCSC can and cannot excise
+
+| Layer | Owner | Can CCSC excise? |
+|---|---|---|
+| Claude's conversation history (KV cache) | Claude Code | No — out of bridge's scope |
+| The original tool-call request | Claude Code | No — Claude itself made the call; it's already in its context |
+| The MCP notification response Claude observes | CCSC server | **Yes — this is the surface ccsc-06s minimises** |
+| The Slack message Claude sees on inbound | CCSC bridge | Already filtered — bot-self-echo gate (T3) drops the bridge's own denial post |
+| The audit journal | CCSC server | Never — full forensic detail is preserved |
+
+The implementable minimisation: **make sure nothing in the response
+Claude observes carries retry-aiding metadata**. The full denial detail
+goes to the journal (forensic record) and the user-visible Slack post
+(operator visibility, bot-self-echo blocks Claude from reading it back).
+
+### Two-event journal sequence
+
+On every `policy.deny` decision the dispatcher writes:
+
+1. `policy.deny` — full detail: `input`, `ruleId`, `reason`,
+   `sessionKey`, `toolName`, `actor`
+2. `policy.deny.context_stripped` — same `toolName` + `sessionKey` for
+   correlation, but **no `input`, `ruleId`, or `reason`**. The
+   distinction is intentional: the second event is the audit signal
+   that minimisation was applied, NOT a second copy of the forensic
+   record. An audit reader who replays the chain sees both events and
+   knows (a) the call was denied with this rule + reason and (b) the
+   denial response delivered to Claude was the minimal form.
+
+Order is enforced by `await` (see `recordPolicyDenyToJournal` in
+`policy-dispatch.ts`) — the second event is never written before the
+first.
+
+### Minimal MCP notification
+
+The notification body delivered to Claude is built via
+`buildDenyNotificationParams` in `policy-dispatch.ts`. It produces
+**exactly two keys**:
+
+```ts
+{ request_id: '<correlator>', behavior: 'deny' }
+```
+
+No `rule_id`. No `reason`. No `input` echo. The literal-type
+`behavior: 'deny'` pins the wire-format invariant statically;
+TypeScript refuses any shape with extra keys at the call site.
+
+The helper is intentionally trivial — its existence is the regression
+protection. A future "helpful" addition that wants to include a
+denial reason in the notification has to either edit the helper
+(visible diff, design-doc PR) or call `mcp.notification` directly
+(visible in code review).
+
+### Why not full excision?
+
+The bridge cannot reach into Claude Code's process memory or rewrite
+its prompt cache. Claude already saw the original tool call when it
+made it — the denial response is the only surface the bridge
+controls. The narrower "minimise the response so it carries nothing
+the model can chain off of" is what ships; this is documented
+explicitly so a future reader of the design doc doesn't expect the
+stronger property.
+
+A future Anthropic feature (e.g., `anthropics/claude-code#53049` —
+external IPC into mid-turn context) could enable full excision. Until
+then, response minimisation is the floor.
+
+---
+
 ## Approval flow integration
 
 `require_approval` decisions flow through the existing permission-reply
