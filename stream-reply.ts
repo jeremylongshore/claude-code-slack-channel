@@ -152,8 +152,19 @@ export type StreamReplyResult =
  *  full message content without needing to replay every intermediate
  *  state.
  *
- *  Never throws — every path returns a structured result. Caller
- *  decides whether to surface mid-stream failure to operators.
+ *  Returns a structured result for normal completion + mid-stream
+ *  failures. **Re-throws on init failures**: if
+ *  `journalWrite(gate.outbound.allow)` throws OR `postMessage` throws
+ *  before any chunks land, the exception propagates. Rationale: a
+ *  failure at init means either the audit log is broken (refuse to
+ *  post bytes that can't be journaled) or Slack itself is unreachable
+ *  (caller decides whether to retry). In both cases, no Slack
+ *  content was delivered. On `postMessage` throw the dispatcher
+ *  writes a defensive `system.stream_finalize` with deny outcome
+ *  before re-throwing, so the "one allow + one finalize" invariant
+ *  holds even on early failure (per Gemini review on PR #181). All
+ *  other paths (mid-stream gate rejection, mid-stream Slack error,
+ *  finalize-write failure) return a structured result.
  */
 export async function streamReply(
   opts: StreamReplyOptions,
@@ -172,6 +183,17 @@ export async function streamReply(
       kind: 'gate_rejected_at_start',
       reason: err instanceof Error ? err.message : String(err),
     }
+  }
+
+  // Guard against empty input (per Gemini review on PR #181). Empty
+  // text would either crash at `chunks[0]!` (if chunkText returned
+  // [], depending on implementation details) OR send an empty
+  // message to Slack (today chunkText returns [""] which is just as
+  // bad — empty Slack post). Caller has a bug if they're streaming
+  // nothing; reject loudly. The check uses opts.text directly so a
+  // future chunkText refactor doesn't reopen the gap.
+  if (opts.text.length === 0) {
+    return { kind: 'gate_rejected_at_start', reason: 'empty text — nothing to stream' }
   }
 
   // Step 2: pre-commit hash.
@@ -199,11 +221,29 @@ export async function streamReply(
 
   // Step 5: initial post. The returned ts is the cached id for
   // every subsequent chat.update.
-  const initial = await deps.postMessage({
-    channel: opts.channel,
-    thread_ts: opts.threadTs,
-    text: chunks[0]!,
-  })
+  //
+  // Wrap in try/catch so a postMessage failure between the
+  // gate.outbound.allow journal write and any chunks landing still
+  // produces a matching system.stream_finalize event (per Gemini
+  // review on PR #181 — the "exactly TWO journal events per stream"
+  // invariant must hold even on early failure). The exception
+  // re-throws after the finalize is written; caller treats this
+  // exactly like the journal-allow-write failure path.
+  let initial: { ts: string }
+  try {
+    initial = await deps.postMessage({
+      channel: opts.channel,
+      thread_ts: opts.threadTs,
+      text: chunks[0]!,
+    })
+  } catch (err) {
+    const reason = `postMessage failed: ${err instanceof Error ? err.message : String(err)}`
+    // No ts to report — postMessage threw before returning one.
+    // Use empty string as a placeholder; the chunks_sent: 0 in the
+    // finalize event tells the story.
+    await finalizeJournal(deps, opts, '', 0, committedHash, 'deny', reason)
+    throw err
+  }
   const ts = initial.ts
   let chunksSent = 1
   let cumulative = chunks[0]!

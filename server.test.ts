@@ -12311,3 +12311,75 @@ describe('ccsc-ele — streamReply invariants', () => {
     if (result.kind === 'completed') expect(result.chunksSent).toBe(3)
   })
 })
+
+describe('ccsc-ele — Gemini #181 review fixes', () => {
+  test('empty text is rejected at gate-rejected-at-start (no crash, no journal, no post)', async () => {
+    // Gemini high-priority finding: chunkText('') returns [] which
+    // would crash at chunks[0]!. Guard added.
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+    let posted = false
+
+    const result = await streamReply(
+      { channel: 'C_OPS', text: '' },
+      {
+        assertOutboundAllowed: () => {},
+        postMessage: async () => {
+          posted = true
+          return { ts: '1.0' }
+        },
+        updateMessage: async () => {},
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        sleep: async () => {},
+      },
+    )
+
+    expect(result.kind).toBe('gate_rejected_at_start')
+    if (result.kind === 'gate_rejected_at_start') {
+      expect(result.reason).toContain('empty text')
+    }
+    expect(posted).toBe(false)
+    expect(journal.length).toBe(0)
+  })
+
+  test('postMessage failure after allow event STILL emits finalize event (invariant holds on early failure)', async () => {
+    // Gemini high-priority finding: postMessage rejection between
+    // gate.outbound.allow and any chunks would leave the journal
+    // with one allow + zero finalize, breaking the "exactly TWO
+    // events per stream" invariant. Fixed by wrapping postMessage
+    // in try/catch + writing finalize before re-throw.
+    const { streamReply } = await import('./stream-reply.ts')
+    const journal: Array<Record<string, unknown>> = []
+
+    await expect(
+      streamReply(
+        { channel: 'C_OPS', text: 'x'.repeat(500) },
+        {
+          assertOutboundAllowed: () => {},
+          postMessage: async () => {
+            throw new Error('Slack unreachable')
+          },
+          updateMessage: async () => {},
+          journalWrite: async (i) => {
+            journal.push(i as Record<string, unknown>)
+            return undefined
+          },
+          sleep: async () => {},
+        },
+      ),
+    ).rejects.toThrow('Slack unreachable')
+
+    // Both events present — invariant holds.
+    const allow = journal.find((j) => j.kind === 'gate.outbound.allow')
+    const finalize = journal.find((j) => j.kind === 'system.stream_finalize')
+    expect(allow).toBeDefined()
+    expect(finalize).toBeDefined()
+    expect(finalize!.outcome).toBe('deny')
+    expect(finalize!.reason as string).toContain('Slack unreachable')
+    // chunks_sent: 0 — postMessage never returned a successful ts
+    expect((finalize!.input as { chunks_sent: number }).chunks_sent).toBe(0)
+  })
+})
