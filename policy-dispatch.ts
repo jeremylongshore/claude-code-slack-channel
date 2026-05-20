@@ -39,15 +39,20 @@ import type { JournalWriter } from './journal.ts'
 /** Shape of the MCP notification body the server sends to Claude on
  *  a policy.deny decision. The literal type on `behavior` pins the
  *  wire-format invariant statically — TypeScript refuses any shape
- *  with extra keys at the call site. Index signature exists for MCP
- *  SDK compatibility (the SDK's `notification.params` is typed as
- *  `Record<string, unknown>`) and does not relax the ccsc-06s
- *  minimisation — the runtime body still only carries the two literal
- *  keys produced by `buildDenyNotificationParams`. */
-export interface DenyNotificationParams {
+ *  with extra keys at the call site.
+ *
+ *  Why `type` (not `interface`): per Gemini review on PR #178, type
+ *  aliases with concrete properties are implicitly assignable to
+ *  `Record<string, unknown>` because type aliases are closed (no
+ *  declaration merging). Interfaces would require an explicit
+ *  `[k: string]: unknown` index signature — which would silently
+ *  relax the ccsc-06s minimisation by permitting extra keys at the
+ *  call site. The `type` form keeps the wire shape EXACTLY two
+ *  fields while still satisfying the MCP SDK's
+ *  `Record<string, unknown>` parameter type. */
+export type DenyNotificationParams = {
   request_id: string
   behavior: 'deny'
-  [k: string]: unknown
 }
 
 /** Build the deny-notification body. The ONLY two fields produced at
