@@ -5441,9 +5441,14 @@ describe('JournalEvent', () => {
     })
   })
 
-  test('rejects wrong schema version', async () => {
+  test('accepts v=1 and v=2; rejects other versions (ccsc-22l)', async () => {
     const { JournalEvent } = await import('./journal.ts')
-    expect(() => JournalEvent.parse(minimal({ v: 2 }))).toThrow()
+    // v=1 and v=2 are both valid — discriminated union after ccsc-22l.
+    expect(() => JournalEvent.parse(minimal({ v: 1 }))).not.toThrow()
+    expect(() => JournalEvent.parse(minimal({ v: 2 }))).not.toThrow()
+    // Anything else is rejected.
+    expect(() => JournalEvent.parse(minimal({ v: 0 }))).toThrow()
+    expect(() => JournalEvent.parse(minimal({ v: 3 }))).toThrow()
     expect(() => JournalEvent.parse(minimal({ v: '1' }))).toThrow()
   })
 
@@ -5535,13 +5540,14 @@ describe('JournalEvent', () => {
     const { JournalEvent, EventKind } = await import('./journal.ts')
     const kinds = EventKind.options
     // 19 original kinds + manifest.read + manifest.read.cached (Epic
-    // 31-A.5) + manifest.publish (Epic 31-B.1/.3). If this number
-    // drifts, update the doc count in journal.ts's header comment too —
-    // both must agree.
-    expect(kinds).toHaveLength(22)
+    // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
+    // (ccsc-22l). If this number drifts, update the doc count in
+    // journal.ts's header comment too — both must agree.
+    expect(kinds).toHaveLength(23)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
+    expect(kinds).toContain('system.key_rotation')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -10293,5 +10299,600 @@ describe('detectShadowing (ccsc-4g8) — backward compatibility', () => {
     ]
     const warnings = detectShadowingDirect(rules)
     expect(warnings.filter((w) => w.crossTier === true)).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Journal v2 signing + verifier (ccsc-22l)
+// ---------------------------------------------------------------------------
+
+describe('Journal v2 signing — JournalWriter writes signed v2 events (ccsc-22l)', () => {
+  let dir: string
+  let path: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ccsc-jv2-'))
+    path = join(dir, 'audit.log')
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('writer without signingKey emits v1 events (backward compatible)', async () => {
+    const { JournalWriter } = await import('./journal.ts')
+    const w = await JournalWriter.open({ path })
+    const ev = await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    expect(ev.v).toBe(1)
+    expect(ev.signature).toBeUndefined()
+    expect(ev.policy_attestation).toBeUndefined()
+  })
+
+  test('writer with signingKey emits v2 events with signature + policy_attestation', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const digest = 'a'.repeat(64)
+    const w = await JournalWriter.open({ path, signingKey: kp, policyDigest: digest })
+    const ev = await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    expect(ev.v).toBe(2)
+    expect(ev.signature).toBeDefined()
+    expect(ev.signature!.length).toBe(88) // base64-encoded 64-byte Ed25519 sig
+    expect(ev.policy_attestation).toEqual({ digest, alg: 'sha256' })
+  })
+
+  test('writer with signingKey but no policyDigest emits v2 events without policy_attestation', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const w = await JournalWriter.open({ path, signingKey: kp })
+    const ev = await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    expect(ev.v).toBe(2)
+    expect(ev.signature).toBeDefined()
+    expect(ev.policy_attestation).toBeUndefined()
+  })
+
+  test('setPolicyDigest updates the attestation on subsequent events', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const d1 = 'a'.repeat(64)
+    const d2 = 'b'.repeat(64)
+    const w = await JournalWriter.open({ path, signingKey: kp, policyDigest: d1 })
+    const e1 = await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    w.setPolicyDigest(d2)
+    const e2 = await w.writeEvent({ kind: 'system.reload', actor: 'system' })
+    await w.close()
+    expect(e1.policy_attestation?.digest).toBe(d1)
+    expect(e2.policy_attestation?.digest).toBe(d2)
+  })
+})
+
+describe('Journal v2 verify — verifyJournal accepts mixed chains and rejects rollback (ccsc-22l)', () => {
+  let dir: string
+  let path: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ccsc-jv2v-'))
+    path = join(dir, 'audit.log')
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('all-v1 chain verifies without an initialPublicKey', async () => {
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const w = await JournalWriter.open({ path })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.writeEvent({ kind: 'system.reload', actor: 'system' })
+    await w.close()
+    const result = await verifyJournal(path)
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(2)
+  })
+
+  test('all-v2 chain verifies with the correct initialPublicKey', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const w = await JournalWriter.open({ path, signingKey: kp })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.writeEvent({ kind: 'system.reload', actor: 'system' })
+    await w.close()
+    const result = await verifyJournal(path, { initialPublicKey: kp.publicKey })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(2)
+  })
+
+  test('all-v2 chain fails verification under the wrong public key', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const wrongKp = generateKeyPair()
+    const w = await JournalWriter.open({ path, signingKey: kp })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    const result = await verifyJournal(path, { initialPublicKey: wrongKp.publicKey })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.break.reason).toContain('signature verification failed')
+  })
+
+  test('v1-then-v2 mixed chain verifies (legitimate cutover)', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    // Stage 1: write a v1 event
+    const w1 = await JournalWriter.open({ path })
+    await w1.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w1.close()
+    // Stage 2: re-open with signing key — chain continues with v2
+    const w2 = await JournalWriter.open({ path, signingKey: kp })
+    await w2.writeEvent({ kind: 'system.reload', actor: 'system' })
+    await w2.close()
+    const result = await verifyJournal(path, { initialPublicKey: kp.publicKey })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(2)
+  })
+
+  test('v2-then-v1 chain rejected as version rollback (tamper signal)', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    // Stage 1: write a v2 event
+    const w1 = await JournalWriter.open({ path, signingKey: kp })
+    await w1.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w1.close()
+    // Stage 2: re-open WITHOUT signing key — would emit v1 → rollback
+    const w2 = await JournalWriter.open({ path })
+    await w2.writeEvent({ kind: 'system.reload', actor: 'system' })
+    await w2.close()
+    const result = await verifyJournal(path, { initialPublicKey: kp.publicKey })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.break.reason).toContain('version rollback')
+  })
+
+  test('signature tamper detection — single byte flip', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const w = await JournalWriter.open({ path, signingKey: kp })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    // Tamper the signature on disk: flip the first base64 char.
+    const raw = readFileSync(path, 'utf8')
+    const lines = raw.split('\n')
+    const parsed = JSON.parse(lines[0]!)
+    parsed.signature = (parsed.signature[0] === 'A' ? 'B' : 'A') + parsed.signature.slice(1)
+    lines[0] = JSON.stringify(parsed)
+    writeFileSync(path, lines.join('\n'))
+    const result = await verifyJournal(path, { initialPublicKey: kp.publicKey })
+    expect(result.ok).toBe(false)
+  })
+
+  test('key_rotation event switches active public key for subsequent events', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const oldKp = generateKeyPair()
+    const newKp = generateKeyPair()
+    // Stage 1: write under old key
+    const w1 = await JournalWriter.open({ path, signingKey: oldKp })
+    await w1.writeEvent({ kind: 'system.boot', actor: 'system' })
+    // Emit key_rotation event UNDER THE OLD KEY (writer still holds old key)
+    await w1.writeEvent({
+      kind: 'system.key_rotation',
+      actor: 'session_owner',
+      input: {
+        old_public_key: oldKp.publicKey,
+        new_public_key: newKp.publicKey,
+        reason: 'scheduled-90day',
+      },
+    })
+    await w1.close()
+    // Stage 2: re-open with new key, write more events
+    const w2 = await JournalWriter.open({ path, signingKey: newKp })
+    await w2.writeEvent({ kind: 'system.reload', actor: 'system' })
+    await w2.close()
+    // Verifier starts with old key, switches on rotation, validates rest with new key
+    const result = await verifyJournal(path, { initialPublicKey: oldKp.publicKey })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(3)
+  })
+
+  test('key_rotation missing input.new_public_key fails verification', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const oldKp = generateKeyPair()
+    const w = await JournalWriter.open({ path, signingKey: oldKp })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.writeEvent({
+      kind: 'system.key_rotation',
+      actor: 'session_owner',
+      // Malformed: missing new_public_key in input
+      input: { reason: 'malformed-rotation' },
+    })
+    await w.close()
+    const result = await verifyJournal(path, { initialPublicKey: oldKp.publicKey })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.break.reason).toContain('missing input.new_public_key')
+  })
+
+  test('v2 event with signature but no verifier key fails clearly', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const w = await JournalWriter.open({ path, signingKey: kp })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    const result = await verifyJournal(path) // no initialPublicKey
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.break.reason).toContain('no public key was provided')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Tier-aware evaluate() — strictest-tier-wins (ccsc-8pw)
+// ---------------------------------------------------------------------------
+
+describe('Tier-aware evaluate() — strictest-tier-wins (ccsc-8pw)', () => {
+  test('admin deny beats workspace auto_approve', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const call = {
+      tool: 'Bash',
+      input: { cmd: 'rm -rf /' },
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      actor: 'session_owner' as const,
+    }
+    const rules = [
+      {
+        id: 'workspace-allow',
+        priority: 100,
+        effect: 'auto_approve' as const,
+        match: { tool: 'Bash', tier: 'workspace' as const },
+      },
+      {
+        id: 'admin-deny',
+        priority: 100,
+        effect: 'deny' as const,
+        reason: 'admin policy',
+        match: { tool: 'Bash', tier: 'admin' as const },
+      },
+    ]
+    const decision = evaluate(call, rules, Date.now())
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.rule).toBe('admin-deny')
+  })
+
+  test('admin auto_approve beats workspace deny (intentional admin-overrides direction)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const call = {
+      tool: 'Bash',
+      input: {},
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      actor: 'session_owner' as const,
+    }
+    const rules = [
+      {
+        id: 'workspace-deny',
+        priority: 100,
+        effect: 'deny' as const,
+        reason: 'workspace policy',
+        match: { tool: 'Bash', tier: 'workspace' as const },
+      },
+      {
+        id: 'admin-allow',
+        priority: 100,
+        effect: 'auto_approve' as const,
+        match: { tool: 'Bash', tier: 'admin' as const },
+      },
+    ]
+    const decision = evaluate(call, rules, Date.now())
+    expect(decision.kind).toBe('allow')
+    if (decision.kind === 'allow') expect(decision.rule).toBe('admin-allow')
+  })
+
+  test('tiers fall through when no rule matches in higher tiers', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const call = {
+      tool: 'Read',
+      input: {},
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      actor: 'session_owner' as const,
+    }
+    const rules = [
+      {
+        id: 'admin-rule-for-write',
+        priority: 100,
+        effect: 'deny' as const,
+        reason: 'admin policy',
+        match: { tool: 'Write', tier: 'admin' as const },
+      },
+      {
+        id: 'workspace-allow-read',
+        priority: 100,
+        effect: 'auto_approve' as const,
+        match: { tool: 'Read', tier: 'workspace' as const },
+      },
+    ]
+    const decision = evaluate(call, rules, Date.now())
+    expect(decision.kind).toBe('allow')
+    if (decision.kind === 'allow') expect(decision.rule).toBe('workspace-allow-read')
+  })
+
+  test('first-applicable still applies within a tier', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const call = {
+      tool: 'Bash',
+      input: {},
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      actor: 'session_owner' as const,
+    }
+    const rules = [
+      {
+        id: 'admin-first',
+        priority: 100,
+        effect: 'auto_approve' as const,
+        match: { tool: 'Bash', tier: 'admin' as const },
+      },
+      {
+        id: 'admin-second',
+        priority: 100,
+        effect: 'deny' as const,
+        reason: 'unreachable',
+        match: { tool: 'Bash', tier: 'admin' as const },
+      },
+    ]
+    const decision = evaluate(call, rules, Date.now())
+    expect(decision.kind).toBe('allow')
+    if (decision.kind === 'allow') expect(decision.rule).toBe('admin-first')
+  })
+
+  test('un-tiered rules behave exactly like default tier (backward compat)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const call = {
+      tool: 'Bash',
+      input: {},
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      actor: 'session_owner' as const,
+    }
+    // No tier declared — should treat as 'default' and use first-applicable.
+    const rules = [
+      {
+        id: 'first',
+        priority: 100,
+        effect: 'auto_approve' as const,
+        match: { tool: 'Bash' },
+      },
+      {
+        id: 'second',
+        priority: 100,
+        effect: 'deny' as const,
+        reason: 'unreachable',
+        match: { tool: 'Bash' },
+      },
+    ]
+    const decision = evaluate(call, rules, Date.now())
+    expect(decision.kind).toBe('allow')
+    if (decision.kind === 'allow') expect(decision.rule).toBe('first')
+  })
+
+  test('user tier beats workspace, loses to admin', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const call = {
+      tool: 'Bash',
+      input: {},
+      sessionKey: { channel: 'C001', thread: '1700000000.000100' },
+      actor: 'session_owner' as const,
+    }
+    const rules = [
+      {
+        id: 'workspace-allow',
+        priority: 100,
+        effect: 'auto_approve' as const,
+        match: { tool: 'Bash', tier: 'workspace' as const },
+      },
+      {
+        id: 'user-deny',
+        priority: 100,
+        effect: 'deny' as const,
+        reason: 'user-locked',
+        match: { tool: 'Bash', tier: 'user' as const },
+      },
+    ]
+    const decision = evaluate(call, rules, Date.now())
+    expect(decision.kind).toBe('deny')
+    if (decision.kind === 'deny') expect(decision.rule).toBe('user-deny')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// policyDigest (ccsc-22l + ccsc-8pw bridge)
+// ---------------------------------------------------------------------------
+
+describe('policyDigest (ccsc-22l)', () => {
+  test('returns 64-char lowercase hex', async () => {
+    const { policyDigest } = await import('./policy.ts')
+    const rules = [
+      { id: 'r1', priority: 100, effect: 'auto_approve' as const, match: { tool: 'Bash' } },
+    ]
+    const digest = policyDigest(rules)
+    expect(digest).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  test('is deterministic on the same rule set', async () => {
+    const { policyDigest } = await import('./policy.ts')
+    const rules = [
+      { id: 'r1', priority: 100, effect: 'auto_approve' as const, match: { tool: 'Bash' } },
+      { id: 'r2', priority: 100, effect: 'deny' as const, reason: 'x', match: { tool: 'Write' } },
+    ]
+    expect(policyDigest(rules)).toBe(policyDigest(rules))
+  })
+
+  test('order-independent — sorted by id before digesting', async () => {
+    const { policyDigest } = await import('./policy.ts')
+    const rules1 = [
+      { id: 'r1', priority: 100, effect: 'auto_approve' as const, match: { tool: 'Bash' } },
+      { id: 'r2', priority: 100, effect: 'deny' as const, reason: 'x', match: { tool: 'Write' } },
+    ]
+    const rules2 = [
+      { id: 'r2', priority: 100, effect: 'deny' as const, reason: 'x', match: { tool: 'Write' } },
+      { id: 'r1', priority: 100, effect: 'auto_approve' as const, match: { tool: 'Bash' } },
+    ]
+    // Authoring order shouldn't change the content digest.
+    expect(policyDigest(rules1)).toBe(policyDigest(rules2))
+  })
+
+  test('changes when a rule body changes', async () => {
+    const { policyDigest } = await import('./policy.ts')
+    const r1 = [
+      { id: 'r1', priority: 100, effect: 'auto_approve' as const, match: { tool: 'Bash' } },
+    ]
+    const r2 = [
+      { id: 'r1', priority: 100, effect: 'auto_approve' as const, match: { tool: 'Write' } },
+    ]
+    expect(policyDigest(r1)).not.toBe(policyDigest(r2))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// crypto.ts — Ed25519 primitives (ccsc-22l) — direct unit tests
+// ---------------------------------------------------------------------------
+
+describe('crypto.ts primitives (ccsc-22l)', () => {
+  test('generateKeyPair produces 32-byte seed and 32-byte public key', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    expect(Buffer.from(kp.seed, 'base64').length).toBe(32)
+    expect(Buffer.from(kp.publicKey, 'base64').length).toBe(32)
+    expect(Date.parse(kp.createdAt)).not.toBeNaN()
+  })
+
+  test('derivePublicKey is deterministic for the same seed', async () => {
+    const { generateKeyPair, derivePublicKey } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    expect(derivePublicKey(kp.seed)).toBe(kp.publicKey)
+    expect(derivePublicKey(kp.seed)).toBe(derivePublicKey(kp.seed))
+  })
+
+  test('signBytes is deterministic for the same input + key', async () => {
+    const { generateKeyPair, signBytes } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const msg = Buffer.from('test message')
+    const sig1 = signBytes(msg, kp)
+    const sig2 = signBytes(msg, kp)
+    expect(sig1).toBe(sig2)
+  })
+
+  test('verifySignatureBytes returns true for valid signature', async () => {
+    const { generateKeyPair, signBytes, verifySignatureBytes } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const msg = Buffer.from('verify me')
+    const sig = signBytes(msg, kp)
+    expect(verifySignatureBytes(msg, sig, kp.publicKey)).toBe(true)
+  })
+
+  test('verifySignatureBytes returns false for tampered message', async () => {
+    const { generateKeyPair, signBytes, verifySignatureBytes } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const msg = Buffer.from('original')
+    const sig = signBytes(msg, kp)
+    expect(verifySignatureBytes(Buffer.from('tampered'), sig, kp.publicKey)).toBe(false)
+  })
+
+  test('verifySignatureBytes returns false for wrong public key', async () => {
+    const { generateKeyPair, signBytes, verifySignatureBytes } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const other = generateKeyPair()
+    const msg = Buffer.from('msg')
+    const sig = signBytes(msg, kp)
+    expect(verifySignatureBytes(msg, sig, other.publicKey)).toBe(false)
+  })
+
+  test('verifySignatureBytes returns false for wrong-length signature (not throw)', async () => {
+    const { generateKeyPair, verifySignatureBytes } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const tooShort = Buffer.alloc(32).toString('base64')
+    expect(verifySignatureBytes(Buffer.from('x'), tooShort, kp.publicKey)).toBe(false)
+  })
+
+  test('verifySignatureBytes throws on wrong-length public key', async () => {
+    const { verifySignatureBytes } = await import('./crypto.ts')
+    const tooShortPub = Buffer.alloc(16).toString('base64')
+    const sig = Buffer.alloc(64).toString('base64')
+    expect(() => verifySignatureBytes(Buffer.from('x'), sig, tooShortPub)).toThrow(
+      'public key must be exactly 32 bytes',
+    )
+  })
+
+  test('parseKeyPairYaml accepts minimal valid YAML', async () => {
+    const { generateKeyPair, serializeKeyPairYaml, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const yaml = serializeKeyPairYaml(kp, 'unit-test')
+    const parsed = parseKeyPairYaml(yaml)
+    expect(parsed.seed).toBe(kp.seed)
+    expect(parsed.publicKey).toBe(kp.publicKey)
+    expect(parsed.createdAt).toBe(kp.createdAt)
+  })
+
+  test('parseKeyPairYaml tolerates comments and blank lines', async () => {
+    const { generateKeyPair, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const yaml = `# comment line\n\nseed: ${kp.seed}\n# another comment\ncreated_at: ${kp.createdAt}\n`
+    const parsed = parseKeyPairYaml(yaml)
+    expect(parsed.seed).toBe(kp.seed)
+  })
+
+  test('parseKeyPairYaml rejects missing seed', async () => {
+    const { parseKeyPairYaml } = await import('./crypto.ts')
+    expect(() => parseKeyPairYaml('created_at: 2026-01-01T00:00:00Z\n')).toThrow(
+      'missing required field `seed`',
+    )
+  })
+
+  test('parseKeyPairYaml rejects wrong-length seed', async () => {
+    const { parseKeyPairYaml } = await import('./crypto.ts')
+    const shortSeed = Buffer.alloc(16).toString('base64')
+    expect(() =>
+      parseKeyPairYaml(`seed: ${shortSeed}\ncreated_at: 2026-01-01T00:00:00Z\n`),
+    ).toThrow('seed must be exactly 32 bytes')
+  })
+
+  test('parseKeyPairYaml rejects missing created_at', async () => {
+    const { generateKeyPair, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    expect(() => parseKeyPairYaml(`seed: ${kp.seed}\n`)).toThrow(
+      'missing required field `created_at`',
+    )
+  })
+
+  test('parseKeyPairYaml rejects invalid created_at', async () => {
+    const { generateKeyPair, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    expect(() => parseKeyPairYaml(`seed: ${kp.seed}\ncreated_at: not-a-date\n`)).toThrow(
+      'not a valid date',
+    )
+  })
+
+  test('parseKeyPairYaml refuses YAML with mismatched public_key (tamper signal)', async () => {
+    const { generateKeyPair, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const otherKp = generateKeyPair()
+    // YAML declares a public_key that does NOT match the seed's derived key
+    const tampered = `seed: ${kp.seed}\npublic_key: ${otherKp.publicKey}\ncreated_at: ${kp.createdAt}\n`
+    expect(() => parseKeyPairYaml(tampered)).toThrow('does not match seed-derived public key')
+  })
+
+  test('serializeKeyPairYaml round-trips through parseKeyPairYaml', async () => {
+    const { generateKeyPair, serializeKeyPairYaml, parseKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const yaml = serializeKeyPairYaml(kp, 'round-trip')
+    expect(yaml).toContain('seed:')
+    expect(yaml).toContain('public_key:')
+    expect(yaml).toContain('created_at:')
+    expect(yaml).toContain('purpose: round-trip')
+    expect(parseKeyPairYaml(yaml).seed).toBe(kp.seed)
   })
 })
