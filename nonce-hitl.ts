@@ -49,7 +49,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -131,36 +131,81 @@ export const MAX_LIVE_NONCES_PER_USER = 3
 /** Create a fresh in-memory `NonceStore`. The store is bounded only
  *  by `MAX_LIVE_NONCES_PER_USER`; periodic `pruneExpired()` keeps the
  *  size from drifting. Process restart drops every pending nonce —
- *  intentional. */
+ *  intentional.
+ *
+ *  Two-index structure (per Gemini security review on PR #179):
+ *    - `byNonce: Map<nonce, NonceChallenge>` — primary lookup table
+ *    - `byUser: Map<userId, Set<nonce>>` — secondary index for O(1)
+ *      per-user cap enforcement
+ *
+ *  Without the secondary index, the cap check iterates every entry
+ *  in `byNonce` on every `set()` call — O(N) where N is total live
+ *  nonces across all users. That creates a minor DoS vector: an
+ *  attacker who can trigger verbs spams `mintNonce` for many user
+ *  ids, growing N, and every subsequent legitimate `mintNonce` pays
+ *  the linear cost. The secondary index keeps cap enforcement
+ *  amortized O(MAX_LIVE_NONCES_PER_USER) — constant. */
 export function createMemoryNonceStore(): NonceStore {
   const byNonce = new Map<string, NonceChallenge>()
+  const byUser = new Map<string, Set<string>>()
+
+  function indexAdd(challenge: NonceChallenge): void {
+    let userNonces = byUser.get(challenge.userId)
+    if (userNonces === undefined) {
+      userNonces = new Set<string>()
+      byUser.set(challenge.userId, userNonces)
+    }
+    userNonces.add(challenge.nonce)
+  }
+
+  function indexRemove(challenge: NonceChallenge): void {
+    const userNonces = byUser.get(challenge.userId)
+    if (userNonces === undefined) return
+    userNonces.delete(challenge.nonce)
+    if (userNonces.size === 0) byUser.delete(challenge.userId)
+  }
 
   return {
     set(challenge) {
-      // Enforce per-user cap. Iterate to find this user's live
-      // entries; if at the cap, drop the oldest (smallest expiresAt).
-      const userEntries: NonceChallenge[] = []
-      for (const c of byNonce.values()) {
-        if (c.userId === challenge.userId) userEntries.push(c)
-      }
-      if (userEntries.length >= MAX_LIVE_NONCES_PER_USER) {
-        // Sort ascending by expiresAt; oldest is first. Drop it.
-        userEntries.sort((a, b) => a.expiresAt - b.expiresAt)
-        byNonce.delete(userEntries[0]!.nonce)
+      // Enforce per-user cap via the secondary index — constant-time
+      // membership check. Eviction iterates only the user's own
+      // entries (at most MAX_LIVE_NONCES_PER_USER), not the whole
+      // store.
+      const userNonces = byUser.get(challenge.userId)
+      if (userNonces !== undefined && userNonces.size >= MAX_LIVE_NONCES_PER_USER) {
+        // Find this user's oldest live entry by walking their small
+        // set (bounded by the cap). Drop it from both indexes.
+        let oldest: NonceChallenge | undefined
+        for (const n of userNonces) {
+          const c = byNonce.get(n)
+          if (c === undefined) continue
+          if (oldest === undefined || c.expiresAt < oldest.expiresAt) {
+            oldest = c
+          }
+        }
+        if (oldest !== undefined) {
+          byNonce.delete(oldest.nonce)
+          indexRemove(oldest)
+        }
       }
       byNonce.set(challenge.nonce, challenge)
+      indexAdd(challenge)
     },
     get(nonce) {
       return byNonce.get(nonce)
     },
     delete(nonce) {
+      const challenge = byNonce.get(nonce)
+      if (challenge === undefined) return
       byNonce.delete(nonce)
+      indexRemove(challenge)
     },
     pruneExpired(now) {
       let removed = 0
       for (const [nonce, challenge] of byNonce) {
         if (challenge.expiresAt <= now) {
           byNonce.delete(nonce)
+          indexRemove(challenge)
           removed += 1
         }
       }
@@ -236,10 +281,11 @@ export function mintNonce(
  *      who triggered the challenge. Even if they're on the allowFrom
  *      list, they cannot consume someone else's nonce.
  *
- *  Comparison uses `timingSafeEqual` to prevent timing-side-channel
- *  inference of the nonce. The nonce is high-entropy (64 bits), so
- *  timing attacks are not a realistic concern — but defense in depth
- *  is cheap here.
+ *  Lookup is via Map key equality (constant-time by language design).
+ *  An earlier draft did a redundant `timingSafeEqual` check after the
+ *  Map lookup; Gemini's security review on PR #179 noted the check
+ *  was unreachable since `Map.get(k)` returning a value implies `k`
+ *  already matched the stored key. Removed.
  *
  *  @param presentedNonce  The nonce text the operator typed
  *  @param presentedBy     The (userId, channelId) of the redemption attempt
@@ -252,23 +298,21 @@ export function verifyNonce(
   store: NonceStore,
   now: () => number = (): number => Date.now(),
 ): VerifyResult {
-  // Lookup is by exact string key; the timing-safe comparison below
-  // covers the case where an attacker can probe values close to a
-  // valid nonce.
+  // Lookup is by exact string key. JavaScript Map keys hash to
+  // buckets and compare via SameValueZero — equality on the key is
+  // already a constant-time-by-design lookup at the language level.
+  // A previous draft of this function did a `timingSafeEqual` compare
+  // after the `get()` succeeded, but Gemini's security review on PR
+  // #179 correctly flagged that the comparison was a no-op: if
+  // `get(presentedNonce)` returned a challenge, then by Map semantics
+  // `challenge.nonce === presentedNonce` already, so the compare
+  // would be string vs itself. The genuine side-channel exposure
+  // here is the boolean "did get() return a hit or undefined" —
+  // which is exactly what the attacker's eventual response code
+  // (`ok` vs `unknown`) reveals anyway. No additional comparison
+  // adds information-flow resistance at this layer.
   const challenge = store.get(presentedNonce)
   if (challenge === undefined) {
-    return { ok: false, reason: 'unknown' }
-  }
-
-  // Constant-time compare. Both strings are 16 hex chars by
-  // construction; equal length is the only case timingSafeEqual
-  // accepts without throwing.
-  if (
-    challenge.nonce.length !== presentedNonce.length ||
-    !timingSafeEqual(Buffer.from(challenge.nonce, 'utf8'), Buffer.from(presentedNonce, 'utf8'))
-  ) {
-    // Map mismatch falls into 'unknown' — a partial hex collision is
-    // not a meaningful distinction at this entropy.
     return { ok: false, reason: 'unknown' }
   }
 
