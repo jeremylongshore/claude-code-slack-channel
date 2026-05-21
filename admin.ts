@@ -38,6 +38,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { JournalWriter } from './journal.ts'
+import { DEFAULT_MUTE_TTL_MS, type MuteStore, parseSlackMention } from './mute-store.ts'
 import type { NonceStore } from './nonce-hitl.ts'
 import { verifyNonce } from './nonce-hitl.ts'
 
@@ -81,17 +82,54 @@ export interface AdminRestartCommand extends AdminCommandBase {
   nonce: string | undefined
 }
 
-export type AdminCommand = AdminClearCommand | AdminRestartCommand
+/** !mute @<bot> — reversible: silences the named peer bot in this
+ *  channel for a TTL (default 5 min). No nonce required (reversible,
+ *  auto-expiring). Carries the resolved target bot id. */
+export interface AdminMuteCommand extends AdminCommandBase {
+  kind: 'mute'
+  /** Slack user_id of the bot to mute, resolved from the `@<bot>`
+   *  mention argument via parseSlackMention. */
+  targetBotId: string
+}
+
+/** !unmute @<bot> — reversible: early release for a previously
+ *  muted bot. No nonce required. */
+export interface AdminUnmuteCommand extends AdminCommandBase {
+  kind: 'unmute'
+  targetBotId: string
+}
+
+export type AdminCommand =
+  | AdminClearCommand
+  | AdminRestartCommand
+  | AdminMuteCommand
+  | AdminUnmuteCommand
 
 // ---------------------------------------------------------------------------
 // Parser — text → AdminCommand
 // ---------------------------------------------------------------------------
 
-/** Matches the admin-verb shape: `!clear` or `!restart [<nonce>]`.
+/** Matches the admin-verb shape:
+ *    !clear
+ *    !restart [<nonce>]
+ *    !mute <@U_BOT>
+ *    !unmute <@U_BOT>
+ *
  *  Anchored — the dispatcher caller is responsible for stripping any
- *  Slack mention prefix (`<@U_BOT>`) before passing text in. See
- *  `stripBotMention()` in lib.ts. */
-const ADMIN_COMMAND_RE = /^!(clear|restart)(?:\s+(\S+))?$/
+ *  Slack mention prefix to the BRIDGE bot (`<@U_BRIDGE>`) before
+ *  passing text in (see `stripBotMention()` in lib.ts). The
+ *  ARGUMENT-side mention (the target bot in mute/unmute) is part of
+ *  the verb syntax and stays.
+ *
+ *  Argument capture uses `.+` (not `\S+`) so Slack mentions whose
+ *  display-name label contains a space (e.g., `<@U123|Alice Smith>`)
+ *  are captured as a single token. Per Gemini review on PR #183 —
+ *  legitimate Slack display names regularly contain spaces and the
+ *  previous `\S+` would silently refuse to match those. The
+ *  downstream `parseSlackMention` accepts spaces inside the
+ *  display-name capture (`[^>]*`).
+ */
+const ADMIN_COMMAND_RE = /^!(clear|restart|mute|unmute)(?:\s+(.+))?$/
 
 /** Parse a normalized text body into an `AdminCommand`, or `null` if
  *  the text doesn't match an admin verb. Pure function — no side
@@ -115,7 +153,7 @@ export function parseAdminCommand(
 ): AdminCommand | null {
   const match = ADMIN_COMMAND_RE.exec(text.trim())
   if (match === null) return null
-  const verb = match[1] as 'clear' | 'restart'
+  const verb = match[1] as 'clear' | 'restart' | 'mute' | 'unmute'
   const arg = match[2]
 
   if (verb === 'clear') {
@@ -127,8 +165,18 @@ export function parseAdminCommand(
     return { kind: 'clear', ...envelope }
   }
 
-  // verb === 'restart'
-  return { kind: 'restart', nonce: arg, ...envelope }
+  if (verb === 'restart') {
+    return { kind: 'restart', nonce: arg, ...envelope }
+  }
+
+  // verb === 'mute' or 'unmute' — argument MUST be a Slack mention
+  // that resolves to a bot user_id. Failure to resolve falls through
+  // to null (treated as normal chat).
+  if (arg === undefined) return null
+  const targetBotId = parseSlackMention(arg)
+  if (targetBotId === null) return null
+  if (verb === 'mute') return { kind: 'mute', targetBotId, ...envelope }
+  return { kind: 'unmute', targetBotId, ...envelope }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +188,7 @@ export function parseAdminCommand(
  *  react (e.g., post a Slack message explaining why a verb was
  *  rejected). */
 export type DispatchOutcome =
-  | { kind: 'executed'; verb: 'clear' | 'restart' }
+  | { kind: 'executed'; verb: 'clear' | 'restart' | 'mute' | 'unmute' }
   | { kind: 'challenge_issued'; nonce: string; expiresAt: number }
   | { kind: 'denied'; reason: string }
 
@@ -180,8 +228,14 @@ export interface DispatchDeps {
     presentedBy: { userId: string; channelId: string },
   ) => ReturnType<typeof verifyNonce>
   /** Post a Slack reaction to the originating message. ♻️ for !clear,
-   *  🔄 for !restart. */
+   *  🔄 for !restart, 🔇 for !mute, 🔊 for !unmute. */
   postReaction: (emoji: string) => Promise<void>
+  /** Mute store (ccsc-gjm). Required when dispatching `!mute` /
+   *  `!unmute`; injected so tests can swap mock stores. */
+  muteStore?: MuteStore
+  /** Clock for mute TTL math. Defaults to `Date.now`. Tests inject
+   *  for deterministic expiry assertions. */
+  now?: () => number
 }
 
 /** Dispatch an admin command through the full pipeline:
@@ -231,7 +285,35 @@ export async function dispatchAdminCommand(
     return { kind: 'executed', verb: 'clear' }
   }
 
-  // cmd.kind === 'restart'
+  if (cmd.kind === 'mute' || cmd.kind === 'unmute') {
+    // ccsc-gjm — both verbs are reversible and auto-expiring (or
+    // operator-reversible via the counterpart). No nonce required.
+    // Allowlist gate already passed above.
+    if (deps.muteStore === undefined) {
+      // Caller bug — wired the verb parser but didn't wire a store.
+      // Fail loud, don't silently no-op.
+      await journalAttempt(deps, cmd, 'denied', 'mute store not configured')
+      return { kind: 'denied', reason: 'mute store not configured' }
+    }
+    const now = deps.now !== undefined ? deps.now() : Date.now()
+    if (cmd.kind === 'mute') {
+      const expiresAt = now + DEFAULT_MUTE_TTL_MS
+      deps.muteStore.mute(cmd.channelId, cmd.targetBotId, expiresAt, cmd.requestedBy, now)
+      await journalAttempt(deps, cmd, 'allow')
+      await deps.postReaction('mute')
+      return { kind: 'executed', verb: 'mute' }
+    }
+    // !unmute — early release. The store reports whether any entry
+    // was actually cleared; we journal regardless (the operator
+    // expressed the intent) but the audit reader can see whether
+    // it landed via the input field if we extend it later.
+    deps.muteStore.unmute(cmd.channelId, cmd.targetBotId)
+    await journalAttempt(deps, cmd, 'allow')
+    await deps.postReaction('loud_sound')
+    return { kind: 'executed', verb: 'unmute' }
+  }
+
+  // cmd.kind === 'restart' — only kind remaining
 
   // Challenge phase: no nonce → mint + DM + journal.
   if (cmd.nonce === undefined) {
@@ -283,18 +365,29 @@ async function journalAttempt(
   const kindMap = {
     clear: outcome === 'allow' ? 'admin.clear' : 'admin.clear.denied',
     restart: outcome === 'allow' ? 'admin.restart' : 'admin.restart.denied',
+    mute: outcome === 'allow' ? 'admin.mute' : 'admin.mute.denied',
+    unmute: outcome === 'allow' ? 'admin.unmute' : 'admin.unmute.denied',
   } as const
+  const kind = kindMap[cmd.kind]
   try {
+    // mute/unmute events carry the target bot in input so audit
+    // readers can correlate who-muted-whom without parsing the
+    // text. Other verbs don't carry a target.
+    const input: Record<string, unknown> = {}
+    if (cmd.kind === 'mute' || cmd.kind === 'unmute') {
+      input.target_bot_id = cmd.targetBotId
+    }
     await deps.journalWrite({
-      kind: kindMap[cmd.kind],
+      kind,
       outcome: outcome === 'allow' ? 'allow' : 'deny',
       actor: 'session_owner',
       sessionKey: { channel: cmd.channelId, thread: cmd.threadTs },
+      ...(Object.keys(input).length > 0 ? { input } : {}),
       ...(reason !== undefined ? { reason } : {}),
     })
   } catch (err) {
     console.error('[slack] journal.writeEvent failed (admin event)', {
-      kind: kindMap[cmd.kind],
+      kind,
       error: err instanceof Error ? err.message : String(err),
     })
   }

@@ -5542,11 +5542,11 @@ describe('JournalEvent', () => {
     // 19 original kinds + manifest.read + manifest.read.cached (Epic
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
-    // 5 admin.* kinds (ccsc-3w0: admin.clear, admin.clear.denied,
-    // admin.restart, admin.restart.denied, admin.restart.challenge) +
-    // system.stream_finalize (ccsc-ele). If this number drifts,
-    // update the doc count in journal.ts's header comment too.
-    expect(kinds).toHaveLength(30)
+    // 5 admin.* kinds (ccsc-3w0) + system.stream_finalize (ccsc-ele) +
+    // 4 admin.mute/unmute kinds (ccsc-gjm: admin.mute, admin.mute.denied,
+    // admin.unmute, admin.unmute.denied). If this number drifts, update
+    // the doc count in journal.ts's header comment too.
+    expect(kinds).toHaveLength(34)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -5558,6 +5558,10 @@ describe('JournalEvent', () => {
     expect(kinds).toContain('admin.restart.denied')
     expect(kinds).toContain('admin.restart.challenge')
     expect(kinds).toContain('system.stream_finalize')
+    expect(kinds).toContain('admin.mute')
+    expect(kinds).toContain('admin.mute.denied')
+    expect(kinds).toContain('admin.unmute')
+    expect(kinds).toContain('admin.unmute.denied')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -12672,5 +12676,507 @@ describe('ccsc-gyt — gate() integration with rate limit', () => {
       const result = await gate({ ...peerEvent, ts: `1700000000.${i}` }, opts)
       expect(result.dropReason).not.toBe('rate.cross_bot_loop')
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ccsc-gjm — !mute / !unmute operator verbs + mute store
+// ---------------------------------------------------------------------------
+
+describe('ccsc-gjm — parseSlackMention', () => {
+  test('extracts user_id from canonical <@U_BOT> form', async () => {
+    const { parseSlackMention } = await import('./mute-store.ts')
+    expect(parseSlackMention('<@U_BOT123>')).toBe('U_BOT123')
+  })
+
+  test('extracts user_id from <@U_BOT|display> form (Slack caches display name)', async () => {
+    const { parseSlackMention } = await import('./mute-store.ts')
+    expect(parseSlackMention('<@U_BOT123|alice>')).toBe('U_BOT123')
+  })
+
+  test('returns null for non-mention input', async () => {
+    const { parseSlackMention } = await import('./mute-store.ts')
+    expect(parseSlackMention('plain text')).toBeNull()
+    expect(parseSlackMention('@U_BOT123')).toBeNull() // no angles
+    expect(parseSlackMention('<@>')).toBeNull() // empty user
+    expect(parseSlackMention('<@123>')).toBeNull() // doesn't start with letter
+  })
+})
+
+describe('ccsc-gjm — MuteStore', () => {
+  test('mute then isMuted returns true within TTL', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 1_000_300, 'U_OPERATOR', 1_000_000)
+    expect(store.isMuted('C_OPS', 'B_alice', 1_000_100)).toBe(true)
+  })
+
+  test('isMuted auto-prunes expired entry and returns false', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 1_000_300, 'U_OPERATOR', 1_000_000)
+    // Expired (now >= expiresAt)
+    expect(store.isMuted('C_OPS', 'B_alice', 1_000_300)).toBe(false)
+    // And the entry is gone — size confirms
+    expect(store.size()).toBe(0)
+  })
+
+  test('per-channel isolation — same bot muted in C1 is NOT muted in C2', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 1_000_300, 'U_OPERATOR', 1_000_000)
+    expect(store.isMuted('C_OPS', 'B_alice', 1_000_100)).toBe(true)
+    expect(store.isMuted('C_INFRA', 'B_alice', 1_000_100)).toBe(false)
+  })
+
+  test('per-bot isolation — Alice muted does NOT mute Bob in same channel', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 1_000_300, 'U_OPERATOR', 1_000_000)
+    expect(store.isMuted('C_OPS', 'B_alice', 1_000_100)).toBe(true)
+    expect(store.isMuted('C_OPS', 'B_bob', 1_000_100)).toBe(false)
+  })
+
+  test('unmute releases the entry early', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 9_999_999_999, 'U_OPERATOR', 1_000_000)
+    expect(store.unmute('C_OPS', 'B_alice')).toBe(true)
+    expect(store.isMuted('C_OPS', 'B_alice', 1_000_100)).toBe(false)
+  })
+
+  test('unmute returns false when no such entry', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    expect(store.unmute('C_OPS', 'B_ghost')).toBe(false)
+  })
+
+  test('most-recent mute overwrites earlier mute (same channel + bot)', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 1_000_300, 'U_OPERATOR_A', 1_000_000)
+    store.mute('C_OPS', 'B_alice', 2_000_000, 'U_OPERATOR_B', 1_500_000)
+    // Still live at t=1_900_000 (second mute's expiresAt is 2_000_000)
+    expect(store.isMuted('C_OPS', 'B_alice', 1_900_000)).toBe(true)
+    // list() reflects the second operator
+    const entries = store.list('C_OPS', 1_900_000)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.mutedBy).toBe('U_OPERATOR_B')
+  })
+
+  test('list returns only live entries for a channel', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_alice', 1_000_300, 'U_OP', 1_000_000)
+    store.mute('C_OPS', 'B_bob', 1_000_300, 'U_OP', 1_000_000)
+    store.mute('C_OPS', 'B_carl', 1_000_100, 'U_OP', 1_000_000) // expired by query time
+    store.mute('C_INFRA', 'B_alice', 1_000_300, 'U_OP', 1_000_000)
+    const live = store.list('C_OPS', 1_000_200)
+    expect(live).toHaveLength(2)
+    const botIds = live.map((e) => e.botId).sort()
+    expect(botIds).toEqual(['B_alice', 'B_bob'])
+  })
+
+  test('prune sweeps all expired entries across channels', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C1', 'B1', 1_000_100, 'U', 1_000_000)
+    store.mute('C2', 'B2', 1_000_200, 'U', 1_000_000)
+    store.mute('C3', 'B3', 9_999_999_999, 'U', 1_000_000)
+    expect(store.prune(1_500_000)).toBe(2)
+    expect(store.size()).toBe(1)
+  })
+
+  test('size is a diagnostic — counts live + stale until pruned', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C1', 'B1', 1_000_100, 'U', 1_000_000)
+    store.mute('C2', 'B2', 9_999_999_999, 'U', 1_000_000)
+    // Before any reads/prunes, size is 2 (stale-but-not-yet-swept counts)
+    expect(store.size()).toBe(2)
+  })
+})
+
+describe('ccsc-gjm — parseAdminCommand for mute/unmute', () => {
+  const envelope = {
+    channelId: 'C_OPS',
+    requestedBy: 'U_OPERATOR',
+    threadTs: '1700000000.000100',
+    messageTs: '1700000000.000100',
+  }
+
+  test('parses !mute <@U_BOT> into AdminMuteCommand with resolved targetBotId', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute <@U_PEER>', envelope)).toEqual({
+      kind: 'mute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+  })
+
+  test('parses !unmute <@U_BOT> into AdminUnmuteCommand', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!unmute <@U_PEER>', envelope)).toEqual({
+      kind: 'unmute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+  })
+
+  test('parses mute with display-name form <@U_BOT|alias>', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute <@U_PEER|codex-bot>', envelope)).toEqual({
+      kind: 'mute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+  })
+
+  test('parses mute with display name containing SPACES (Gemini #183 fix)', async () => {
+    // Slack display names regularly contain spaces (real names like
+    // 'Alice Smith'). The regex argument capture uses .+ (not \\S+)
+    // so the whole mention token is one argument. Pinned to prevent
+    // a future refactor from re-introducing the \\S+ bug.
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute <@U_PEER|Alice Smith>', envelope)).toEqual({
+      kind: 'mute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+    expect(parseAdminCommand('!unmute <@U_PEER|Bot With Spaces>', envelope)).toEqual({
+      kind: 'unmute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+  })
+
+  test('rejects !mute without an argument (returns null)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute', envelope)).toBeNull()
+  })
+
+  test('rejects !mute with non-mention argument (returns null)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute alice', envelope)).toBeNull()
+    expect(parseAdminCommand('!mute @alice', envelope)).toBeNull()
+  })
+})
+
+describe('ccsc-gjm — dispatchAdminCommand for mute/unmute', () => {
+  test('!mute happy path: store.mute called + admin.mute journaled + 🔇 reaction', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const muteStore = createMuteStore()
+    const journal: Array<Record<string, unknown>> = []
+    const reactions: string[] = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'mute',
+        targetBotId: 'U_PEER',
+        channelId: 'C_OPS',
+        requestedBy: 'U_OPERATOR',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input as Record<string, unknown>)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async (e) => {
+          reactions.push(e)
+        },
+        muteStore,
+        now: () => 1_000_000,
+      },
+    )
+
+    expect(result).toEqual({ kind: 'executed', verb: 'mute' })
+    expect(journal[0]!.kind).toBe('admin.mute')
+    const journalInput = journal[0]!.input as Record<string, unknown>
+    expect(journalInput.target_bot_id).toBe('U_PEER')
+    expect(reactions).toEqual(['mute'])
+    // Mute is live in the store
+    expect(muteStore.isMuted('C_OPS', 'U_PEER', 1_000_100)).toBe(true)
+  })
+
+  test('!unmute happy path: store.unmute called + admin.unmute journaled + 🔊 reaction', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const muteStore = createMuteStore()
+    // Pre-seed an active mute
+    muteStore.mute('C_OPS', 'U_PEER', 9_999_999_999, 'U_OPERATOR', 1_000_000)
+    const journal: Array<Record<string, unknown>> = []
+    const reactions: string[] = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'unmute',
+        targetBotId: 'U_PEER',
+        channelId: 'C_OPS',
+        requestedBy: 'U_OPERATOR',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async (input) => {
+          journal.push(input as Record<string, unknown>)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async (e) => {
+          reactions.push(e)
+        },
+        muteStore,
+        now: () => 1_000_100,
+      },
+    )
+
+    expect(result).toEqual({ kind: 'executed', verb: 'unmute' })
+    expect(journal[0]!.kind).toBe('admin.unmute')
+    expect(reactions).toEqual(['loud_sound'])
+    // Mute is gone
+    expect(muteStore.isMuted('C_OPS', 'U_PEER', 1_000_200)).toBe(false)
+  })
+
+  test('!mute without store wired → denied with explicit reason (fail loud, not silent no-op)', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'mute',
+        targetBotId: 'U_PEER',
+        channelId: 'C_OPS',
+        requestedBy: 'U_OPERATOR',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async () => undefined,
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async () => {},
+        // NO muteStore
+      },
+    )
+
+    expect(result.kind).toBe('denied')
+    if (result.kind === 'denied') {
+      expect(result.reason).toContain('mute store not configured')
+    }
+  })
+
+  test('!mute without allowlist → denied with admin.mute.denied, no store mutation', async () => {
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const muteStore = createMuteStore()
+    const journal: Array<Record<string, unknown>> = []
+
+    const result = await dispatchAdminCommand(
+      {
+        kind: 'mute',
+        targetBotId: 'U_PEER',
+        channelId: 'C_OPS',
+        requestedBy: 'U_RANDO',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => false,
+        journalWrite: async (i) => {
+          journal.push(i as Record<string, unknown>)
+          return undefined
+        },
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+        postReaction: async () => {},
+        muteStore,
+      },
+    )
+
+    expect(result.kind).toBe('denied')
+    expect(journal[0]!.kind).toBe('admin.mute.denied')
+    expect(muteStore.size()).toBe(0)
+  })
+
+  test('!mute does NOT require nonce (reversible verbs skip the HITL handshake)', async () => {
+    // Pin: even if a nonce was somehow added to the mute envelope,
+    // dispatch should not call verifyChallenge. This is the
+    // reversible/destructive design split — mute is reversible.
+    const { dispatchAdminCommand, createRecordingSendKeys } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    let verifyCalled = false
+
+    await dispatchAdminCommand(
+      {
+        kind: 'mute',
+        targetBotId: 'U_PEER',
+        channelId: 'C_OPS',
+        requestedBy: 'U_OPERATOR',
+        threadTs: '1700000000.000100',
+        messageTs: '1700000000.000100',
+      },
+      {
+        isAllowed: () => true,
+        journalWrite: async () => undefined,
+        quiesceAndDeactivate: async () => {},
+        sendTmuxKeys: createRecordingSendKeys([]),
+        issueChallenge: async () => ({ nonce: 'unused', expiresAt: 0 }),
+        verifyChallenge: () => {
+          verifyCalled = true
+          return { ok: false, reason: 'unknown' }
+        },
+        postReaction: async () => {},
+        muteStore: createMuteStore(),
+      },
+    )
+
+    expect(verifyCalled).toBe(false)
+  })
+})
+
+describe('ccsc-gjm — gate() integration with mute store', () => {
+  test('muted peer bot dropped with admin.muted reason', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const { gate } = await import('./lib.ts')
+    const muteStore = createMuteStore()
+    muteStore.mute('C_OPS', 'U_PEER', 9_999_999_999, 'U_OPERATOR', 1_000_000)
+
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_OPS: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER'] },
+      },
+      pending: {},
+    }
+    const result = await gate(
+      {
+        type: 'message',
+        channel: 'C_OPS',
+        user: 'U_PEER',
+        bot_id: 'B_PEER',
+        text: 'silenced message',
+        ts: '1700000000.000100',
+      },
+      {
+        access,
+        staticMode: true,
+        saveAccess: () => {},
+        botUserId: 'U_BRIDGE_BOT',
+        selfBotId: 'B_BRIDGE',
+        selfAppId: 'A_BRIDGE',
+        muteStore,
+        now: () => 1_000_100,
+      },
+    )
+
+    expect(result.action).toBe('drop')
+    expect(result.dropReason).toBe('admin.muted')
+  })
+
+  test('mute check runs BEFORE rate limit (explicit operator block wins over auto-block)', async () => {
+    // If a muted bot's message reaches the rate limit check first,
+    // an operator unmute might still see "rate.cross_bot_loop" if
+    // the rate-limit hit happened to be the dropping authority.
+    // The mute should ALWAYS win — it's an explicit operator intent.
+    const { createMuteStore } = await import('./mute-store.ts')
+    const { gate } = await import('./lib.ts')
+    const muteStore = createMuteStore()
+    muteStore.mute('C_OPS', 'U_PEER', 9_999_999_999, 'U_OPERATOR', 1_000_000)
+    const rateLimitStore = (await import('./peer-bot-rate-limit.ts')).createPeerBotRateLimitStore()
+    // Pre-saturate the rate limiter so it WOULD drop
+    for (let i = 0; i < 100; i++) {
+      rateLimitStore.check('C_OPS', 'U_PEER', 1_000_000, { count: 5, windowMs: 60_000 })
+    }
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_OPS: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_PEER'],
+          peerBotRateLimit: { count: 5, windowMs: 60_000 },
+        },
+      },
+      pending: {},
+    }
+    const result = await gate(
+      {
+        type: 'message',
+        channel: 'C_OPS',
+        user: 'U_PEER',
+        bot_id: 'B_PEER',
+        text: 'silenced',
+        ts: '1700000000.000100',
+      },
+      {
+        access,
+        staticMode: true,
+        saveAccess: () => {},
+        botUserId: 'U_BRIDGE_BOT',
+        selfBotId: 'B_BRIDGE',
+        selfAppId: 'A_BRIDGE',
+        muteStore,
+        peerBotRateLimitStore: rateLimitStore,
+        now: () => 1_000_100,
+      },
+    )
+
+    expect(result.dropReason).toBe('admin.muted')
+  })
+
+  test('expired mute does NOT drop (auto-prune in isMuted)', async () => {
+    const { createMuteStore } = await import('./mute-store.ts')
+    const { gate } = await import('./lib.ts')
+    const muteStore = createMuteStore()
+    muteStore.mute('C_OPS', 'U_PEER', 1_000_100, 'U_OPERATOR', 1_000_000)
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_OPS: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER'] },
+      },
+      pending: {},
+    }
+    // Now is past expiry — mute should auto-clear
+    const result = await gate(
+      {
+        type: 'message',
+        channel: 'C_OPS',
+        user: 'U_PEER',
+        bot_id: 'B_PEER',
+        text: 'expired-mute message',
+        ts: '1700000000.000100',
+      },
+      {
+        access,
+        staticMode: true,
+        saveAccess: () => {},
+        botUserId: 'U_BRIDGE_BOT',
+        selfBotId: 'B_BRIDGE',
+        selfAppId: 'A_BRIDGE',
+        muteStore,
+        now: () => 2_000_000,
+      },
+    )
+
+    expect(result.dropReason).not.toBe('admin.muted')
   })
 })

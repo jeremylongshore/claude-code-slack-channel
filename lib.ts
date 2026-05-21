@@ -1150,8 +1150,15 @@ export interface GateOptions {
    *  `rate.cross_bot_loop`. Absent (tests) → rate limiting
    *  disabled, only the existing allowBotIds gate applies. */
   peerBotRateLimitStore?: import('./peer-bot-rate-limit.ts').PeerBotRateLimitStore
-  /** Clock source for the rate limit. Injected so tests can use a
-   *  deterministic Date.now(). Defaults to wall clock. */
+  /** Operator-initiated peer-bot mute store (ccsc-gjm). When
+   *  present, peer-bot messages from a (channel, bot_id) pair that
+   *  has been muted via the `!mute` admin verb are dropped with
+   *  reason `admin.muted`. Mutes auto-expire after their TTL
+   *  (default 5min) OR can be released early via `!unmute`. */
+  muteStore?: import('./mute-store.ts').MuteStore
+  /** Clock source for the rate limit + mute checks. Injected so
+   *  tests can use a deterministic Date.now(). Defaults to wall
+   *  clock. */
   now?: () => number
 }
 
@@ -1181,6 +1188,18 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
     return { action: 'drop' }
+  }
+
+  // ccsc-gjm — operator-initiated mute. Check the mute store BEFORE
+  // the rate limit so an explicit operator block takes precedence
+  // over the automatic loop-breaker. If muted, drop with reason
+  // 'admin.muted' (distinguishable from rate.cross_bot_loop in the
+  // journal so the operator can grep their own mutes vs auto-drops).
+  if (opts.muteStore !== undefined) {
+    const muteNow = opts.now !== undefined ? opts.now() : Date.now()
+    if (opts.muteStore.isMuted(channel, botUser, muteNow)) {
+      return { action: 'drop', dropReason: 'admin.muted' }
+    }
   }
 
   // ccsc-gyt — per-(channel, sender_bot_id) sliding-window rate limit
