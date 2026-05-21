@@ -12383,3 +12383,286 @@ describe('ccsc-ele — Gemini #181 review fixes', () => {
     expect((finalize!.input as { chunks_sent: number }).chunks_sent).toBe(0)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ccsc-gyt — Per-bot per-channel sliding-window rate limit
+// ---------------------------------------------------------------------------
+//
+// First piece of the multi-agent epic (ccsc-7xq). Defends against
+// A→B→A runaway loops when multiple peer bots are opted into one
+// channel via allowBotIds.
+
+describe('ccsc-gyt — createPeerBotRateLimitStore', () => {
+  test('first message from a (channel, bot) pair is allowed', async () => {
+    const { createPeerBotRateLimitStore, DEFAULT_PEER_BOT_RATE_LIMIT } = await import(
+      './peer-bot-rate-limit.ts'
+    )
+    const store = createPeerBotRateLimitStore()
+    expect(store.check('C_OPS', 'B_alice', 1_000_000, DEFAULT_PEER_BOT_RATE_LIMIT)).toBe(true)
+  })
+
+  test('within threshold: all messages allowed', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 5, windowMs: 60_000 }
+    for (let i = 0; i < 5; i++) {
+      expect(store.check('C_OPS', 'B_alice', 1_000_000 + i * 100, cfg)).toBe(true)
+    }
+  })
+
+  test('exceeds threshold: subsequent messages dropped', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 3, windowMs: 60_000 }
+    // First 3 within threshold
+    expect(store.check('C_OPS', 'B_alice', 1_000_000, cfg)).toBe(true)
+    expect(store.check('C_OPS', 'B_alice', 1_000_100, cfg)).toBe(true)
+    expect(store.check('C_OPS', 'B_alice', 1_000_200, cfg)).toBe(true)
+    // 4th exceeds — dropped
+    expect(store.check('C_OPS', 'B_alice', 1_000_300, cfg)).toBe(false)
+    expect(store.check('C_OPS', 'B_alice', 1_000_400, cfg)).toBe(false)
+  })
+
+  test('after window expires: count resets, new messages allowed', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 2, windowMs: 60_000 }
+    // Saturate the window
+    expect(store.check('C_OPS', 'B_alice', 1_000_000, cfg)).toBe(true)
+    expect(store.check('C_OPS', 'B_alice', 1_000_100, cfg)).toBe(true)
+    expect(store.check('C_OPS', 'B_alice', 1_000_200, cfg)).toBe(false)
+    // Time advances past the window (60_001ms after the FIRST timestamp)
+    // — first two entries are now expired
+    expect(store.check('C_OPS', 'B_alice', 1_060_101, cfg)).toBe(true)
+  })
+
+  test('per-bot isolation: bot A exceeding does NOT drop bot B', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 2, windowMs: 60_000 }
+    // Saturate Alice
+    store.check('C_OPS', 'B_alice', 1_000_000, cfg)
+    store.check('C_OPS', 'B_alice', 1_000_100, cfg)
+    expect(store.check('C_OPS', 'B_alice', 1_000_200, cfg)).toBe(false)
+    // Bob is fresh
+    expect(store.check('C_OPS', 'B_bob', 1_000_300, cfg)).toBe(true)
+    expect(store.check('C_OPS', 'B_bob', 1_000_400, cfg)).toBe(true)
+  })
+
+  test('per-channel isolation: bot A in C1 exceeding does NOT drop A in C2', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 2, windowMs: 60_000 }
+    // Saturate Alice in #design
+    store.check('C_DESIGN', 'B_alice', 1_000_000, cfg)
+    store.check('C_DESIGN', 'B_alice', 1_000_100, cfg)
+    expect(store.check('C_DESIGN', 'B_alice', 1_000_200, cfg)).toBe(false)
+    // Alice in #infra is independent
+    expect(store.check('C_INFRA', 'B_alice', 1_000_300, cfg)).toBe(true)
+  })
+
+  test('drop does NOT append the rejected timestamp (no unbounded growth)', async () => {
+    // Sliding window correctness — if drops were appended, the
+    // array would grow indefinitely during a sustained loop and
+    // never recover even after the original timestamps aged out.
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 1, windowMs: 60_000 }
+    expect(store.check('C', 'B', 1_000_000, cfg)).toBe(true)
+    // 100 rejected attempts during the window
+    for (let i = 0; i < 100; i++) {
+      expect(store.check('C', 'B', 1_000_100 + i, cfg)).toBe(false)
+    }
+    // After the original timestamp ages out, the next attempt
+    // succeeds — proves the 100 rejected attempts did NOT stick
+    // in the array.
+    expect(store.check('C', 'B', 1_060_001, cfg)).toBe(true)
+  })
+
+  test('prune sweeps fully-expired entries and returns the count', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 5, windowMs: 60_000 }
+    store.check('C', 'B1', 1_000_000, cfg)
+    store.check('C', 'B2', 1_000_000, cfg)
+    store.check('C', 'B3', 1_500_000, cfg)
+    expect(store.size()).toBe(3)
+    // Sweep at t=1_080_000 — B1 and B2's only timestamps (1_000_000)
+    // are now expired (windowMs=60_000), B3's is still live.
+    const removed = store.prune(1_080_000, 60_000)
+    expect(removed).toBe(2)
+    expect(store.size()).toBe(1)
+  })
+
+  test('prune is a no-op when nothing has expired', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    store.check('C', 'B', 1_000_000, { count: 5, windowMs: 60_000 })
+    expect(store.prune(1_000_001, 60_000)).toBe(0)
+    expect(store.size()).toBe(1)
+  })
+
+  test('threshold = 0 means always drop (boundary)', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    // First message rejected immediately — count 0 means "no messages allowed"
+    expect(store.check('C', 'B', 1_000_000, { count: 0, windowMs: 60_000 })).toBe(false)
+  })
+
+  test('very large threshold (effectively unlimited) never drops', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 1_000_000, windowMs: 60_000 }
+    for (let i = 0; i < 1000; i++) {
+      expect(store.check('C', 'B', 1_000_000 + i, cfg)).toBe(true)
+    }
+  })
+
+  test('mixed allow/drop pattern during sliding window', async () => {
+    // Verify the sliding-window edge: as old timestamps age out
+    // one-by-one, individual new messages slot in.
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 2, windowMs: 100 }
+    // t=0: allow, count=1
+    expect(store.check('C', 'B', 0, cfg)).toBe(true)
+    // t=50: allow, count=2
+    expect(store.check('C', 'B', 50, cfg)).toBe(true)
+    // t=80: deny, both still in window
+    expect(store.check('C', 'B', 80, cfg)).toBe(false)
+    // t=101: t=0 entry aged out (cutoff = 101 - 100 = 1), count=1 → allow
+    expect(store.check('C', 'B', 101, cfg)).toBe(true)
+    // t=120: t=50 still in window (cutoff = 20), t=101 in window, count=2 → deny
+    expect(store.check('C', 'B', 120, cfg)).toBe(false)
+    // t=151: t=50 aged out (cutoff = 51), count=1 (only t=101 left) → allow
+    expect(store.check('C', 'B', 151, cfg)).toBe(true)
+  })
+})
+
+describe('ccsc-gyt — gate() integration with rate limit', () => {
+  test('peer-bot message above threshold returns drop with rate.cross_bot_loop reason', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const { gate } = await import('./lib.ts')
+    const store = createPeerBotRateLimitStore()
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_OPS: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_PEER_BOT'],
+          peerBotRateLimit: { count: 2, windowMs: 60_000 },
+        },
+      },
+      pending: {},
+    }
+
+    let now = 1_000_000
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      peerBotRateLimitStore: store,
+      now: () => now,
+    }
+
+    const peerEvent = {
+      type: 'message',
+      channel: 'C_OPS',
+      user: 'U_PEER_BOT',
+      bot_id: 'B_PEER',
+      text: 'reply from peer',
+      ts: '1700000000.000100',
+    }
+
+    // First two pass — within threshold
+    expect((await gate(peerEvent, opts)).action).not.toBe('drop')
+    now += 100
+    expect((await gate(peerEvent, opts)).action).not.toBe('drop')
+    now += 100
+    // Third exceeds → drop with structured reason
+    const result = await gate(peerEvent, opts)
+    expect(result.action).toBe('drop')
+    expect(result.dropReason).toBe('rate.cross_bot_loop')
+  })
+
+  test('absence of peerBotRateLimitStore in opts disables the check (backward compat)', async () => {
+    // Tests that don't wire up the store get the old behavior.
+    const { gate } = await import('./lib.ts')
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_OPS: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER_BOT'] },
+      },
+      pending: {},
+    }
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      // NO peerBotRateLimitStore
+    }
+    const peerEvent = {
+      type: 'message',
+      channel: 'C_OPS',
+      user: 'U_PEER_BOT',
+      bot_id: 'B_PEER',
+      text: 'reply 1',
+      ts: '1700000000.000100',
+    }
+    // 100 messages — none rate-limited because store is absent
+    for (let i = 0; i < 100; i++) {
+      const result = await gate({ ...peerEvent, ts: `1700000000.${i}` }, opts)
+      // Either delivered or dropped for non-rate reasons — but never with rate.cross_bot_loop
+      expect(result.dropReason).not.toBe('rate.cross_bot_loop')
+    }
+  })
+
+  test('explicit { count: 0, windowMs: 0 } disables the limit (operator opt-out)', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const { gate } = await import('./lib.ts')
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_OPS: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_PEER_BOT'],
+          peerBotRateLimit: { count: 0, windowMs: 0 },
+        },
+      },
+      pending: {},
+    }
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      peerBotRateLimitStore: createPeerBotRateLimitStore(),
+    }
+    const peerEvent = {
+      type: 'message',
+      channel: 'C_OPS',
+      user: 'U_PEER_BOT',
+      bot_id: 'B_PEER',
+      text: 'reply',
+      ts: '1700000000.000100',
+    }
+    // 50 messages — none rate-limited because operator explicitly disabled
+    for (let i = 0; i < 50; i++) {
+      const result = await gate({ ...peerEvent, ts: `1700000000.${i}` }, opts)
+      expect(result.dropReason).not.toBe('rate.cross_bot_loop')
+    }
+  })
+})
