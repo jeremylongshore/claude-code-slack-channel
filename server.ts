@@ -73,6 +73,7 @@ import {
 } from './manifest.ts'
 import { createMuteStore } from './mute-store.ts'
 import { createMemoryNonceStore, mintNonce, verifyNonce } from './nonce-hitl.ts'
+import { createPeerBotRateLimitStore } from './peer-bot-rate-limit.ts'
 import {
   type ApprovalKey,
   approvalKey,
@@ -615,6 +616,15 @@ async function gate(event: unknown): Promise<GateResult> {
     botUserId,
     selfBotId,
     selfAppId,
+    // ccsc-00f — pass the shared mute + rate-limit stores into the
+    // gate's production options. Module-level singletons (declared
+    // alongside admin-dispatch wiring in ccsc-0jj). gate()'s
+    // handleBotEvent consults muteStore BEFORE the rate-limit
+    // check (operator intent wins over auto-block). The reaper
+    // (below) periodically prunes both stores to keep memory
+    // bounded under sustained load.
+    muteStore: adminMuteStore,
+    peerBotRateLimitStore: peerBotRateLimitStore,
   })
 }
 
@@ -2672,6 +2682,10 @@ async function handleMessage(event: unknown): Promise<void> {
 
 const adminNonceStore = createMemoryNonceStore()
 const adminMuteStore = createMuteStore()
+/** Per-(channel, bot_id) sliding-window rate limit store (ccsc-gyt).
+ *  Passed into gate()'s production options; the reaper sweeps it
+ *  periodically alongside adminMuteStore. */
+const peerBotRateLimitStore = createPeerBotRateLimitStore()
 
 /** Production tmux key-sender. Lazy: only constructed when an admin
  *  command actually fires AND SLACK_TMUX_SESSION is set. The boot
@@ -3061,9 +3075,32 @@ async function main(): Promise<void> {
 
   // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is
   // older than idleMs and no in-flight work, and drives quiesce → deactivate.
-  // Stored in reaperTimer so shutdown() can clearInterval before draining.
+  // Also (ccsc-00f) sweeps the in-memory peer-bot stores so they don't drift:
+  // adminMuteStore drops mutes past their TTL, peerBotRateLimitStore drops
+  // timestamp arrays where every entry has aged out of the longest configured
+  // window. Stored in reaperTimer so shutdown() can clearInterval before
+  // draining.
   reaperTimer = setInterval(() => {
     void supervisor!.reapIdle()
+    const now = Date.now()
+    adminMuteStore.prune(now)
+    // The reaper's job is "drop entries that NO conceivable window
+    // would still consider live" — NOT to match the default window.
+    // Per Gemini high-priority fix on PR #187: a hardcoded 60s
+    // prune would silently destroy timestamps for any channel that
+    // configures `peerBotRateLimit: { windowMs: 300_000 }` (5 min),
+    // effectively resetting their counter every minute and breaking
+    // enforcement. The store's own `check()` prunes in-line per
+    // call against the actual configured window — the reaper is
+    // pure memory hygiene for buckets that get no traffic. 1 hour
+    // is safely larger than any realistic operator-configured window
+    // (the use case is "drop A→B loops in seconds", not "rate-limit
+    // over hours") while keeping memory bounded.
+    peerBotRateLimitStore.prune(now, 60 * 60 * 1000)
+    // Nonce store also benefits from periodic sweep — single-use
+    // makes consumption-on-success the primary cleanup, but expired
+    // never-redeemed nonces sit until pruned.
+    adminNonceStore.pruneExpired(now)
   }, 60_000)
   // Don't hold the event loop open on the reaper tick alone — the socket and
   // MCP transport already keep the process alive while active.
