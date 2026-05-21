@@ -24,6 +24,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { z } from 'zod'
+import { loadSigningKey, parseNoAuditSigningFlag } from './audit-key-loader.ts'
 import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
@@ -77,6 +78,7 @@ import {
   type PolicyRule,
   type ToolCall as PolicyToolCall,
   parsePolicyRules,
+  policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
 
@@ -2794,9 +2796,57 @@ async function main(): Promise<void> {
       // newline-delimited events), so match that rule here.
       const isFreshChain = !existsSync(absPath) || statSync(absPath).size === 0
       const trustedAnchor = isFreshChain ? createBootAnchor() : null
+
+      // ccsc-uge — attempt to load the Ed25519 signing key at boot.
+      // Three outcomes:
+      //   loaded → JournalWriter signs every event under v2 +
+      //     populates policy_attestation with the current policy
+      //     digest
+      //   disabled → operator passed --no-audit-signing; journal
+      //     emits v1 events (legacy backward-compat)
+      //   error → SOPS file missing without the flag, decrypt
+      //     failed, YAML malformed: exit non-zero with the message
+      //     (refuse to start in an ambiguous state)
+      const noAuditSigning = parseNoAuditSigningFlag(process.argv.slice(2))
+      const signingResolution = await loadSigningKey({ noAuditSigning })
+      if (signingResolution.kind === 'error') {
+        console.error(`[slack] audit-signing key load failed: ${signingResolution.reason}`)
+        process.exit(2)
+      }
+      let signingKey: import('./crypto.ts').Ed25519KeyPair | undefined
+      let initialPolicyDigest: string | undefined
+      if (signingResolution.kind === 'loaded') {
+        signingKey = signingResolution.keypair
+        // Compute the initial policy digest from the boot-time
+        // parsed policy rules. The digest is opaque to journal.ts
+        // (per the no-journal-imports-policy invariant) — server.ts
+        // is the bridge that computes it from policy.ts and passes
+        // it in as a primitive hex string. The `policyRules`
+        // module-level constant is the typed form already parsed at
+        // boot (see loadPolicyRulesAtBoot above).
+        initialPolicyDigest = policyDigest(policyRules)
+        if (signingResolution.staleWarning) {
+          console.error(
+            `[slack] audit-signing key is older than 90 days (createdAt=${signingKey.createdAt}). ` +
+              `Consider rotating via \`ccsc audit-key rotate --reason=scheduled-90day\`. ` +
+              `See 000-docs/key-management.md.`,
+          )
+        }
+        console.error(
+          `[slack] audit-signing key loaded from ${signingResolution.source} ` +
+            `(public key: ${signingKey.publicKey.slice(0, 16)}…)`,
+        )
+      } else {
+        console.error(
+          '[slack] audit-signing key NOT loaded (--no-audit-signing). Journal emits v1 events.',
+        )
+      }
+
       journal = await JournalWriter.open({
         path: absPath,
         ...(trustedAnchor !== null ? { initialPrevHash: trustedAnchor } : {}),
+        ...(signingKey !== undefined ? { signingKey } : {}),
+        ...(initialPolicyDigest !== undefined ? { policyDigest: initialPolicyDigest } : {}),
       })
       console.error(
         `[slack] audit journal enabled at ${absPath} (source: ${auditResolution.source})`,
