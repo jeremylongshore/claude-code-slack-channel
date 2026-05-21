@@ -12832,6 +12832,24 @@ describe('ccsc-gjm — parseAdminCommand for mute/unmute', () => {
     })
   })
 
+  test('parses mute with display name containing SPACES (Gemini #183 fix)', async () => {
+    // Slack display names regularly contain spaces (real names like
+    // 'Alice Smith'). The regex argument capture uses .+ (not \\S+)
+    // so the whole mention token is one argument. Pinned to prevent
+    // a future refactor from re-introducing the \\S+ bug.
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute <@U_PEER|Alice Smith>', envelope)).toEqual({
+      kind: 'mute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+    expect(parseAdminCommand('!unmute <@U_PEER|Bot With Spaces>', envelope)).toEqual({
+      kind: 'unmute',
+      targetBotId: 'U_PEER',
+      ...envelope,
+    })
+  })
+
   test('rejects !mute without an argument (returns null)', async () => {
     const { parseAdminCommand } = await import('./admin.ts')
     expect(parseAdminCommand('!mute', envelope)).toBeNull()

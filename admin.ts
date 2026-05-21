@@ -120,8 +120,16 @@ export type AdminCommand =
  *  passing text in (see `stripBotMention()` in lib.ts). The
  *  ARGUMENT-side mention (the target bot in mute/unmute) is part of
  *  the verb syntax and stays.
+ *
+ *  Argument capture uses `.+` (not `\S+`) so Slack mentions whose
+ *  display-name label contains a space (e.g., `<@U123|Alice Smith>`)
+ *  are captured as a single token. Per Gemini review on PR #183 —
+ *  legitimate Slack display names regularly contain spaces and the
+ *  previous `\S+` would silently refuse to match those. The
+ *  downstream `parseSlackMention` accepts spaces inside the
+ *  display-name capture (`[^>]*`).
  */
-const ADMIN_COMMAND_RE = /^!(clear|restart|mute|unmute)(?:\s+(\S+))?$/
+const ADMIN_COMMAND_RE = /^!(clear|restart|mute|unmute)(?:\s+(.+))?$/
 
 /** Parse a normalized text body into an `AdminCommand`, or `null` if
  *  the text doesn't match an admin verb. Pure function — no side
