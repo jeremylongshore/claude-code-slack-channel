@@ -185,19 +185,22 @@ is itself an auditable event.
      "v": 2,
      "kind": "system.key_rotation",
      "ts": "2026-08-15T12:00:00.000Z",
-     "actor": "session_owner",
-     "body": {
+     "outcome": "allow",
+     "input": {
        "old_public_key": "<base64>",
        "new_public_key": "<base64>",
        "rotation_reason": "scheduled-90day" | "compromise-suspected" | "operator-initiated"
      },
-     "prev_hash": "<sha256>",
+     "prevHash": "<sha256>",
      "hash": "<sha256>",
      "signature": "<base64 ed25519 sig with OLD private key>"
    }
    ```
-4. Atomically swap `audit.key.sops.yaml.tmp` → `audit.key.sops.yaml`. The
-   old encrypted file is moved to `audit.key.sops.yaml.<timestamp>.archived`
+   (Field names match `journal.ts` shape: `input`, `prevHash`, `outcome` —
+   not `body`. The doc previously listed the wrong field names; the writer
+   never emitted `body`. Synchronized with implementation in `ccsc-l1f`.)
+4. Atomically swap `audit.key.sops.yaml.new.tmp` → `audit.key.sops.yaml`. The
+   old encrypted file is moved to `audit.key.sops.yaml.<unix-ms>.archived`
    inside the state dir so historical journal segments remain verifiable.
 5. Update the external gist with the new public key + add a row to the
    "History" table.
