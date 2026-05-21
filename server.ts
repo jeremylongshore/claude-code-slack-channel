@@ -2712,12 +2712,23 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
   // Build production deps for the dispatcher.
   const sendTmuxKeys = getTmuxSendKeys()
   if ((cmd.kind === 'clear' || cmd.kind === 'restart') && sendTmuxKeys === undefined) {
-    // Operator tried to use !clear or !restart in a channel that
-    // somehow has adminCommands but the bridge has no
-    // SLACK_TMUX_SESSION configured. Boot-time validation should
-    // prevent this combination, but defensive check here too.
-    console.error('[slack] admin verb dispatched but SLACK_TMUX_SESSION is unset — refusing')
-    return false
+    // Operator tried !clear or !restart but SLACK_TMUX_SESSION is
+    // unset. Boot validation prevents this combination at startup,
+    // but access.json hot-reload (getAccess()) could add
+    // adminCommands to a channel post-boot without re-checking the
+    // env. Per Gemini review on PR #186: return `true` (we DID
+    // recognize the admin verb) so Claude does NOT see the verb
+    // text as chat — preserves the ccsc-3w0 invariant. Journal a
+    // .denied event so operators see the refusal in audit.
+    console.error('[slack] admin verb refused — SLACK_TMUX_SESSION is unset; runtime config drift')
+    journalWrite({
+      kind: cmd.kind === 'clear' ? 'admin.clear.denied' : 'admin.restart.denied',
+      outcome: 'deny',
+      actor: 'session_owner',
+      sessionKey: { channel: channelId, thread: threadTs },
+      reason: 'SLACK_TMUX_SESSION not configured at admin-verb dispatch time',
+    })
+    return true
   }
 
   const deps = {
