@@ -24,6 +24,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { SocketModeClient } from '@slack/socket-mode'
 import { WebClient } from '@slack/web-api'
 import { z } from 'zod'
+import { createTmuxSendKeys, dispatchAdminCommand, parseAdminCommand } from './admin.ts'
 import { loadSigningKey, parseNoAuditSigningFlag } from './audit-key-loader.ts'
 import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
@@ -58,6 +59,7 @@ import {
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
+  stripBotMention,
   validateSendableRoots,
 } from './lib.ts'
 import {
@@ -69,6 +71,8 @@ import {
   ManifestV1,
   type PinItemLike,
 } from './manifest.ts'
+import { createMuteStore } from './mute-store.ts'
+import { createMemoryNonceStore, mintNonce, verifyNonce } from './nonce-hitl.ts'
 import {
   type ApprovalKey,
   approvalKey,
@@ -2644,8 +2648,156 @@ async function handleMessage(event: unknown): Promise<void> {
     }
 
     case 'deliver': {
+      // ccsc-0jj — admin verb detection BEFORE delivering to Claude.
+      // If the message is an admin verb (!clear / !restart / !mute /
+      // !unmute), dispatch it through admin.ts and return WITHOUT
+      // also delivering to Claude (Claude shouldn't see operator
+      // verbs as chat content).
+      const handled = await tryDispatchAdminVerb(ev, result.access!)
+      if (handled) return
       await deliverEvent(ev, result.access!)
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Admin-verb dispatch wiring (ccsc-0jj)
+// ---------------------------------------------------------------------------
+//
+// Module-level singletons for the stores admin.ts + gate() consult.
+// nonceStore is for !restart's HMAC challenge (ccsc-ofn). muteStore
+// holds active mutes from !mute (ccsc-gjm) — gate() consults this on
+// every peer-bot message. Both reset on process restart, which is
+// the conservative posture documented in the relevant beads.
+
+const adminNonceStore = createMemoryNonceStore()
+const adminMuteStore = createMuteStore()
+
+/** Production tmux key-sender. Lazy: only constructed when an admin
+ *  command actually fires AND SLACK_TMUX_SESSION is set. The boot
+ *  guard below ensures we don't START with admin commands enabled
+ *  but no SESSION configured. */
+function getTmuxSendKeys(): ((keys: readonly string[]) => Promise<void>) | undefined {
+  const session = process.env.SLACK_TMUX_SESSION
+  if (session === undefined || session === '') return undefined
+  return createTmuxSendKeys(session)
+}
+
+/** Detect admin verb in `ev.text` (mention-stripped) and dispatch.
+ *  Returns true when the message was handled as an admin verb,
+ *  false when it should fall through to normal delivery to Claude.
+ *
+ *  Never throws — dispatcher errors are logged and treated as a
+ *  silent decline so a buggy admin path can't break normal chat. */
+async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access): Promise<boolean> {
+  const channelId = ev.channel as string
+  const userId = ev.user as string | undefined
+  const text = (ev.text as string | undefined) ?? ''
+  const threadTs = (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined) ?? ''
+  const messageTs = (ev.ts as string | undefined) ?? ''
+  if (userId === undefined || channelId === undefined || messageTs === '') return false
+
+  // Strip the bridge's own mention so the admin parser sees normalized
+  // text. The argument-side mention (target bot in !mute / !unmute)
+  // stays — that's part of the verb syntax.
+  const stripped = stripBotMention(text, botUserId)
+  const cmd = parseAdminCommand(stripped, {
+    channelId,
+    requestedBy: userId,
+    threadTs,
+    messageTs,
+  })
+  if (cmd === null) return false
+
+  // Build production deps for the dispatcher.
+  const sendTmuxKeys = getTmuxSendKeys()
+  if ((cmd.kind === 'clear' || cmd.kind === 'restart') && sendTmuxKeys === undefined) {
+    // Operator tried !clear or !restart but SLACK_TMUX_SESSION is
+    // unset. Boot validation prevents this combination at startup,
+    // but access.json hot-reload (getAccess()) could add
+    // adminCommands to a channel post-boot without re-checking the
+    // env. Per Gemini review on PR #186: return `true` (we DID
+    // recognize the admin verb) so Claude does NOT see the verb
+    // text as chat — preserves the ccsc-3w0 invariant. Journal a
+    // .denied event so operators see the refusal in audit.
+    console.error('[slack] admin verb refused — SLACK_TMUX_SESSION is unset; runtime config drift')
+    journalWrite({
+      kind: cmd.kind === 'clear' ? 'admin.clear.denied' : 'admin.restart.denied',
+      outcome: 'deny',
+      actor: 'session_owner',
+      sessionKey: { channel: channelId, thread: threadTs },
+      reason: 'SLACK_TMUX_SESSION not configured at admin-verb dispatch time',
+    })
+    return true
+  }
+
+  const deps = {
+    isAllowed: (cId: string, uId: string): boolean => {
+      const policy = access.channels[cId]
+      return policy?.adminCommands?.allowFrom?.includes(uId) ?? false
+    },
+    journalWrite: async (input: Parameters<JournalWriter['writeEvent']>[0]): Promise<unknown> => {
+      if (journal === null) return undefined
+      return journal.writeEvent(input)
+    },
+    quiesceAndDeactivate: async (): Promise<void> => {
+      if (supervisor === null) return
+      const key = { channel: channelId, thread: threadTs }
+      await supervisor.quiesce(key)
+      await supervisor.deactivate(key)
+    },
+    sendTmuxKeys:
+      sendTmuxKeys ??
+      (async (): Promise<void> => {
+        // mute / unmute don't need tmux; the dispatcher's mute/unmute
+        // branch never calls sendTmuxKeys, so this fallback is just
+        // type-shape filler.
+      }),
+    issueChallenge: async (
+      challengeUserId: string,
+      challengeChannelId: string,
+    ): Promise<{ nonce: string; expiresAt: number }> => {
+      const challenge = mintNonce(challengeUserId, challengeChannelId, adminNonceStore)
+      // DM the nonce to the operator — separate Slack channel from
+      // where the verb was uttered. This is the cross-channel
+      // property that closes the EchoLeak class.
+      try {
+        await web.chat.postMessage({
+          channel: challengeUserId,
+          text: `Confirm with: \`!restart ${challenge.nonce}\` in <#${challengeChannelId}> within 60s.`,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+      } catch (err) {
+        console.error('[slack] nonce DM failed:', err)
+      }
+      return { nonce: challenge.nonce, expiresAt: challenge.expiresAt }
+    },
+    verifyChallenge: (
+      nonce: string,
+      presentedBy: { userId: string; channelId: string },
+    ): ReturnType<typeof verifyNonce> => verifyNonce(nonce, presentedBy, adminNonceStore),
+    postReaction: async (emoji: string): Promise<void> => {
+      try {
+        await web.reactions.add({ channel: channelId, timestamp: messageTs, name: emoji })
+      } catch (err) {
+        console.error('[slack] reaction post failed:', err)
+      }
+    },
+    muteStore: adminMuteStore,
+  }
+
+  try {
+    const outcome = await dispatchAdminCommand(cmd, deps)
+    if (outcome.kind === 'challenge_issued') {
+      // No emoji reaction at challenge phase — the DM IS the visible
+      // feedback that something happened. Reaction lands when the
+      // operator redeems.
+    }
+    return true
+  } catch (err) {
+    console.error('[slack] admin dispatcher unexpected error:', err)
+    return true // still treat as handled — we don't want Claude to see the verb as chat
   }
 }
 
@@ -2868,6 +3020,28 @@ async function main(): Promise<void> {
         `[slack] audit journal open failed at ${absPath}: ${
           err instanceof Error ? err.message : String(err)
         }`,
+      )
+      process.exit(1)
+    }
+  }
+
+  // ccsc-0jj — Risk-register R14 boot guard. If any channel has
+  // `adminCommands` configured AND SLACK_TMUX_SESSION is unset, the
+  // tmux send-keys path for !clear / !restart would silently no-op
+  // at admin-verb time. Refuse to start so the operator notices at
+  // boot, not on the first failed !clear.
+  {
+    const bootAccess = getAccess()
+    const hasAdminChannels = Object.values(bootAccess.channels).some(
+      (p) => p.adminCommands?.allowFrom !== undefined && p.adminCommands.allowFrom.length > 0,
+    )
+    const tmuxSession = process.env.SLACK_TMUX_SESSION ?? ''
+    if (hasAdminChannels && tmuxSession === '') {
+      console.error(
+        '[slack] One or more channels have `adminCommands` configured (!clear / !restart) ' +
+          'but SLACK_TMUX_SESSION env var is unset. Set the tmux session name that hosts ' +
+          'Claude Code (the target of `tmux send-keys`) before enabling admin commands. ' +
+          'See 000-docs/multi-agent-channels.md § "Enable admin commands".',
       )
       process.exit(1)
     }
