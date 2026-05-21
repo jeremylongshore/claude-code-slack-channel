@@ -13180,3 +13180,193 @@ describe('ccsc-gjm — gate() integration with mute store', () => {
     expect(result.dropReason).not.toBe('admin.muted')
   })
 })
+
+// ---------------------------------------------------------------------------
+// ccsc-uge — Audit-key loader (SOPS+age boot-time loading)
+// ---------------------------------------------------------------------------
+//
+// Bridges crypto.ts primitives to the server.ts boot path. The
+// loader spawns `sops -d` as a subprocess + parses the YAML +
+// returns the keypair. Tests inject a mock spawn so we exercise
+// the orchestration without an actual sops binary.
+
+describe('ccsc-uge — parseNoAuditSigningFlag', () => {
+  test('detects the flag at any position in argv', async () => {
+    const { parseNoAuditSigningFlag } = await import('./audit-key-loader.ts')
+    expect(parseNoAuditSigningFlag(['--no-audit-signing'])).toBe(true)
+    expect(parseNoAuditSigningFlag(['x', '--no-audit-signing', 'y'])).toBe(true)
+    expect(parseNoAuditSigningFlag([])).toBe(false)
+    expect(parseNoAuditSigningFlag(['--something-else'])).toBe(false)
+  })
+})
+
+describe('ccsc-uge — loadSigningKey', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'ccsc-uge-'))
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('disabled when file absent + noAuditSigning flag set', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const result = await loadSigningKey({
+      path: join(tmpDir, 'no-such-file.sops.yaml'),
+      noAuditSigning: true,
+    })
+    expect(result.kind).toBe('disabled')
+  })
+
+  test('error when file absent + flag NOT set (loud refusal)', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const result = await loadSigningKey({
+      path: join(tmpDir, 'no-such-file.sops.yaml'),
+      noAuditSigning: false,
+    })
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      expect(result.reason).toContain('not found')
+      expect(result.reason).toContain('ccsc audit-key init')
+      expect(result.reason).toContain('--no-audit-signing')
+    }
+  })
+
+  test('loaded with a fresh keypair via mock spawn', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const { generateKeyPair, serializeKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    const path = join(tmpDir, 'present.sops.yaml')
+    writeFileSync(path, 'sentinel') // existsSync needs the file to be present
+    const result = await loadSigningKey({
+      path,
+      spawn: async () => serializeKeyPairYaml(kp, 'unit-test'),
+    })
+    expect(result.kind).toBe('loaded')
+    if (result.kind === 'loaded') {
+      expect(result.keypair.seed).toBe(kp.seed)
+      expect(result.keypair.publicKey).toBe(kp.publicKey)
+      expect(result.staleWarning).toBe(false)
+      expect(result.source).toBe(path)
+    }
+  })
+
+  test('stale warning set when key is older than 90 days', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const { generateKeyPair, serializeKeyPairYaml } = await import('./crypto.ts')
+    const kp = generateKeyPair()
+    // Force createdAt to 100 days ago
+    kp.createdAt = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000).toISOString()
+    const path = join(tmpDir, 'stale.sops.yaml')
+    writeFileSync(path, 'sentinel')
+    const result = await loadSigningKey({
+      path,
+      spawn: async () => serializeKeyPairYaml(kp, 'unit-test'),
+    })
+    expect(result.kind).toBe('loaded')
+    if (result.kind === 'loaded') {
+      expect(result.staleWarning).toBe(true)
+    }
+  })
+
+  test('error when SOPS spawn throws (decrypt failure)', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const path = join(tmpDir, 'undecryptable.sops.yaml')
+    writeFileSync(path, 'encrypted-blob')
+    const result = await loadSigningKey({
+      path,
+      spawn: async () => {
+        throw new Error('age private key not found in keyring')
+      },
+    })
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      expect(result.reason).toContain('SOPS decrypt failed')
+      expect(result.reason).toContain('age private key not found')
+    }
+  })
+
+  test('error when SOPS returns malformed YAML', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const path = join(tmpDir, 'malformed.sops.yaml')
+    writeFileSync(path, 'sentinel')
+    const result = await loadSigningKey({
+      path,
+      spawn: async () => 'this is not the right shape',
+    })
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      expect(result.reason).toContain('audit key parse failed')
+    }
+  })
+
+  test('error when declared public_key does not match seed (tamper signal)', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const { generateKeyPair } = await import('./crypto.ts')
+    const a = generateKeyPair()
+    const b = generateKeyPair()
+    const path = join(tmpDir, 'tampered.sops.yaml')
+    writeFileSync(path, 'sentinel')
+    // Hand-build YAML with mismatched public_key
+    const yaml = `seed: ${a.seed}\npublic_key: ${b.publicKey}\ncreated_at: ${a.createdAt}\n`
+    const result = await loadSigningKey({
+      path,
+      spawn: async () => yaml,
+    })
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      expect(result.reason).toContain('does not match seed-derived public key')
+    }
+  })
+
+  test('expands ~/ prefix to $HOME', async () => {
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    // Force a known HOME that doesn't contain the file → expect
+    // the error message to reflect the EXPANDED path, not the
+    // unexpanded ~/...
+    const originalHome = process.env.HOME
+    process.env.HOME = tmpDir
+    try {
+      const result = await loadSigningKey({
+        path: '~/no-such-file.sops.yaml',
+        noAuditSigning: false,
+      })
+      expect(result.kind).toBe('error')
+      if (result.kind === 'error') {
+        expect(result.reason).toContain(tmpDir)
+        expect(result.reason).not.toContain('~/no-such-file')
+      }
+    } finally {
+      if (originalHome !== undefined) process.env.HOME = originalHome
+      else delete process.env.HOME
+    }
+  })
+
+  test('end-to-end: loaded keypair signs an event that verifyJournal accepts', async () => {
+    // Integration test — loadSigningKey returns a key; pass it
+    // into a JournalWriter; verify the journal back with the
+    // returned public key. Pins the contract that the loader
+    // produces a key the writer + verifier accept.
+    const { loadSigningKey } = await import('./audit-key-loader.ts')
+    const { generateKeyPair, serializeKeyPairYaml } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const sopsPath = join(tmpDir, 'key.sops.yaml')
+    writeFileSync(sopsPath, 'sentinel')
+    const auditPath = join(tmpDir, 'audit.log')
+    const loaded = await loadSigningKey({
+      path: sopsPath,
+      spawn: async () => serializeKeyPairYaml(kp, 'integration-test'),
+    })
+    if (loaded.kind !== 'loaded') throw new Error('expected loaded')
+    const w = await JournalWriter.open({ path: auditPath, signingKey: loaded.keypair })
+    await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+    await w.close()
+    const verifyResult = await verifyJournal(auditPath, {
+      initialPublicKey: loaded.keypair.publicKey,
+    })
+    expect(verifyResult.ok).toBe(true)
+  })
+})
