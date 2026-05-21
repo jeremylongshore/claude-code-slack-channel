@@ -13321,26 +13321,24 @@ describe('ccsc-uge — loadSigningKey', () => {
     }
   })
 
-  test('expands ~/ prefix to $HOME', async () => {
+  test('expands ~/ prefix via os.homedir() (Gemini #185 — robust path resolution)', async () => {
     const { loadSigningKey } = await import('./audit-key-loader.ts')
-    // Force a known HOME that doesn't contain the file → expect
-    // the error message to reflect the EXPANDED path, not the
-    // unexpanded ~/...
-    const originalHome = process.env.HOME
-    process.env.HOME = tmpDir
-    try {
-      const result = await loadSigningKey({
-        path: '~/no-such-file.sops.yaml',
-        noAuditSigning: false,
-      })
-      expect(result.kind).toBe('error')
-      if (result.kind === 'error') {
-        expect(result.reason).toContain(tmpDir)
-        expect(result.reason).not.toContain('~/no-such-file')
-      }
-    } finally {
-      if (originalHome !== undefined) process.env.HOME = originalHome
-      else delete process.env.HOME
+    const { homedir } = await import('node:os')
+    // homedir() may resolve via $HOME, getpwuid, or USERPROFILE
+    // depending on the platform. We don't override it (Node caches
+    // the value); we just verify that ~/ in the input is replaced
+    // by the OS-reported home, not left literal.
+    const result = await loadSigningKey({
+      path: '~/no-such-file-from-test.sops.yaml',
+      noAuditSigning: false,
+    })
+    expect(result.kind).toBe('error')
+    if (result.kind === 'error') {
+      // Expanded path appears verbatim in the error message
+      expect(result.reason).toContain(homedir())
+      expect(result.reason).toContain('no-such-file-from-test.sops.yaml')
+      // Literal ~/ is gone from the error
+      expect(result.reason).not.toContain('~/no-such-file-from-test')
     }
   })
 

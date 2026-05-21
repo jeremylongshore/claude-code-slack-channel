@@ -35,6 +35,8 @@
 
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { type Ed25519KeyPair, parseKeyPairYaml } from './crypto.ts'
 
@@ -106,15 +108,18 @@ export function parseNoAuditSigningFlag(argv: readonly string[]): boolean {
 // SOPS subprocess invocation (production)
 // ---------------------------------------------------------------------------
 
-/** Default SOPS runner — spawns `sops -d <path>` via execFile and
+/** Default SOPS runner — spawns `sops -d -- <path>` via execFile and
  *  returns stdout. Throws if SOPS exits non-zero (decrypt failure,
  *  missing age key, malformed input).
  *
- *  Argv-mode by construction (no shell). The only argument that
- *  comes from outside our code is `path`, which we treat as a
- *  filesystem path under operator control — not user input. */
+ *  Argv-mode by construction (no shell). The `--` separator stops
+ *  argument parsing before the path — defense-in-depth against a
+ *  pathological path that begins with a hyphen and could otherwise
+ *  be interpreted as a flag (per Gemini security review on PR #185).
+ *  In practice the path comes from operator configuration, not user
+ *  input, but the `--` is one extra character for non-zero benefit. */
 async function defaultSopsSpawn(path: string): Promise<string> {
-  const { stdout } = await execFileAsync('sops', ['-d', path], {
+  const { stdout } = await execFileAsync('sops', ['-d', '--', path], {
     encoding: 'utf8',
     // Modest size cap — a 32-byte seed YAML is < 1 KiB. Anything
     // larger is suspicious. 16 KiB headroom for future extensions.
@@ -127,11 +132,14 @@ async function defaultSopsSpawn(path: string): Promise<string> {
 // Path expansion — handle ~/ prefix
 // ---------------------------------------------------------------------------
 
-function expandTilde(path: string): string {
-  if (!path.startsWith('~/')) return path
-  const home = process.env.HOME ?? ''
-  if (home === '') return path
-  return `${home}${path.slice(1)}`
+/** Expand a leading `~/` to the OS-reported home directory.
+ *  Uses `os.homedir()` + `path.join()` (per Gemini review on PR
+ *  #185) — more portable than `process.env.HOME` + string
+ *  concatenation, and handles environments where HOME is unset
+ *  (Windows, certain containerized setups). */
+function expandTilde(p: string): string {
+  if (!p.startsWith('~/')) return p
+  return join(homedir(), p.slice(2))
 }
 
 // ---------------------------------------------------------------------------
