@@ -2605,7 +2605,13 @@ async function handleMessage(event: unknown): Promise<void> {
         input: {
           channel: ev.channel as string,
           user: ev.user as string | undefined,
+          // ccsc-gyt — structured reason when present (rate-limit
+          // drops surface as `rate.cross_bot_loop`; admin mutes will
+          // surface as `admin.muted` when ccsc-gjm lands). Absent
+          // for generic drops (self-echo, allowlist miss).
+          ...(result.dropReason !== undefined ? { dropReason: result.dropReason } : {}),
         },
+        ...(result.dropReason !== undefined ? { reason: result.dropReason } : {}),
       })
       return
     }

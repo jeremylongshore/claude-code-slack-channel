@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { basename, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
+import { DEFAULT_PEER_BOT_RATE_LIMIT } from './peer-bot-rate-limit.ts'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -70,6 +71,12 @@ export interface ChannelPolicy {
    *  admin verbs are a tighter privilege and require explicit
    *  per-channel + per-user opt-in. */
   adminCommands?: { allowFrom: string[] }
+  /** Per-(channel, sender_bot_id) sliding-window cap to break
+   *  A→B→A runaway loops when multiple peer bots are opted in via
+   *  `allowBotIds` (ccsc-gyt). Absent → DEFAULT_PEER_BOT_RATE_LIMIT
+   *  applies (10 msgs in 60s). Set `{ count: 0, windowMs: 0 }` only
+   *  to explicitly DISABLE the limit; default-on is intentional. */
+  peerBotRateLimit?: { count: number; windowMs: number }
 }
 
 export interface PendingEntry {
@@ -102,11 +109,23 @@ export interface Access {
 
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
+/** Structured reason for a drop. Optional — only set by drop paths
+ *  that benefit from operator-visible distinguishing. Self-echo and
+ *  generic policy-miss drops omit it; rate-limit drops (ccsc-gyt)
+ *  surface as `'rate.cross_bot_loop'` so an operator can grep the
+ *  journal for runaway-loop incidents. */
+export type GateDropReason =
+  | 'rate.cross_bot_loop' // ccsc-gyt — peer-bot exceeded per-(channel, bot_id) sliding window
+  | 'admin.muted' // ccsc-gjm (future) — operator muted this peer bot in this channel
+
 export interface GateResult {
   action: GateAction
   access?: Access
   code?: string
   isResend?: boolean
+  /** Reason a drop occurred, when structured enough to surface in the
+   *  journal. Absent on generic drops (self-echo, allowlist miss). */
+  dropReason?: GateDropReason
 }
 
 /** Identity of a thread-scoped session. See 000-docs/session-state-machine.md.
@@ -1125,6 +1144,15 @@ export interface GateOptions {
   selfBotId: string
   /** App ID from auth.test (matches ev.bot_profile.app_id for self-echo in multi-workspace) */
   selfAppId: string
+  /** Per-(channel, sender_bot_id) sliding-window rate limit store
+   *  (ccsc-gyt). When present, peer-bot messages that exceed the
+   *  channel's configured threshold are dropped with reason
+   *  `rate.cross_bot_loop`. Absent (tests) → rate limiting
+   *  disabled, only the existing allowBotIds gate applies. */
+  peerBotRateLimitStore?: import('./peer-bot-rate-limit.ts').PeerBotRateLimitStore
+  /** Clock source for the rate limit. Injected so tests can use a
+   *  deterministic Date.now(). Defaults to wall clock. */
+  now?: () => number
 }
 
 /**
@@ -1153,6 +1181,29 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
     return { action: 'drop' }
+  }
+
+  // ccsc-gyt — per-(channel, sender_bot_id) sliding-window rate limit
+  // to break A→B→A runaway loops. The dedupe TTL and global rate
+  // limit don't specifically target the cross-bot case: each peer-
+  // bot reply is a legitimately distinct Slack event, but the
+  // exchange itself is the loop. Cap each sender bot per channel.
+  //
+  // Default-on at DEFAULT_PEER_BOT_RATE_LIMIT (10 msgs in 60s) when
+  // the channel doesn't override. An operator who wants to disable
+  // can set `peerBotRateLimit: { count: 0, windowMs: 0 }` explicitly.
+  // Skipped entirely when no store is wired (e.g., test contexts
+  // that don't care about this layer).
+  if (opts.peerBotRateLimitStore !== undefined) {
+    const config = policy.peerBotRateLimit ?? DEFAULT_PEER_BOT_RATE_LIMIT
+    // count=0 + windowMs=0 is the operator-chosen "disable" form.
+    if (config.count > 0 && config.windowMs > 0) {
+      const now = opts.now !== undefined ? opts.now() : Date.now()
+      const allowed = opts.peerBotRateLimitStore.check(channel, botUser, now, config)
+      if (!allowed) {
+        return { action: 'drop', dropReason: 'rate.cross_bot_loop' }
+      }
+    }
   }
 
   // Belt-and-suspenders: drop peer-bot messages that look like permission
