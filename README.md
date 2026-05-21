@@ -156,6 +156,8 @@ Example `access.json` entry:
 
 Self-echoes from this bot are always filtered regardless of `allowBotIds`. Peer bots cannot approve permission prompts — the permission relay gates on the top-level `allowFrom`, not the channel policy.
 
+**For the full multi-agent recipe** — registering a second bot, configuring `allowBotIds` mutually, mention-driven addressing, loop-prevention rate limit, `!mute`/`!unmute` operator verbs, common failure modes, what you DON'T get — see [`000-docs/multi-agent-channels.md`](000-docs/multi-agent-channels.md).
+
 ## Security
 
 - **Sender gating**: Every inbound message hits a gate. Ungated messages are silently dropped before reaching Claude.
