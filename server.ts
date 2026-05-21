@@ -3084,11 +3084,19 @@ async function main(): Promise<void> {
     void supervisor!.reapIdle()
     const now = Date.now()
     adminMuteStore.prune(now)
-    // 60s matches the default rate-limit window. Anything older is
-    // safe to drop; if an operator configures a longer custom window
-    // a few entries may stick around an extra tick but the check
-    // itself still uses each rule's windowMs.
-    peerBotRateLimitStore.prune(now, 60_000)
+    // The reaper's job is "drop entries that NO conceivable window
+    // would still consider live" — NOT to match the default window.
+    // Per Gemini high-priority fix on PR #187: a hardcoded 60s
+    // prune would silently destroy timestamps for any channel that
+    // configures `peerBotRateLimit: { windowMs: 300_000 }` (5 min),
+    // effectively resetting their counter every minute and breaking
+    // enforcement. The store's own `check()` prunes in-line per
+    // call against the actual configured window — the reaper is
+    // pure memory hygiene for buckets that get no traffic. 1 hour
+    // is safely larger than any realistic operator-configured window
+    // (the use case is "drop A→B loops in seconds", not "rate-limit
+    // over hours") while keeping memory bounded.
+    peerBotRateLimitStore.prune(now, 60 * 60 * 1000)
     // Nonce store also benefits from periodic sweep — single-use
     // makes consumption-on-success the primary cleanup, but expired
     // never-redeemed nonces sit until pruned.
