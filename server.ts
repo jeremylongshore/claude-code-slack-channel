@@ -86,6 +86,7 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
+import { streamReply } from './stream-reply.ts'
 
 // ---------------------------------------------------------------------------
 // --verify-audit-log subcommand (ccsc-t7j, Epic 30-A.15)
@@ -704,6 +705,13 @@ const ReplyInput = z
     text: z.string().min(1),
     thread_ts: z.string().optional(),
     files: z.array(z.string()).optional(),
+    /** When true (ccsc-h1h), and text exceeds the chunk threshold,
+     *  post via progressive chat.update streaming (one growing
+     *  message). When false or absent, use the existing per-chunk
+     *  chat.postMessage loop (each chunk a separate message).
+     *  Backward-compatible — existing callers without `stream` get
+     *  unchanged behavior. */
+    stream: z.boolean().optional(),
   })
   .strict()
 
@@ -959,11 +967,91 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 // -----------------------------------------------------------------------
 // reply
 // -----------------------------------------------------------------------
+/** ccsc-h1h — extracted streaming path for executeReply. Posts the
+ *  reply via streamReply (single message that grows via chat.update)
+ *  + handles the file-upload tail + builds the result. streamReply
+ *  emits its own gate.outbound.allow + system.stream_finalize events
+ *  so this path does NOT write a separate allow event. Kept as a
+ *  module-level function so executeReply itself stays under the
+ *  CRAP-30 threshold. */
+async function executeReplyStreamingPath(opts: {
+  chatId: string
+  threadTs: string | undefined
+  text: string
+  files: string[] | undefined
+  limit: number
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, text, files, limit, ctx } = opts
+  const result = await streamReply(
+    { channel: chatId, threadTs, text, chunkSize: limit },
+    {
+      assertOutboundAllowed: (c, t) => ctx.assertOutboundAllowed(c, t),
+      postMessage: async (a) => {
+        const res = await ctx.web.chat.postMessage({
+          channel: a.channel,
+          text: a.text,
+          thread_ts: a.thread_ts,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+        return { ts: (res.ts as string) ?? '' }
+      },
+      updateMessage: async (a) => {
+        await ctx.web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
+      },
+      journalWrite: async (input) => ctx.journalWrite(input),
+      sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    },
+  )
+  if (result.kind === 'gate_rejected_at_start') {
+    // Unreachable in practice — assertOutboundAllowed already passed
+    // in executeReply — but documented as the structured outcome.
+    throw new Error(`stream rejected at start: ${result.reason}`)
+  }
+  const lastTs = result.ts
+  const chunksSent = result.chunksSent
+  if (files && files.length > 0) {
+    for (const filePath of files) {
+      try {
+        ctx.assertSendable(filePath)
+      } catch (exfilErr) {
+        ctx.journalWrite({
+          kind: 'exfil.block',
+          outcome: 'deny',
+          toolName: 'reply',
+          reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
+        })
+        throw exfilErr
+      }
+      const resolved = resolve(filePath)
+      const uploadArgs: Record<string, any> = {
+        channel_id: chatId,
+        file: resolved,
+        filename: basename(resolved),
+      }
+      if (threadTs) uploadArgs.thread_ts = threadTs
+      await ctx.web.filesUploadV2(uploadArgs as any)
+    }
+  }
+  const failureSuffix =
+    result.kind === 'failed_mid_stream' ? ` (failed mid-stream: ${result.reason})` : ''
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Streamed ${chunksSent} chunk(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}${failureSuffix}`,
+      },
+    ],
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
   const threadTs: string | undefined = args.thread_ts
   const files: string[] | undefined = args.files
+  const stream: boolean = args.stream === true
 
   try {
     ctx.assertOutboundAllowed(chatId, threadTs)
@@ -978,6 +1066,18 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     })
     throw outboundErr
   }
+
+  const access = ctx.getAccess()
+  const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
+  const mode = access.chunkMode || 'newline'
+
+  // ccsc-h1h — streaming branch. Extracted to executeReplyStreamingPath
+  // to keep executeReply's CRAP score under the 30 threshold.
+  if (stream && text.length > limit) {
+    return executeReplyStreamingPath({ chatId, threadTs, text, files, limit, ctx })
+  }
+
+  // Non-streaming path — existing behavior unchanged.
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -986,9 +1086,6 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     input: { channel: chatId, thread_ts: threadTs },
   })
 
-  const access = ctx.getAccess()
-  const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
-  const mode = access.chunkMode || 'newline'
   const chunks = chunkText(text, limit, mode)
 
   let lastTs = ''
