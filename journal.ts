@@ -114,6 +114,16 @@ export const EventKind = z.enum([
   'admin.restart',
   'admin.restart.denied',
   'admin.restart.challenge',
+  // Mute / unmute verbs (ccsc-gjm — multi-agent epic). Operator
+  // silences a specific peer bot in a channel for a TTL (default 5
+  // min). The mute store is in-memory; restart clears all mutes.
+  // Counterpart admin.unmute provides early release. .denied
+  // variants record allowlist misses / mute-store-not-configured
+  // failures.
+  'admin.mute',
+  'admin.mute.denied',
+  'admin.unmute',
+  'admin.unmute.denied',
   // Bot-manifest protocol (Epic 31-A). Emitted on every read_peer_manifests
   // call so manifest activity is forensically visible even when cached;
   // see 000-docs/bot-manifest-protocol.md §163-166.
