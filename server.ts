@@ -967,6 +967,44 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 // -----------------------------------------------------------------------
 // reply
 // -----------------------------------------------------------------------
+/** Upload one or more files as attachments to a Slack channel/thread.
+ *  Extracted from executeReply paths (per Gemini review on PR #188)
+ *  so the streaming + non-streaming branches share one implementation
+ *  of the exfil-guard + filesUploadV2 sequence. Both paths get
+ *  consistent security checks + journaling.
+ *
+ *  Throws on assertSendable failure (after writing exfil.block to
+ *  the journal). Throws on filesUploadV2 rejection. Either case,
+ *  the caller's exception propagation handles the rest. */
+async function executeReplyFileUploads(
+  files: readonly string[],
+  chatId: string,
+  threadTs: string | undefined,
+  ctx: ToolContext,
+): Promise<void> {
+  for (const filePath of files) {
+    try {
+      ctx.assertSendable(filePath)
+    } catch (exfilErr) {
+      ctx.journalWrite({
+        kind: 'exfil.block',
+        outcome: 'deny',
+        toolName: 'reply',
+        reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
+      })
+      throw exfilErr
+    }
+    const resolved = resolve(filePath)
+    const uploadArgs: Record<string, any> = {
+      channel_id: chatId,
+      file: resolved,
+      filename: basename(resolved),
+    }
+    if (threadTs) uploadArgs.thread_ts = threadTs
+    await ctx.web.filesUploadV2(uploadArgs as any)
+  }
+}
+
 /** ccsc-h1h — extracted streaming path for executeReply. Posts the
  *  reply via streamReply (single message that grows via chat.update)
  *  + handles the file-upload tail + builds the result. streamReply
@@ -995,12 +1033,25 @@ async function executeReplyStreamingPath(opts: {
           unfurl_links: false,
           unfurl_media: false,
         })
-        return { ts: (res.ts as string) ?? '' }
+        const ts = res.ts as string | undefined
+        // Per Gemini review on PR #188: validate ts BEFORE returning
+        // an empty string downstream. streamReply's invariant is that
+        // subsequent chat.update calls target a real ts; an empty
+        // string would cause each update to fail with a confusing
+        // "channel_not_found"-style Slack error. Throw here so
+        // streamReply's init-failure path runs cleanly + the
+        // system.stream_finalize event records the failure reason.
+        if (!ts) throw new Error('chat.postMessage returned no ts')
+        return { ts }
       },
       updateMessage: async (a) => {
         await ctx.web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
       },
-      journalWrite: async (input) => ctx.journalWrite(input),
+      // Per Gemini review on PR #188: inject toolName so streamReply's
+      // gate.outbound.allow + system.stream_finalize events attribute
+      // to 'reply' in the audit log (streamReply is a generic
+      // primitive; it doesn't know the calling tool's name).
+      journalWrite: async (input) => ctx.journalWrite({ ...input, toolName: 'reply' }),
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     },
   )
@@ -1012,27 +1063,7 @@ async function executeReplyStreamingPath(opts: {
   const lastTs = result.ts
   const chunksSent = result.chunksSent
   if (files && files.length > 0) {
-    for (const filePath of files) {
-      try {
-        ctx.assertSendable(filePath)
-      } catch (exfilErr) {
-        ctx.journalWrite({
-          kind: 'exfil.block',
-          outcome: 'deny',
-          toolName: 'reply',
-          reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
-        })
-        throw exfilErr
-      }
-      const resolved = resolve(filePath)
-      const uploadArgs: Record<string, any> = {
-        channel_id: chatId,
-        file: resolved,
-        filename: basename(resolved),
-      }
-      if (threadTs) uploadArgs.thread_ts = threadTs
-      await ctx.web.filesUploadV2(uploadArgs as any)
-    }
+    await executeReplyFileUploads(files, chatId, threadTs, ctx)
   }
   const failureSuffix =
     result.kind === 'failed_mid_stream' ? ` (failed mid-stream: ${result.reason})` : ''
@@ -1100,29 +1131,9 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     lastTs = (res.ts as string) || lastTs
   }
 
-  // Upload files if provided
+  // Upload files if provided (shared helper — Gemini #188)
   if (files && files.length > 0) {
-    for (const filePath of files) {
-      try {
-        ctx.assertSendable(filePath)
-      } catch (exfilErr) {
-        ctx.journalWrite({
-          kind: 'exfil.block',
-          outcome: 'deny',
-          toolName: 'reply',
-          reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
-        })
-        throw exfilErr
-      }
-      const resolved = resolve(filePath)
-      const uploadArgs: Record<string, any> = {
-        channel_id: chatId,
-        file: resolved,
-        filename: basename(resolved),
-      }
-      if (threadTs) uploadArgs.thread_ts = threadTs
-      await ctx.web.filesUploadV2(uploadArgs as any)
-    }
+    await executeReplyFileUploads(files, chatId, threadTs, ctx)
   }
 
   return {
