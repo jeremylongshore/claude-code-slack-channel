@@ -45,9 +45,13 @@ export interface RateLimitConfig {
 }
 
 /** Conservative default: 10 messages in 60 seconds. Operators can
- *  tighten or loosen via `ChannelPolicy.peerBotRateLimit`. Never zero —
- *  a zero count effectively disables peer-bot delivery (use
- *  `allowBotIds: []` instead). */
+ *  tighten or loosen via `ChannelPolicy.peerBotRateLimit`. To opt
+ *  OUT of rate limiting entirely (allow unlimited peer-bot messages
+ *  in a channel), set `{ count: 0, windowMs: 0 }` — both `check()`
+ *  and the gate integration short-circuit on either zero to "always
+ *  allow". To deny all peer-bot delivery, use `allowBotIds: []`
+ *  instead. (Per Gemini review on PR #182 — single coherent
+ *  semantic across the store + gate.) */
 export const DEFAULT_PEER_BOT_RATE_LIMIT: RateLimitConfig = {
   count: 10,
   windowMs: 60_000,
@@ -99,6 +103,14 @@ export function createPeerBotRateLimitStore(): PeerBotRateLimitStore {
 
   return {
     check(channelId, botId, now, config) {
+      // Operator opt-out: { count: 0, windowMs: 0 } (or either zero)
+      // means "disable the rate limit for this call". Always allow,
+      // do NOT record a timestamp. This matches the ChannelPolicy
+      // contract documented in lib.ts and the gate-integration
+      // short-circuit. Per Gemini review on PR #182 — single
+      // coherent semantic across the store + gate.
+      if (config.count === 0 || config.windowMs === 0) return true
+
       const key = keyOf(channelId, botId)
       const arr = buckets.get(key) ?? []
       // Drop stale timestamps before evaluating. In-place filter to

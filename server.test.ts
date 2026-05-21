@@ -12502,11 +12502,19 @@ describe('ccsc-gyt — createPeerBotRateLimitStore', () => {
     expect(store.size()).toBe(1)
   })
 
-  test('threshold = 0 means always drop (boundary)', async () => {
+  test('count: 0 OR windowMs: 0 short-circuits to allow (operator opt-out)', async () => {
+    // Per Gemini review on PR #182: single coherent semantic across
+    // store + gate. { count: 0 } or { windowMs: 0 } means "disable
+    // the rate limit", NOT "always drop". To deny peer-bot delivery
+    // entirely, use ChannelPolicy.allowBotIds: []. Pinned here so a
+    // future refactor can't reintroduce the inconsistency.
     const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
     const store = createPeerBotRateLimitStore()
-    // First message rejected immediately — count 0 means "no messages allowed"
-    expect(store.check('C', 'B', 1_000_000, { count: 0, windowMs: 60_000 })).toBe(false)
+    expect(store.check('C', 'B', 1_000_000, { count: 0, windowMs: 60_000 })).toBe(true)
+    expect(store.check('C', 'B', 1_000_000, { count: 10, windowMs: 0 })).toBe(true)
+    expect(store.check('C', 'B', 1_000_000, { count: 0, windowMs: 0 })).toBe(true)
+    // The disable-shape should NOT record timestamps — store stays empty
+    expect(store.size()).toBe(0)
   })
 
   test('very large threshold (effectively unlimited) never drops', async () => {
