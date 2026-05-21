@@ -13368,3 +13368,556 @@ describe('ccsc-uge — loadSigningKey', () => {
     expect(verifyResult.ok).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ccsc-l1f — Audit-key operator CLI (init + rotate)
+// ---------------------------------------------------------------------------
+//
+// Pure module audit-key-cli.ts with injectable deps. Tests mock
+// the SOPS subprocess (encryptInPlace = no-op, decryptFile reads
+// the plaintext back) so the orchestration is exercised without
+// requiring a real sops binary in the test environment. The
+// rotate happy-path test injects the REAL JournalWriter so the
+// system.key_rotation event is written to a real chain and
+// verified end-to-end.
+
+describe('ccsc-l1f — parseAuditKeyArgv', () => {
+  test('empty argv → help', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    expect(parseAuditKeyArgv([])).toEqual({ command: 'help' })
+  })
+
+  test('--help, -h, help → help', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    expect(parseAuditKeyArgv(['help']).command).toBe('help')
+    expect(parseAuditKeyArgv(['--help']).command).toBe('help')
+    expect(parseAuditKeyArgv(['-h']).command).toBe('help')
+  })
+
+  test('init with default path', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    expect(parseAuditKeyArgv(['init'])).toEqual({
+      command: 'init',
+      keyPath: undefined,
+      purpose: undefined,
+    })
+  })
+
+  test('init with --key and --purpose flags (space-separated and = form)', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    expect(parseAuditKeyArgv(['init', '--key', '/x.yaml', '--purpose', 'unit'])).toEqual({
+      command: 'init',
+      keyPath: '/x.yaml',
+      purpose: 'unit',
+    })
+    expect(parseAuditKeyArgv(['init', '--key=/x.yaml', '--purpose=unit'])).toEqual({
+      command: 'init',
+      keyPath: '/x.yaml',
+      purpose: 'unit',
+    })
+  })
+
+  test('init rejects unknown args', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    const r = parseAuditKeyArgv(['init', '--bogus'])
+    expect(r.command).toBe('error')
+    if (r.command === 'error') expect(r.message).toContain('--bogus')
+  })
+
+  test('rotate requires --reason', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    const r = parseAuditKeyArgv(['rotate', '--confirm-bridge-stopped'])
+    expect(r.command).toBe('error')
+    if (r.command === 'error') expect(r.message).toContain('--reason is required')
+  })
+
+  test('rotate validates --reason enum', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    const r = parseAuditKeyArgv(['rotate', '--reason', 'something-bogus'])
+    expect(r.command).toBe('error')
+    if (r.command === 'error') {
+      expect(r.message).toContain('--reason must be one of')
+      expect(r.message).toContain('scheduled-90day')
+    }
+  })
+
+  test('rotate happy parse: all flags', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    expect(
+      parseAuditKeyArgv([
+        'rotate',
+        '--reason=scheduled-90day',
+        '--key=/k.yaml',
+        '--journal=/j.log',
+        '--confirm-bridge-stopped',
+      ]),
+    ).toEqual({
+      command: 'rotate',
+      keyPath: '/k.yaml',
+      journalPath: '/j.log',
+      reason: 'scheduled-90day',
+      confirmBridgeStopped: true,
+      purpose: undefined,
+    })
+  })
+
+  test('rotate defaults confirmBridgeStopped to false', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    const r = parseAuditKeyArgv(['rotate', '--reason=operator-initiated'])
+    if (r.command !== 'rotate') throw new Error('expected rotate')
+    expect(r.confirmBridgeStopped).toBe(false)
+  })
+
+  test('unknown subcommand → error', async () => {
+    const { parseAuditKeyArgv } = await import('./audit-key-cli.ts')
+    const r = parseAuditKeyArgv(['banana'])
+    expect(r.command).toBe('error')
+    if (r.command === 'error') expect(r.message).toContain('Unknown subcommand')
+  })
+})
+
+// Helper: build a deps object with mock SOPS (encrypt = no-op so
+// the plaintext stays on disk; decrypt = readFile). Real crypto +
+// real fs. Production-shaped JournalWriter via JournalWriter.open.
+async function makeAuditKeyCliDeps(opts?: {
+  encryptInPlaceImpl?: (path: string) => Promise<void>
+  decryptFileImpl?: (path: string) => Promise<string>
+  now?: () => number
+}) {
+  const { generateKeyPair, parseKeyPairYaml, serializeKeyPairYaml } = await import('./crypto.ts')
+  const { JournalWriter } = await import('./journal.ts')
+  const { readFile, rename, unlink, writeFile } = await import('node:fs/promises')
+  const logs: string[] = []
+  const errs: string[] = []
+  return {
+    deps: {
+      generateKeyPair,
+      serializeKeyPairYaml,
+      parseKeyPairYaml,
+      fileExists: existsSync,
+      writeTempPlain: async (path: string, content: string) => {
+        await writeFile(path, content, { mode: 0o600, encoding: 'utf8' })
+      },
+      // No-op encrypt for test: the "encrypted" file is whatever
+      // was written. Tests verify the orchestration; the actual
+      // SOPS round-trip is exercised in audit-key-loader.test.
+      encryptInPlace: opts?.encryptInPlaceImpl ?? (async () => {}),
+      renameAtomic: rename,
+      decryptFile: opts?.decryptFileImpl ?? (async (path: string) => readFile(path, 'utf8')),
+      unlinkIfExists: async (path: string) => {
+        try {
+          await unlink(path)
+        } catch (e: any) {
+          if (e?.code !== 'ENOENT') throw e
+        }
+      },
+      openJournalWriter: (writerOpts: any) => JournalWriter.open(writerOpts),
+      now: opts?.now ?? Date.now,
+      log: (m: string) => logs.push(m),
+      errLog: (m: string) => errs.push(m),
+    },
+    logs,
+    errs,
+  }
+}
+
+describe('ccsc-l1f — auditKeyInit', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'ccsc-l1f-init-'))
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('happy path: generates keypair, writes file, round-trips via parseKeyPairYaml', async () => {
+    const { auditKeyInit } = await import('./audit-key-cli.ts')
+    const { parseKeyPairYaml } = await import('./crypto.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    const { deps, logs } = await makeAuditKeyCliDeps()
+
+    const result = await auditKeyInit({ keyPath, purpose: 'unit-test' }, deps)
+
+    expect(result.kind).toBe('ok')
+    if (result.kind !== 'ok') throw new Error('expected ok')
+    expect(result.publicKey).toBeDefined()
+    expect(result.publicKey).toHaveLength(44) // base64-encoded 32 bytes
+    expect(existsSync(keyPath)).toBe(true)
+    expect(existsSync(`${keyPath}.tmp`)).toBe(false) // renamed away
+
+    // Acceptance criterion: round-trip via parseKeyPairYaml matches generateKeyPair output
+    const yamlText = readFileSync(keyPath, 'utf8')
+    const parsed = parseKeyPairYaml(yamlText)
+    expect(result.publicKey).toBeDefined()
+    expect(parsed.publicKey).toBe(result.publicKey as string)
+    expect(parsed.seed).toHaveLength(44)
+
+    // File mode: 0o600 (operator readable, nothing else)
+    const mode = statSync(keyPath).mode & 0o777
+    expect(mode).toBe(0o600)
+
+    // Operator-facing output is informative
+    expect(logs.some((m) => m.includes('Generated audit-signing keypair'))).toBe(true)
+    expect(logs.some((m) => m.includes(result.publicKey!))).toBe(true)
+    expect(logs.some((m) => m.includes('pass insert'))).toBe(true)
+  })
+
+  test('refuses to overwrite an existing key file', async () => {
+    const { auditKeyInit } = await import('./audit-key-cli.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    writeFileSync(keyPath, 'preexisting content')
+    const { deps } = await makeAuditKeyCliDeps()
+
+    const result = await auditKeyInit({ keyPath }, deps)
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.code).toBe(1)
+    expect(result.message).toContain('Refusing to overwrite')
+    expect(result.message).toContain('ccsc audit-key rotate')
+    // Existing file untouched
+    expect(readFileSync(keyPath, 'utf8')).toBe('preexisting content')
+  })
+
+  test('refuses if a stale .tmp file is present (interrupted prior run)', async () => {
+    const { auditKeyInit } = await import('./audit-key-cli.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    writeFileSync(`${keyPath}.tmp`, 'leftover plaintext from prior run')
+    const { deps } = await makeAuditKeyCliDeps()
+
+    const result = await auditKeyInit({ keyPath }, deps)
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.message).toContain('stale temp file')
+    expect(result.message).toContain('Manually verify')
+    // Operator's potentially-sensitive file is untouched
+    expect(readFileSync(`${keyPath}.tmp`, 'utf8')).toBe('leftover plaintext from prior run')
+  })
+
+  test('cleans up temp file when encrypt fails', async () => {
+    const { auditKeyInit } = await import('./audit-key-cli.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    const { deps } = await makeAuditKeyCliDeps({
+      encryptInPlaceImpl: async () => {
+        throw new Error('sops: no recipient configured')
+      },
+    })
+
+    const result = await auditKeyInit({ keyPath }, deps)
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.code).toBe(2)
+    expect(result.message).toContain('sops: no recipient configured')
+    // The temp file must be cleaned up so plaintext doesn't survive
+    expect(existsSync(`${keyPath}.tmp`)).toBe(false)
+    // The destination should never have been written
+    expect(existsSync(keyPath)).toBe(false)
+  })
+})
+
+describe('ccsc-l1f — auditKeyRotate', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'ccsc-l1f-rotate-'))
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('refuses without --confirm-bridge-stopped', async () => {
+    const { auditKeyRotate } = await import('./audit-key-cli.ts')
+    const { deps } = await makeAuditKeyCliDeps()
+
+    const result = await auditKeyRotate(
+      {
+        keyPath: join(tmpDir, 'audit.key.sops.yaml'),
+        journalPath: join(tmpDir, 'audit.log'),
+        reason: 'scheduled-90day',
+        confirmBridgeStopped: false,
+      },
+      deps,
+    )
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.code).toBe(1)
+    expect(result.message).toContain('--confirm-bridge-stopped')
+    expect(result.message).toContain('hash chain')
+  })
+
+  test('refuses if no current key file', async () => {
+    const { auditKeyRotate } = await import('./audit-key-cli.ts')
+    const { deps } = await makeAuditKeyCliDeps()
+
+    const result = await auditKeyRotate(
+      {
+        keyPath: join(tmpDir, 'no-such-key.sops.yaml'),
+        journalPath: join(tmpDir, 'audit.log'),
+        reason: 'scheduled-90day',
+        confirmBridgeStopped: true,
+      },
+      deps,
+    )
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.message).toContain('No current key')
+    expect(result.message).toContain('ccsc audit-key init')
+  })
+
+  test('refuses if a stale .new.tmp is present', async () => {
+    const { auditKeyInit, auditKeyRotate } = await import('./audit-key-cli.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    const journalPath = join(tmpDir, 'audit.log')
+    // Seed: init succeeds first so we have a current key
+    {
+      const { deps } = await makeAuditKeyCliDeps()
+      const r = await auditKeyInit({ keyPath, purpose: 'unit-test' }, deps)
+      expect(r.kind).toBe('ok')
+    }
+    // Plant a stale .new.tmp
+    writeFileSync(`${keyPath}.new.tmp`, 'leftover from interrupted rotate')
+
+    const { deps } = await makeAuditKeyCliDeps()
+    const result = await auditKeyRotate(
+      {
+        keyPath,
+        journalPath,
+        reason: 'scheduled-90day',
+        confirmBridgeStopped: true,
+      },
+      deps,
+    )
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.message).toContain('stale temp file')
+    expect(result.message).toContain('.new.tmp')
+  })
+
+  test('happy path: writes key_rotation event under OLD key + subsequent events verify under NEW key', async () => {
+    const { auditKeyInit, auditKeyRotate } = await import('./audit-key-cli.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const { parseKeyPairYaml } = await import('./crypto.ts')
+
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    const journalPath = join(tmpDir, 'audit.log')
+
+    // 1. init creates the first keypair
+    const initDeps = await makeAuditKeyCliDeps()
+    const initResult = await auditKeyInit({ keyPath, purpose: 'unit-test' }, initDeps.deps)
+    expect(initResult.kind).toBe('ok')
+    if (initResult.kind !== 'ok') throw new Error('expected ok')
+    const oldPublicKey = initResult.publicKey!
+
+    // 2. Load the OLD keypair + write a baseline event so the
+    //    chain has content for rotate to extend
+    const oldKp = parseKeyPairYaml(readFileSync(keyPath, 'utf8'))
+    {
+      const w = await JournalWriter.open({ path: journalPath, signingKey: oldKp })
+      await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+      await w.close()
+    }
+
+    // 3. Rotate
+    const rotateDeps = await makeAuditKeyCliDeps({ now: () => 1700000000000 })
+    const rotateResult = await auditKeyRotate(
+      {
+        keyPath,
+        journalPath,
+        reason: 'scheduled-90day',
+        confirmBridgeStopped: true,
+        purpose: 'unit-test-rotated',
+      },
+      rotateDeps.deps,
+    )
+    expect(rotateResult.kind).toBe('ok')
+    if (rotateResult.kind !== 'ok') throw new Error('expected ok')
+    expect(rotateResult.publicKey).toBeDefined()
+    expect(rotateResult.publicKey).not.toBe(oldPublicKey) // new key
+    expect(rotateResult.archivePath).toBe(`${keyPath}.1700000000000.archived`)
+
+    // 4. Old encrypted file archived at the deterministic timestamp
+    expect(existsSync(`${keyPath}.1700000000000.archived`)).toBe(true)
+    // 5. New file exists at keyPath
+    expect(existsSync(keyPath)).toBe(true)
+    // 6. .new.tmp is gone (renamed)
+    expect(existsSync(`${keyPath}.new.tmp`)).toBe(false)
+
+    // 7. Acceptance criterion: parse new file → matches rotateResult.publicKey
+    expect(rotateResult.publicKey).toBeDefined()
+    const newKp = parseKeyPairYaml(readFileSync(keyPath, 'utf8'))
+    expect(newKp.publicKey).toBe(rotateResult.publicKey as string)
+
+    // 8. Acceptance criterion: rotation event verifies under OLD key + verifier picks up NEW key for subsequent events
+    //    Append one event AFTER rotate under the NEW key
+    {
+      const w = await JournalWriter.open({ path: journalPath, signingKey: newKp })
+      await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+      await w.close()
+    }
+    const verifyResult = await verifyJournal(journalPath, {
+      initialPublicKey: oldPublicKey, // start with OLD key
+    })
+    expect(verifyResult.ok).toBe(true)
+    if (verifyResult.ok) {
+      // baseline + key_rotation + post-rotation = 3 events
+      expect(verifyResult.eventsVerified).toBe(3)
+    }
+  })
+
+  test('decrypt failure returns descriptive error without touching journal', async () => {
+    const { auditKeyRotate } = await import('./audit-key-cli.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    writeFileSync(keyPath, 'opaque-encrypted-blob') // present but undecryptable
+    const journalPath = join(tmpDir, 'audit.log')
+
+    const { deps } = await makeAuditKeyCliDeps({
+      decryptFileImpl: async () => {
+        throw new Error('age private key not in keyring')
+      },
+    })
+
+    const result = await auditKeyRotate(
+      {
+        keyPath,
+        journalPath,
+        reason: 'compromise-suspected',
+        confirmBridgeStopped: true,
+      },
+      deps,
+    )
+
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.code).toBe(2)
+    expect(result.message).toContain('Failed to load current key')
+    expect(result.message).toContain('age private key not in keyring')
+    // Journal must NOT have been touched
+    expect(existsSync(journalPath)).toBe(false)
+    // Key file must NOT have been swapped
+    expect(readFileSync(keyPath, 'utf8')).toBe('opaque-encrypted-blob')
+  })
+
+  test('encrypt-new failure surfaces "rotation event landed but new key did not" guidance', async () => {
+    const { auditKeyInit, auditKeyRotate } = await import('./audit-key-cli.ts')
+    const keyPath = join(tmpDir, 'audit.key.sops.yaml')
+    const journalPath = join(tmpDir, 'audit.log')
+
+    // Setup: init + write baseline event so the journal exists
+    {
+      const { deps } = await makeAuditKeyCliDeps()
+      const r = await auditKeyInit({ keyPath, purpose: 'unit-test' }, deps)
+      expect(r.kind).toBe('ok')
+    }
+    const { JournalWriter } = await import('./journal.ts')
+    const { parseKeyPairYaml } = await import('./crypto.ts')
+    const oldKp = parseKeyPairYaml(readFileSync(keyPath, 'utf8'))
+    {
+      const w = await JournalWriter.open({ path: journalPath, signingKey: oldKp })
+      await w.writeEvent({ kind: 'system.boot', actor: 'system' })
+      await w.close()
+    }
+
+    // Now rotate, but mock encryptInPlace to fail on the NEW key
+    let callCount = 0
+    const { deps } = await makeAuditKeyCliDeps({
+      encryptInPlaceImpl: async (_path: string) => {
+        callCount++
+        // We're inside rotate; the only call to encryptInPlace
+        // in this run is for the new key
+        throw new Error('sops: temporary recipient unavailable')
+      },
+    })
+
+    const result = await auditKeyRotate(
+      {
+        keyPath,
+        journalPath,
+        reason: 'operator-initiated',
+        confirmBridgeStopped: true,
+      },
+      deps,
+    )
+
+    expect(callCount).toBe(1)
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.code).toBe(3)
+    expect(result.message).toContain('Rotation event WAS written')
+    expect(result.message).toContain('new-key encrypt failed')
+    expect(result.message).toContain('Manual recovery required')
+    // Critical: new tmp must be cleaned up so plaintext doesn't survive
+    expect(existsSync(`${keyPath}.new.tmp`)).toBe(false)
+    // Old encrypted file is still at the original path (archive
+    // never happened because we failed before that step)
+    expect(existsSync(keyPath)).toBe(true)
+  })
+})
+
+describe('ccsc-l1f — runAuditKeyCli (dispatch + defaults)', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'ccsc-l1f-run-'))
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('help command prints HELP_TEXT and returns ok 0', async () => {
+    const { runAuditKeyCli, HELP_TEXT } = await import('./audit-key-cli.ts')
+    const { deps, logs } = await makeAuditKeyCliDeps()
+    const result = await runAuditKeyCli(['help'], deps, {
+      keyPath: join(tmpDir, 'k.yaml'),
+      journalPath: join(tmpDir, 'j.log'),
+    })
+    expect(result.kind).toBe('ok')
+    expect(result.code).toBe(0)
+    expect(logs.join('\n')).toContain(HELP_TEXT.split('\n')[0])
+  })
+
+  test('init dispatch with default keyPath applies', async () => {
+    const { runAuditKeyCli } = await import('./audit-key-cli.ts')
+    const { deps } = await makeAuditKeyCliDeps()
+    const keyPath = join(tmpDir, 'default-from-runner.yaml')
+    const result = await runAuditKeyCli(['init'], deps, {
+      keyPath,
+      journalPath: join(tmpDir, 'audit.log'),
+    })
+    expect(result.kind).toBe('ok')
+    expect(existsSync(keyPath)).toBe(true)
+  })
+
+  test('error result for malformed argv returns code 64 (EX_USAGE)', async () => {
+    const { runAuditKeyCli } = await import('./audit-key-cli.ts')
+    const { deps, errs } = await makeAuditKeyCliDeps()
+    const result = await runAuditKeyCli(['rotate'], deps, {
+      keyPath: join(tmpDir, 'k.yaml'),
+      journalPath: join(tmpDir, 'j.log'),
+    })
+    expect(result.kind).toBe('error')
+    expect(result.code).toBe(64)
+    expect(errs.some((m) => m.includes('--reason'))).toBe(true)
+  })
+
+  test('unknown subcommand surfaces help', async () => {
+    const { runAuditKeyCli } = await import('./audit-key-cli.ts')
+    const { deps, errs } = await makeAuditKeyCliDeps()
+    const result = await runAuditKeyCli(['frobulate'], deps, {
+      keyPath: join(tmpDir, 'k.yaml'),
+      journalPath: join(tmpDir, 'j.log'),
+    })
+    expect(result.kind).toBe('error')
+    if (result.kind !== 'error') throw new Error('expected error')
+    expect(result.message).toContain('Unknown subcommand')
+    expect(errs.some((m) => m.toLowerCase().includes('usage'))).toBe(true)
+  })
+})
