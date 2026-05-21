@@ -18,10 +18,12 @@ want to add a second agent to the same channel.
    ┌─────────────────┐ │  Jeremy:  @Claude check the tests    │
    │ Operator (you)  │─┼─┐                                    │
    │  human in Slack │ │ │ Claude:  Tests pass 952/952        │
-   └─────────────────┘ │ │ Codex:   Got it, my side passes too│
+   └─────────────────┘ │ │ Jeremy:  @Codex same on your side? │
+                       │ │ Codex:   Tests pass too            │
                        │ │ Jeremy:  @Codex what about coverage│
                        │ │ Codex:   94%                       │
-                       │ │ Claude:  Mine is 97%               │
+                       │ │ Jeremy:  @Claude same question?    │
+                       │ │ Claude:  97%                       │
                        │ └────────────────────────────────────┘
                        │                                      │
                        │ Bot identities live in Slack:        │
@@ -199,7 +201,7 @@ Ed25519-signed under each operator's audit key.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Bot A doesn't see Bot B's messages | A's `allowBotIds` doesn't contain B's user_id | Add `U_B_BOT` to A's `ChannelPolicy.allowBotIds`. Restart bridge A. |
+| Bot A doesn't see Bot B's messages | A's `allowBotIds` doesn't contain B's user_id | Add `U_PEER_BOT` to A's `ChannelPolicy.allowBotIds`. No restart needed — `access.json` is hot-reloaded on every inbound message via the bridge's `getAccess()` loader. |
 | Bot reacts to its own messages | Self-echo filter mis-identified the bot. Rare. | Check that `selfBotId` / `selfAppId` from `auth.test` are populated; look for unfamiliar `bot_id` values in the journal. |
 | Loop between A and B | Both bots respond to each other on every message | (a) Confirm `requireMention: true` so each bot only responds when mentioned. (b) Rate limit catches it automatically — see `gate.inbound.drop` events with `dropReason: 'rate.cross_bot_loop'`. (c) Operator can type `!mute @<bot>` for immediate manual break. |
 | Permission requests routed to the wrong operator | Each bot's permission requests go to ITS OWN `allowFrom` set | This is by design. Each agent's permission set is independent. If you want a shared approver, add the same operator id to both bots' `allowFrom`. |
@@ -247,10 +249,10 @@ point, it's a different product:
 
 This recipe + the underlying primitives ship as the multi-agent epic:
 
-| Bead | What |
-|---|---|
-| [`ccsc-7xq`](#) | Epic — Multi-agent Slack channels (this) |
-| [`ccsc-gyt`](#) | Per-bot per-channel sliding-window rate limit |
-| [`ccsc-gjm`](#) | `!mute <@bot>` / `!unmute <@bot>` operator verbs |
-| [`ccsc-6gw`](#) | This doc |
-| [`ccsc-8fc`](#) | (deferred) `slack/announce_task` MCP tool for cross-agent task coordination |
+| Bead | What | PR |
+|---|---|---|
+| `ccsc-7xq` | Epic — Multi-agent Slack channels (this) | — |
+| `ccsc-gyt` | Per-bot per-channel sliding-window rate limit | [#182](https://github.com/jeremylongshore/claude-code-slack-channel/pull/182) |
+| `ccsc-gjm` | `!mute <@bot>` / `!unmute <@bot>` operator verbs | [#183](https://github.com/jeremylongshore/claude-code-slack-channel/pull/183) |
+| `ccsc-6gw` | This doc | [#184](https://github.com/jeremylongshore/claude-code-slack-channel/pull/184) |
+| `ccsc-8fc` | (deferred) `slack/announce_task` MCP tool for cross-agent task coordination | — |
