@@ -155,18 +155,41 @@ Health check an existing install. Reports a structured pass/fail per check,
 no mutations. Suggests `/slack-channel:install repair` if fixable issues
 are found.
 
-Run all checks in order:
+### Doctor dependencies
+
+The doctor checks below shell out to `curl` and `jq`. `curl` is preinstalled
+on virtually every dev system; `jq` may not be. Verify before running:
+
+```bash
+command -v curl >/dev/null && command -v jq >/dev/null || echo "Install jq: brew install jq  (macOS)  |  sudo apt install jq  (Debian/Ubuntu)"
+```
+
+The checks also need `$SLACK_BOT_TOKEN` and `$SLACK_APP_TOKEN` in the
+environment. Load them from the user's `.env` before running any check
+that references them:
+
+```bash
+set -a; . ~/.claude/channels/slack/.env; set +a
+```
+
+If the user prefers not to export the tokens (some shells leak env to
+child processes / process listings), substitute the literal token values
+inline — the doctor commands tolerate either form.
+
+### Checks
+
+Run all in order:
 
 1. **State directory exists**: `~/.claude/channels/slack/` is a directory with mode `0700`.
 2. **`.env` exists, is mode `0600`, owned by current user**.
 3. **`.env` contains both tokens** with valid prefixes (`xoxb-` and `xapp-`).
 4. **Bot token is live**: `curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" https://slack.com/api/auth.test | jq -e '.ok == true'`. Reports the `bot_id` and `team` if live; "invalid_auth" / "token_revoked" / "account_inactive" if not.
-5. **App token has `connections:write`**: query `apps.connections.open` with the `xapp-` token; expect `ok: true` and a `wss://` URL.
-6. **`access.json` exists, is mode `0600`, parses as valid JSON**.
-7. **`allowFrom` is non-empty**: at least one paired user. If empty, the user has not completed Step 5.
+5. **App token has `connections:write`**: `curl -s -X POST -H "Authorization: Bearer $SLACK_APP_TOKEN" https://slack.com/api/apps.connections.open | jq -e '.ok == true and (.url | startswith("wss://"))'`. Expects `ok: true` and a `wss://` URL. Failure modes: "not_authed" (token missing), "missing_scope" (token lacks `connections:write`), "token_revoked" (regenerate).
+6. **`access.json` exists, is mode `0600`, parses as valid JSON**: `[ -f ~/.claude/channels/slack/access.json ] && jq empty ~/.claude/channels/slack/access.json`.
+7. **`allowFrom` is non-empty**: `jq -e '.allowFrom | length > 0' ~/.claude/channels/slack/access.json`. If empty, user has not completed Step 5.
 8. **Audit log integrity**: if `audit.log` exists, run `bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log`. Report hash-chain status.
-9. **Claude Code version ≥ v2.1.80** and `claude.ai` login present.
-10. **Bot is in channel(s) configured in `access.json.channels`**: for each opted-in channel, call `conversations.members` and check the bot's user ID is in the list. THIS catches the silent-killer Step 2 omission.
+9. **Claude Code version ≥ v2.1.80** and `claude.ai` login present: `claude --version` and `claude auth status`.
+10. **Bot is in channel(s) configured in `access.json.channels`**: for each opted-in channel, `curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" "https://slack.com/api/conversations.members?channel=$CHANNEL_ID" | jq -e --arg bot "$BOT_USER_ID" '.members | index($bot) != null'`. THIS catches the silent-killer Step 2 omission.
 
 Report format:
 
@@ -210,7 +233,7 @@ Auto-fix the issues `doctor` found that are safely fixable:
 | State dir missing | `mkdir -p ~/.claude/channels/slack && chmod 0700 ~/.claude/channels/slack` |
 | `.env` perms wrong | `chmod 0600 ~/.claude/channels/slack/.env` |
 | `access.json` perms wrong | `chmod 0600 ~/.claude/channels/slack/access.json` |
-| `access.json` corrupt JSON | Move aside as `access.json.broken.<timestamp>`, write a fresh empty `{ "allowFrom": [], "channels": {}, "pending": [] }` |
+| `access.json` corrupt JSON | `TS=$(date +%s); mv ~/.claude/channels/slack/access.json ~/.claude/channels/slack/access.json.broken.$TS && echo '{ "allowFrom": [], "channels": {}, "pending": [] }' > ~/.claude/channels/slack/access.json && chmod 0600 ~/.claude/channels/slack/access.json` |
 | Audit log hash break | DO NOT repair — surface for incident review (this means tampering or write loss) |
 | Bot not in channel | Cannot fix from the terminal — print the exact Slack click-path |
 | Token invalid | Cannot fix — instruct user to regenerate at api.slack.com/apps |
@@ -311,8 +334,8 @@ Steps:
    stay. Proceed? [y/N]"
 2. On confirm:
    - Move `access.json` to `access.json.reset.<timestamp>` (don't delete — keep one rollback)
-   - `rm -rf sessions/`
-   - Write a fresh empty `access.json`
+   - Move `sessions/` to `sessions.reset.<timestamp>/` (archive, never `rm -rf` — keep one rollback path per the skill's safety invariants)
+   - Write a fresh empty `access.json` with mode `0600`
 3. Tell the user: "Reset complete. Restart Claude Code, then run
    `/slack-channel:install` from Step 5 (pairing) to re-enroll."
 

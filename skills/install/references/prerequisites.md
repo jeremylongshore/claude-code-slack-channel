@@ -120,6 +120,31 @@ the Research Preview constraint). When the only auth signal is
 with a non-obvious error in `~/.claude/logs/`. The user sees "the bot
 just doesn't work."
 
+## Optional: `jq` (only needed for `doctor` / `repair` modes)
+
+The `doctor` and `repair` modes use `jq` for JSON parsing of Slack API
+responses and `access.json` validation. The `install` mode itself does
+not need it — skip this if you're only doing a fresh install.
+
+```bash
+command -v jq    # confirm whether jq is installed
+```
+
+If missing:
+
+```bash
+# macOS
+brew install jq
+
+# Debian / Ubuntu
+sudo apt install jq
+
+# Fedora / RHEL
+sudo dnf install jq
+
+# Other: https://jqlang.org/download/
+```
+
 ## All three green? Proceed to Step 1
 
 When `bun --version`, `claude --version`, and `claude auth status` all
