@@ -24,6 +24,16 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
 
 ## Quick Start
 
+**For AI-assisted setup**: run `/slack-channel:install` and your AI assistant will walk you through every step below. The install skill also supports `doctor` (health check), `verify` (round-trip test), `repair` (auto-fix), `manifest` (one-click Slack-app import), `reset`, `tour`, and `uninstall` modes — see [`skills/install/SKILL.md`](skills/install/SKILL.md).
+
+### Prerequisites
+
+Before step 1, confirm you have:
+
+- **Bun ≥ 1.0** — install with `curl -fsSL https://bun.sh/install | bash`. Node.js / Docker fallbacks are documented in [Option B](#option-b-nodejs--npx) / [Option C](#option-c-docker) below.
+- **Claude Code ≥ v2.1.80** — see https://docs.claude.com/claude-code/install for upgrade.
+- **`claude.ai` login** — this is a Research Preview constraint. API-key-only auth (`ANTHROPIC_API_KEY` set with no `claude.ai` session) does NOT work for Channels. Run `claude login` to complete the browser flow.
+
 ### 1. Create a Slack App
 
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → From scratch
@@ -54,6 +64,7 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
 
 Pick your runtime:
 
+<a id="option-a-bun-recommended"></a>
 #### Option A: Bun (recommended)
 
 ```bash
@@ -64,6 +75,7 @@ claude --channels plugin:slack-channel@claude-code-plugins
 # claude --channels plugin:slack-channel@claude-plugins-official
 ```
 
+<a id="option-b-nodejs--npx"></a>
 #### Option B: Node.js / npx
 
 ```bash
@@ -72,6 +84,7 @@ npm install
 claude --channels plugin:slack-channel@claude-code-plugins
 ```
 
+<a id="option-c-docker"></a>
 #### Option C: Docker
 
 ```bash
@@ -80,11 +93,44 @@ docker build -t claude-slack-channel .
 claude --channels plugin:slack-channel@claude-code-plugins
 ```
 
+### 3.5. Add the bot to your Slack channel
+
+**This step is the most common silent failure.** Slack installs apps to the workspace without joining any channels. The pairing DM in step 4 works because DMs auto-route, but a channel test message in step 5 will hit silence — the bot literally isn't in the channel to see the event.
+
+1. Open Slack → navigate to the channel where you want the bot to live
+2. Click the channel name at the top → **Integrations** tab
+3. Click **Add an App** → select your bot
+4. Confirm: the bot now appears in the channel's member list
+
+Private channels need explicit invitation. Repeat per channel if the bot needs to be in more than one.
+
 ### 4. Pair Your Account
 
 1. DM the bot in Slack — you'll get a 6-character pairing code
 2. In your terminal: `/slack-channel:access pair <code>`
 3. You're connected. Chat away.
+
+### 5. Verify it's working
+
+In the channel where you added the bot in step 3.5, send:
+
+```
+@<bot-name> hello
+```
+
+The bot should reply within 10 seconds. If you get silence, run `/slack-channel:install doctor` for a structured diagnosis, then `/slack-channel:install repair` to auto-fix what's fixable. See [Troubleshooting](#troubleshooting) for the top failure modes.
+
+### Troubleshooting
+
+The five silent-failure modes that cover ~95% of fresh-install issues:
+
+1. **Bot is not in the channel** — see step 3.5 above. Channel test messages hit silence because the bot can't see the event.
+2. **Claude Code version too old** — run `claude --version`; need ≥ v2.1.80.
+3. **`claude.ai` login missing** — `ANTHROPIC_API_KEY` alone is not accepted (Research Preview constraint). Run `claude login`.
+4. **Bun not installed** — `bun: command not found`. Install with `curl -fsSL https://bun.sh/install | bash` or use the Node.js fallback in Option B.
+5. **Wrong file permissions on `.env`** — must be `0600`. Run `chmod 0600 ~/.claude/channels/slack/.env`, or run `/slack-channel:install repair`.
+
+Full troubleshooting matrix (10 failure modes): [`skills/install/references/troubleshooting.md`](skills/install/references/troubleshooting.md).
 
 ## Policy Engine (v0.6.0+)
 
@@ -179,6 +225,10 @@ claude --dangerously-load-development-channels server:slack
 ## One-Pager & System Analysis
 
 [Full project one-pager and operator-grade system analysis](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53)
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for branching, commits, PR workflow, and the quality-gate checklist. AI assistants helping with contributions should read [`AGENTS.md`](AGENTS.md) first.
 
 ## Contributors
 
