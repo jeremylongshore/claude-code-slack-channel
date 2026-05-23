@@ -1,66 +1,161 @@
-# Contributing
+# Contributing to CCSC
 
-We welcome contributions to the Slack channel for Claude Code.
+Thanks for considering a contribution. CCSC is opinionated about how work
+lands; this doc captures the conventions so your PR doesn't bounce off them.
 
-## Development Setup
+## Before you start
 
-1. **Clone the repo**
-   ```bash
-   git clone https://github.com/jeremylongshore/claude-code-slack-channel.git
-   cd claude-code-slack-channel
-   ```
+- Read [`README.md`](README.md) to understand what this repo is and how to install it.
+- Read [`AGENTS.md`](AGENTS.md) if you're using an AI assistant — it has the
+  load-bearing context every agent needs (module layout, architecture
+  invariants, what NOT to do).
+- For non-trivial changes, **open a GitHub issue first** describing the
+  problem you're trying to solve. Solo author with a busy schedule —
+  surprise PRs often go un-merged. A 5-line issue saves a 500-line PR
+  from being closed unread.
 
-2. **Install dependencies**
-   ```bash
-   bun install
-   ```
+## Dev environment
 
-3. **Create a Slack test app** (see [README.md](README.md#1-create-a-slack-app))
+Prerequisites are in [`README.md` § Prerequisites](README.md#prerequisites):
+Bun ≥ 1.0, Claude Code ≥ v2.1.80, `claude.ai` login.
 
-4. **Configure tokens**
-   ```bash
-   mkdir -p ~/.claude/channels/slack
-   cat > ~/.claude/channels/slack/.env << 'EOF'
-   SLACK_BOT_TOKEN=xoxb-your-test-token
-   SLACK_APP_TOKEN=xapp-your-test-token
-   EOF
-   chmod 600 ~/.claude/channels/slack/.env
-   ```
+```bash
+git clone https://github.com/jeremylongshore/claude-code-slack-channel.git
+cd claude-code-slack-channel
+bun install
+bun run typecheck   # sanity check
+bun test            # 986+ tests should pass green
+```
 
-5. **Run in dev mode**
-   ```bash
-   claude --dangerously-load-development-channels server:slack
-   ```
+If you want to run the MCP server against a real Slack workspace while
+developing, follow [`skills/install/SKILL.md`](skills/install/SKILL.md) (or
+run `/slack-channel:install`) — that sets up a test app, tokens, and
+pairing without you having to assemble steps from five different files.
 
-## Code Style
+Dev mode bypasses the plugin allowlist:
 
-- TypeScript strict mode
-- No external frameworks beyond the four declared runtime dependencies (`@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`)
-- Run `bun run typecheck` before submitting
+```bash
+claude --dangerously-load-development-channels server:slack
+```
 
-## Testing
+## Branching + commits
 
-Test against a real Slack workspace (no mocks — the Slack API surface is too broad for meaningful mocks).
+- **Feature branches always. Never push to `main` directly.**
+- Branch naming:
+  - `feat/<description>-bz-<bead-id>` for new features
+  - `fix/<description>-bz-<bead-id>` for bug fixes
+  - `docs/<description>-bz-<bead-id>` for documentation-only changes
+- One logical change per commit. Don't bundle "refactor + fix + feature"
+  in one commit — split into three.
+- Commit messages: imperative present tense ("add streaming reply", not
+  "added streaming reply"). Keep the subject under 70 chars.
+- **Do NOT add `Co-Authored-By`, AI-marketing strings, or model-version
+  tags to commit messages.** Repo convention.
 
-Verify at minimum:
-- [ ] MCP server starts and connects via stdio + Socket Mode
-- [ ] Bot messages are dropped at gate
-- [ ] Pairing flow works end-to-end
-- [ ] Allowlisted DMs are delivered as `<channel>` events
-- [ ] Reply tool sends messages with `unfurl_links: false`
-- [ ] `assertSendable()` blocks state directory files
+## Pull requests
 
-## Pull Requests
+- **Title**: short, under 70 chars. Describes the outcome, not the
+  mechanism. ("Add streaming reply for long Claude outputs", not
+  "Refactor reply tool to use chat.update").
+- **Body** must include:
+  - **Summary** — 1–3 bullets on what changed and why.
+  - **Test plan** — markdown checklist of what you verified.
+  - **Closes <bead-id>** — reference the bead this ships (if applicable).
+- One PR = one logical unit. Don't bundle unrelated changes.
+- **Gemini auto-reviews PRs** via the GitHub App. Round-1 findings are
+  usually legitimate — address them in fix-up commits, NOT by force-push.
+  See `~/.claude/CLAUDE.md` § "Autonomous git on feature branches" for
+  the canonical Gemini-review loop.
+- **Required CI**: `Typecheck` (the 9-gate sweep), `gitleaks`, `CodeQL`,
+  `Scorecard`. All must be green before merge.
+- **Branch protection**: `Typecheck` is the required status check with
+  `strict: true` (PR must be up-to-date with `main`).
 
-- One feature or fix per PR
-- Describe the security implications of any changes to `gate()`, `assertSendable()`, or `assertOutboundAllowed()`
-- Update CHANGELOG.md with your changes under `[Unreleased]`
-- All PRs require passing typecheck
+## Quality gates (run before pushing)
 
-## Security
+These are the gates CI will run. If any fail locally, the PR will fail
+in CI too — save yourself the round-trip:
 
-If you discover a security vulnerability, **do not open a public issue**. See [SECURITY.md](SECURITY.md).
+```bash
+bun run typecheck                                    # TypeScript strict
+bunx @biomejs/biome check .                          # Lint
+bun test --timeout 15000                             # 986+ tests pass
+bash scripts/coverage-floor.sh 95                    # 95% line + func coverage
+bun scripts/crap-score.ts --threshold 30             # Per-function complexity
+bunx depcruise --config .dependency-cruiser.js .     # Architecture rules
+bash scripts/gherkin-lint.sh --path features/ --strict
+bash scripts/harness-hash.sh --verify                # Tamper check
+bun audit --audit-level=high --ignore=GHSA-j3q9-mxjg-w52f
+```
+
+Optional but appreciated for non-trivial logic changes:
+
+```bash
+bunx stryker run    # Mutation testing (~45 min) — see 000-docs/MUTATION_REPORT.md
+```
+
+## Architecture invariants you must NOT break
+
+These are enforced by `.dependency-cruiser.js` and will fail CI:
+
+- `server.ts` MUST NOT import `manifest.ts` (31-A.4 invariant).
+- `journal.ts` MUST NOT import `policy.ts` (no-journal-imports-policy).
+- `admin.ts` MUST NOT import `manifest.ts` (no-admin-imports-manifest).
+
+If your change forces an invariant to be broken, that's a design discussion
+on the GitHub issue first — not a PR submission.
+
+## Where to put new code
+
+- **Pure logic** → a sibling module (the 17 existing sibling modules are the
+  pattern: `lib.ts`, `journal.ts`, `policy.ts`, `manifest.ts`, etc.). Keep
+  them side-effect-free where possible; accept dependencies as parameters.
+- **Stateful runtime concerns** → `server.ts`. Slack client bootstrap,
+  MCP server registration, event listeners, file I/O.
+- **Tests**:
+  - Unit + integration → `server.test.ts`
+  - Gherkin acceptance contracts → `features/*.feature` + matching steps
+    in `features/steps/`
+- **Operator CLIs** → `scripts/` (e.g., `scripts/audit-key.ts`).
+
+## Security-sensitive changes
+
+Changes to these functions are security-critical and need extra scrutiny:
+
+| File | Functions / surface |
+|---|---|
+| `lib.ts` | `gate()`, `assertOutboundAllowed()`, `assertSendable()` |
+| `journal.ts` | Hash chain, redactor, `verifyJournal` |
+| `crypto.ts` | Ed25519 signing |
+| `admin.ts` | All admin command routing |
+| `audit-key-loader.ts` | Boot-time key load + SOPS decryption |
+| `policy.ts` | `evaluate()`, shadow linter, monotonicity check |
+
+If you're touching any of these, **read the matching design doc in
+`000-docs/` FIRST**. A PR that contradicts a frozen design doc is a
+revert, not a merge. The design-in-public commitment: docs ship before
+code, and docs are the source of truth for security-boundary decisions.
+
+## Issue tracking (beads / bd)
+
+This repo uses [bd (beads)](https://github.com/gastownbeads/beads) for issue
+tracking. If you're an external contributor, you don't need to use bd —
+file a GitHub issue and the maintainer will mirror it into a bead. If
+you're working from a bead, reference its ID in commits and PRs
+(`Closes ccsc-xyz` in the PR body).
+
+## Reporting security vulnerabilities
+
+**DO NOT file a public GitHub issue for security vulnerabilities.** See
+[`SECURITY.md`](SECURITY.md) for the disclosure policy. Short version:
+email jeremy@intentsolutions.io with details.
+
+## Code of conduct
+
+See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Be decent. No harassment,
+no discriminatory language, no spam PRs.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under MIT.
+By contributing, you agree your contributions are licensed under MIT
+(see [`LICENSE`](LICENSE)).
