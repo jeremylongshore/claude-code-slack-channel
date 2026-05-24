@@ -1,4 +1,4 @@
-# claude-code-slack-channel v0.9.1
+# claude-code-slack-channel v0.10.0
 
 Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative policy engine; every gate decision lands in a hash-chained tamper-evident audit journal — per-thread session isolation, identity-aware permission gates, five-layer prompt-injection defense.
 
@@ -6,7 +6,7 @@ Enterprise Slack-native governance substrate where humans, Claude Code sessions,
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
-**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.9.1)
+**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.10.0)
 
 > **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login.
 
