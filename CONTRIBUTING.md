@@ -138,7 +138,7 @@ code, and docs are the source of truth for security-boundary decisions.
 
 ## Issue tracking (beads / bd)
 
-This repo uses [bd (beads)](https://github.com/gastownbeads/beads) for issue
+This repo uses [bd (beads)](https://github.com/gastownhall/beads) for issue
 tracking. If you're an external contributor, you don't need to use bd —
 file a GitHub issue and the maintainer will mirror it into a bead. If
 you're working from a bead, reference its ID in commits and PRs
