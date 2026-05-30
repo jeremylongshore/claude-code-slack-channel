@@ -8,18 +8,29 @@ Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP 
 
 ## Architecture
 
-Six production source files (Bun/TypeScript, strict mode):
+Bun/TypeScript, strict mode. ~16 production source files (LoC drifts every commit — run `wc -l *.ts` for current). The load-bearing core:
 
-| File | LoC | Purpose |
+| File | ~LoC | Purpose |
 |---|---|---|
-| `server.ts` | 2810 | Stateful runtime — Slack client bootstrap, MCP server, event handlers |
-| `lib.ts` | 1793 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt helpers |
-| `journal.ts` | 1145 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
+| `server.ts` | 3250 | Stateful runtime — Slack client bootstrap, MCP server, event handlers, file I/O |
+| `lib.ts` | 1894 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt helpers |
+| `journal.ts` | 1450 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
 | `supervisor.ts` | 980 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32) |
-| `policy.ts` | 647 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
+| `policy.ts` | 818 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
 | `manifest.ts` | 573 | Bot-manifest protocol — schema, publish-side validation, subset check (Epic 31) |
 
-Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
+Supporting modules (epic-scoped; each file header carries its `ccsc-*` bead tag):
+
+| File(s) | Purpose |
+|---|---|
+| `crypto.ts` · `audit-key-loader.ts` · `audit-key-cli.ts` | Ed25519 audit-event signing over RFC 8785 JCS + keypair load/CLI (journal v2) |
+| `admin.ts` · `mute-store.ts` · `nonce-hitl.ts` | Operator admin command dispatcher, peer-bot mute store, HMAC-nonce cross-channel HITL approval |
+| `policy-dispatch.ts` | Side-effect-free dispatcher routing a gated call through `evaluate()` to allow/deny/require |
+| `peer-bot-rate-limit.ts` | Per-(channel, bot_id) sliding-window limit breaking A→B→A runaway loops |
+| `stream-reply.ts` | Progressive Slack reply via `chat.update` |
+| `acp-adapter.ts` | Agent Client Protocol (ACP) stdio boundary adapter |
+
+Runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`, `tsx`. No frameworks.
 
 ```
 Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude Code
@@ -29,7 +40,7 @@ Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude
 
 **`server.ts`** handles stateful concerns: Slack client bootstrap, token loading, MCP server registration, event listeners, file I/O.
 
-**`policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`** are epic-scoped modules with their own design docs (see below). 31-A.4 invariant: `server.ts` does not import `manifest.ts` directly — enforced by both `.dependency-cruiser.js` and a compile-time import-graph test in `server.test.ts`.
+**`policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`** are epic-scoped modules with their own design docs (see below). **31-A.4 isolation invariant**: `policy.ts` (and `admin.ts`) must NEVER import `manifest.ts` — the manifest module is advertising-only, the policy engine is authoritative, so "advertisements are not grants." Enforced by `.dependency-cruiser.js` (`no-policy-imports-manifest`, `no-admin-imports-manifest`) plus a compile-time import-graph test in `server.test.ts`. (`server.ts` itself *does* import `manifest.ts` to wire the `publish_manifest` tool — that's allowed; the ban is specifically policy/admin → manifest.)
 
 ## Commands
 
@@ -38,12 +49,12 @@ Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude
 ```bash
 bun install                              # Install deps
 bun run typecheck                        # TypeScript strict check (tsc --noEmit)
-bun test                                 # Run test suite (bun:test) — 704 tests
+bun test                                 # Run test suite (bun:test) — ~986 tests
 bun test --timeout 15000                 # Match CI's timeout
 bun test --watch                         # Watch mode
 bun test --test-name-pattern "gate"      # Run tests matching a pattern
 bun test server.test.ts                  # Just the unit suite (skip Gherkin runner)
-bun test features/runner.test.ts         # Just the Gherkin scenarios (37 tests)
+bun test features/runner.test.ts         # Just the Gherkin scenarios (61 across 7 .feature files)
 bun server.ts                            # Run server directly
 npx tsx server.ts                        # Node.js fallback
 ```
@@ -110,9 +121,10 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `manifest.ts` — bot-manifest protocol (Epic 31): schema, `assertPublishAllowed`, `validateManifestSubset`
 
 ### Tests & acceptance contracts
-- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`). Total across all three test files (plus `features/gate-properties.test.ts` and `features/runner.test.ts`) is **~704 tests / ~4,035 expects** (a moving snapshot — exact count drifts with every feature commit; soft floor lives in coverage, not test count). Run a subset with `bun test --test-name-pattern "<pattern>"`.
-- `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); five primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`
-- `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 37 scenarios against the real primitives
+- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`). Total across all four test files (`server.test.ts` + `features/gate-properties.test.ts` + `features/jcs-interop.test.ts` + `features/runner.test.ts`) is **~986 tests / ~6,017 expects** (a moving snapshot — exact count drifts with every feature commit; soft floor lives in coverage, not test count). Run a subset with `bun test --test-name-pattern "<pattern>"`.
+- `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); seven primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`, `admin_commands`, `tier-shadow`
+- `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 61 scenarios against the real primitives
+- `features/gate-properties.test.ts` — fast-check property-based tests for `gate()`; `features/jcs-interop.test.ts` — RFC 8785 JCS canonicalization interop for audit signing
 
 ### Config
 - `biome.json` — Biome lint config (curated rule set, formatter off, `recommended: false`)
@@ -134,6 +146,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
 - `skills/policy/SKILL.md` — `/slack-channel:policy` policy-rule authoring skill (validates via `scripts/policy-validate.ts`)
+- `skills/install/SKILL.md` — `/slack-channel:install` multi-mode install skill (plugin / dev / Docker)
 - `ACCESS.md` — access control schema documentation
 - `CHANGELOG.md` — Keep a Changelog format; every user-visible change lands with a PR entry
 
