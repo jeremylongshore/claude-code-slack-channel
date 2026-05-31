@@ -4,7 +4,7 @@
  * Exercises gate() from lib.ts. Each scenario uses the shared Context to
  * carry the GateOptions and the resulting GateResult between steps.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { expect } from 'bun:test'

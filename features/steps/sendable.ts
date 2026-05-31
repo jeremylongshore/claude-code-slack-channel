@@ -5,7 +5,7 @@
  * per-feature-file run. The Context carries `inboxDir`, `stateRoot`,
  * `allowlistRoots`, and `targetPath` across steps.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { expect } from 'bun:test'

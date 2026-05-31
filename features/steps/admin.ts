@@ -6,7 +6,7 @@
  * reactions, quiesce flag), the result of dispatch, and the
  * configurable behavior of isAllowed and verifyChallenge per scenario.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { expect } from 'bun:test'

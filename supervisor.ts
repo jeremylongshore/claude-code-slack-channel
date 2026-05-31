@@ -33,7 +33,7 @@
  *     or what gets logged (Epic 30-A). Those subsystems observe session
  *     state; they never mutate it.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import type { JournalWriter } from './journal'

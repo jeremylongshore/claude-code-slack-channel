@@ -6,7 +6,7 @@ Two-way Slack channel for Claude Code — chat from Slack DMs and channels, appr
 A `claude/channel` implementation for Slack. Socket Mode (outbound WebSocket, no public URL) bridges Slack into a running Claude Code session via MCP stdio. Permission relay with Block Kit buttons, per-thread session isolation, hash-chained tamper-evident audit journal, policy-gated MCP tools, real-time audit projection to Slack threads, and a five-layer prompt-injection defense. Three runtime options: Bun, Node.js, Docker.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
 **Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.7.0)
@@ -142,7 +142,7 @@ Every security-relevant event appends to a hash-chained audit journal (`audit.lo
 ### Quick Reference
 
 - **Repo:** [github.com/jeremylongshore/claude-code-slack-channel](https://github.com/jeremylongshore/claude-code-slack-channel)
-- **License:** MIT
+- **License:** Apache 2.0
 - **Latest Release:** [v0.7.0](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.7.0)
 - **Test Coverage:** ~500 tests
 

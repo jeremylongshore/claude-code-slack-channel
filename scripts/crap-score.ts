@@ -33,7 +33,7 @@
  *   1 — one or more functions exceed the threshold
  *   2 — CLI / parse error
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { readFileSync } from 'node:fs'

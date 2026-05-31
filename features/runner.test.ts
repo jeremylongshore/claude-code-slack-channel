@@ -11,7 +11,7 @@
  * 5 (outbound_reply_filter) + 7 (policy_evaluation) + 7 (audit_chain)
  * = 37 new scenarios.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { afterAll, beforeEach, describe, test } from 'bun:test'

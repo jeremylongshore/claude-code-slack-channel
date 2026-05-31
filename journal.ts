@@ -32,7 +32,7 @@
  * (which only walks the documented fields). Strict mode surfaces those
  * mistakes at build time or on the first `parse()` call.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { createHash, randomBytes } from 'node:crypto'

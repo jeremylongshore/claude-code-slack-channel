@@ -25,7 +25,7 @@
  * side effects. Mirrors acp-adapter.ts / policy-dispatch.ts / nonce-
  * hitl.ts / admin.ts / stream-reply.ts.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // ---------------------------------------------------------------------------

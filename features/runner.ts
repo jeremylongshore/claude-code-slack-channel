@@ -12,7 +12,7 @@
  * Per-scenario state is carried in a plain Context object that is reset
  * between scenarios by the runner.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // ---------------------------------------------------------------------------

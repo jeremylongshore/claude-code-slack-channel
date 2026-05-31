@@ -3,7 +3,7 @@ name: access
 description: Manage Slack channel access control — pairing, allowlist, channel opt-in
 version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
-license: MIT
+license: Apache-2.0
 user-invocable: true
 argument-hint: "pair <code> | policy <mode> | add <user_id> | remove <user_id> | channel <id> [opts] | status"
 allowed-tools: [Read, Write, Edit]

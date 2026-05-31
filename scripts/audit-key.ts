@@ -11,7 +11,7 @@
  *
  * See `audit-key-cli.ts:HELP_TEXT` for the full CLI surface.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { execFile } from 'node:child_process'

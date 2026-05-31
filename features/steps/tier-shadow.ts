@@ -9,7 +9,7 @@
  * for "<tier>-tier <effect> rule on tool <name>" variations. The scenarios
  * are intentionally declarative; the handlers do the wiring.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { expect } from 'bun:test'

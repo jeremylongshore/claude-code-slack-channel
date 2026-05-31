@@ -1,0 +1,12 @@
+claude-code-slack-channel
+Copyright 2026 Jeremy Longshore / Intent Solutions
+
+This product is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this product except in compliance with the License. A copy of
+the License is provided in the LICENSE file and is also available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This product bundles a vendored copy of @intentsolutions/audit-harness under
+.audit-harness/, which is distributed under the MIT License. See
+.audit-harness/LICENSE for its terms.

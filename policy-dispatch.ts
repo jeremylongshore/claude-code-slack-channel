@@ -27,7 +27,7 @@
  *     evaluation-flow.md § Context-stripping (ccsc-06s) for the
  *     architectural rationale.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import type { JournalWriter } from './journal.ts'

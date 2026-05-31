@@ -16,7 +16,7 @@ import { basename, join, resolve } from 'node:path'
  * Two-way Slack ↔ Claude Code bridge via Socket Mode + MCP stdio.
  * Security: gate layer, outbound gate, file exfiltration guard, prompt hardening.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'

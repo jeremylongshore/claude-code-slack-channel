@@ -14,7 +14,7 @@
  * Deliberately narrow surface: no compound combinators, no expression DSL.
  * Three effects only; more is a footgun for shadows.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { createHash } from 'node:crypto'

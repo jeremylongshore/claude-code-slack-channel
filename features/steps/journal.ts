@@ -5,7 +5,7 @@
  * valid fixtures, then mutates specific lines for the negative cases.
  * Per-scenario tmp files are created and removed via Context cleanup.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { expect } from 'bun:test'

@@ -46,7 +46,7 @@
  * provides the nonce primitives that the dispatcher composes with
  * the Slack send.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { randomBytes } from 'node:crypto'
