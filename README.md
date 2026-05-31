@@ -237,6 +237,13 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for branching, commits, PR workflow, an
 - [@jinsung-kang](https://github.com/jinsung-kang) — clean shutdown on client disconnect (v0.3.1)
 - [@CaseyMargell](https://github.com/CaseyMargell) — event deduplication fix (v0.3.1), cross-bot delivery via `allowBotIds` (v0.4.0)
 
+## Support
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/jeremylongshore)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/jeremylongshore)
+
+This is open-source software maintained by [Jeremy Longshore](https://github.com/jeremylongshore). If it saves you time, consider [sponsoring on GitHub](https://github.com/sponsors/jeremylongshore) or [buying a coffee](https://www.buymeacoffee.com/jeremylongshore) — it funds continued development and keeps the project independent.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
