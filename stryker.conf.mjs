@@ -39,7 +39,12 @@ export default {
   // errors run anyway and are killed by the test suite instead.
   checkers: [],
   coverageAnalysis: 'off',
-  reporters: ['html', 'clear-text', 'progress'],
+  // `json` emits a compact machine-readable reports/mutation/mutation.json
+  // (the `html` report embeds the full viewer bundle → ~230 MB, which OOMs
+  // small boxes on parse). The json report is the survivor source of truth:
+  // the Mutation workflow uploads reports/mutation/, so survivors can be
+  // extracted per-file without re-running Stryker locally (ccsc-2et).
+  reporters: ['html', 'json', 'clear-text', 'progress'],
   // break: 80 — fail the run if overall mutation score drops below 80%.
   // Documented baseline is 85.22% (000-docs/MUTATION_REPORT.md, ccsc-y4e);
   // 80 sits ~5pp below baseline, the regression margin called for in ccsc-0mn.
