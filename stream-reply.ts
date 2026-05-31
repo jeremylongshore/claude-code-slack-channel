@@ -33,7 +33,7 @@
  * tests import the production code path directly without triggering
  * server.ts boot-time exit paths.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { createHash } from 'node:crypto'

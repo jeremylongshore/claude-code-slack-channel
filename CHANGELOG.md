@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Relicensed from MIT to Apache License 2.0.** Replaces the MIT `LICENSE` with the canonical Apache 2.0 text, adds a `NOTICE` file (Apache convention) attributing the project to Jeremy Longshore / Intent Solutions and noting the vendored MIT `@intentsolutions/audit-harness`, retags the `SPDX-License-Identifier` header in all 32 first-party source/feature files to `Apache-2.0`, and updates `package.json`, `.claude-plugin/plugin.json`, README/docs license badges, and CONTRIBUTING. The vendored `.audit-harness/` copy keeps its own MIT license. Restores the project's original license (it had briefly been MIT — see the entry below).
+
 ## [0.10.0] - 2026-05-24
 
 ### Added

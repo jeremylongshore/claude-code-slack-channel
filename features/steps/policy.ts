@@ -4,7 +4,7 @@
  * Exercises evaluate() from policy.ts. Context carries the ToolCall,
  * PolicyRule list, approval map, and the returned PolicyDecision.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { expect } from 'bun:test'

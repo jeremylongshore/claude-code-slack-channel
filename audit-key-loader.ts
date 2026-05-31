@@ -30,7 +30,7 @@
  * Sibling-module pattern: pure async function + injectable spawn,
  * tests use a mock spawn that returns canned stdout.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { execFile } from 'node:child_process'

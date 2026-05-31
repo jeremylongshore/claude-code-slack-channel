@@ -3,7 +3,7 @@ name: install
 description: CCSC lifecycle command center — fresh install walkthrough, health doctor, verify round-trip, auto-repair, Slack app manifest export, reset, tour, and uninstall. One skill for the full install lifecycle.
 version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
-license: MIT
+license: Apache-2.0
 user-invocable: true
 argument-hint: "[install | doctor | verify | repair | manifest | reset | tour | uninstall]"
 allowed-tools: [Read, Write, Edit, Bash, WebFetch]

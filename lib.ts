@@ -5,7 +5,7 @@
  * parameters) so they can be imported by server.test.ts without starting the
  * Slack socket or loading credentials.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { randomBytes } from 'node:crypto'

@@ -3,7 +3,7 @@
 Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative policy engine; every gate decision lands in a hash-chained tamper-evident audit journal — per-thread session isolation, identity-aware permission gates, five-layer prompt-injection defense.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
 **Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.10.0)
@@ -239,4 +239,4 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for branching, commits, PR workflow, an
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE).

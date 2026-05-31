@@ -17,7 +17,7 @@
  *
  * Sibling-module pattern. Pure functions + injectable store.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 // ---------------------------------------------------------------------------

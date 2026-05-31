@@ -32,7 +32,7 @@
  * siblings: the test suite imports the production code path directly
  * without triggering server.ts boot-time side effects.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { execFile } from 'node:child_process'

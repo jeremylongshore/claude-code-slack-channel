@@ -29,7 +29,7 @@
  *   3. `pass insert -e intentsolutions/ccsc/audit-pubkey`, paste.
  *   4. Update the external gist with the new public key.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import type { Ed25519KeyPair } from './crypto.ts'

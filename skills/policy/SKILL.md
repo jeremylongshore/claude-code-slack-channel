@@ -3,7 +3,7 @@ name: policy
 description: Author MCP tool-call policy rules without hand-editing access.json
 version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
-license: MIT
+license: Apache-2.0
 user-invocable: true
 argument-hint: "list | lint | add <id> <effect> <json-match> [--reason \"...\"] [--ttl-ms N] [--approvers N] [--priority N] | remove <id>"
 allowed-tools: [Read, Write, Edit, "Bash(cmd:bun)", "Bash(cmd:chmod)"]
