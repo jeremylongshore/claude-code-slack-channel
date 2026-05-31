@@ -1,6 +1,6 @@
 # claude-code-slack-channel v0.10.0
 
-Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative policy engine; every gate decision lands in a hash-chained tamper-evident audit journal — per-thread session isolation, identity-aware permission gates, five-layer prompt-injection defense.
+Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative, tier-aware policy engine; every decision lands in a hash-chained, **Ed25519-signed** audit journal you can verify offline. Per-thread session isolation, identity-aware permission gates, operator admin commands with cross-channel approval, peer-bot loop control, and defense-in-depth against prompt injection.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -167,7 +167,11 @@ Author rules in `access.json.policy` to automate permission decisions for Claude
 - Successful approvals grant a TTL window scoped to `(rule, channel, thread)` so a chain of similar calls doesn't re-prompt.
 - Parse errors in `access.json.policy` are **fatal at boot** — policy is safety-critical, silent degradation is not offered. Missing or empty `policy` is fine (first-install path).
 
-Full schema reference: [`ACCESS.md`](ACCESS.md#policy-rules). Decision procedure: [`000-docs/policy-evaluation-flow.md`](000-docs/policy-evaluation-flow.md). Release scope and what was deliberately deferred: [`000-docs/v0.6.0-release-plan.md`](000-docs/v0.6.0-release-plan.md).
+**Tier-aware evaluation**: rules carry a tier (`admin` → `user` → `workspace` → `default`). Evaluation is strictest-tier-wins — a higher tier's `deny` cannot be overridden by a lower tier's `auto_approve`, so a workspace-level guardrail can't be relaxed by a per-user rule. Within a tier, first-applicable ordering holds.
+
+When a call is denied, the result returned to Claude is **context-stripped** to a bare `{ behavior: 'deny' }` — the rule id and reason are journaled and posted to the thread, but not handed back to the model, so a denied tool call can't be reverse-engineered into a rephrase-and-retry loop.
+
+Full schema reference: [`ACCESS.md`](ACCESS.md#policy-schema-v050). Decision procedure: [`000-docs/policy-evaluation-flow.md`](000-docs/policy-evaluation-flow.md). Release scope and what was deliberately deferred: [`000-docs/v0.6.0-release-plan.md`](000-docs/v0.6.0-release-plan.md).
 
 ## Access Control
 
@@ -204,16 +208,62 @@ Self-echoes from this bot are always filtered regardless of `allowBotIds`. Peer 
 
 **For the full multi-agent recipe** — registering a second bot, configuring `allowBotIds` mutually, mention-driven addressing, loop-prevention rate limit, `!mute`/`!unmute` operator verbs, common failure modes, what you DON'T get — see [`000-docs/multi-agent-channels.md`](000-docs/multi-agent-channels.md).
 
-## Security
+This is a prompt-injection vector by design, so it's built defense-in-depth. The layers:
 
 - **Sender gating**: Every inbound message hits a gate. Ungated messages are silently dropped before reaching Claude.
 - **Outbound gate**: Replies only work to channels that passed the inbound gate.
-- **File exfiltration guard**: Cannot send `.env`, `access.json`, or other state files through the reply tool.
-- **Prompt injection defense**: System instructions explicitly tell Claude to refuse pairing/access requests from Slack messages.
+- **File exfiltration guard**: Cannot send `.env`, `access.json`, `audit.log`, or other state files through the reply tool.
+- **Prompt-injection defense**: System instructions explicitly tell Claude to refuse pairing/access requests from Slack messages — peer-bot messages carry the same risk as human messages.
 - **Bot filtering**: `bot_id` messages are dropped by default. Channels that host multiple cooperating agents can opt in to specific peers via `allowBotIds`; self-echoes are always filtered via `bot_id` / `bot_profile.app_id` / `user` triple-check.
 - **Link unfurling disabled**: All outbound messages set `unfurl_links: false, unfurl_media: false`.
 - **Token security**: `.env` is `chmod 0o600`, never logged, never in tool results.
 - **Static mode**: Set `SLACK_ACCESS_MODE=static` to freeze access at boot (no runtime mutation).
+- **Signed audit journal**: Every tool-call decision is written to a hash-chained, **Ed25519-signed** journal (RFC 8785 JCS canonical form). The chain is verifiable offline against a published public key — see [Audit Signing](#audit-signing).
+- **Admin-command hardening**: Operator verbs (`!clear`, `!restart`) route through gate → policy → journal → execute and require a server-minted **HMAC nonce confirmed from a second channel**. Claude cannot self-invoke them — no MCP tool name begins with `admin.`. This closes the EchoLeak / operator-coercion class ([CVE-2025-32711](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/000-docs/THREAT-MODEL.md), threat T11): a prompt injected into one channel cannot drive a privileged action, because confirmation must come from a channel the attacker doesn't control.
+- **Peer-bot loop control**: A per-`(channel, bot_id)` sliding-window rate limit (default 10 msg/60s) breaks A→B→A runaway loops; operators can `!mute <@bot>` / `!unmute <@bot>` a misbehaving peer.
+
+Trust boundaries, per-primitive attack surface, and threats T1–T11 are documented in [`000-docs/THREAT-MODEL.md`](000-docs/THREAT-MODEL.md).
+
+## Audit Signing
+
+Every decision the gate makes is journaled to `~/.claude/channels/slack/audit.log` — hash-chained (tamper-evident) and, as of v0.10, **Ed25519-signed** so a third party can verify the log against a public key without trusting the host.
+
+```bash
+# Verify a journal end-to-end (hash chain + signatures):
+bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log
+
+# Operator key lifecycle (Ed25519 over RFC 8785 JCS):
+bun audit-key-cli.ts init       # generate keypair, encrypt private half to .env, print public key
+bun audit-key-cli.ts rotate     # fresh keypair, re-sign chain head, archive the old public key
+bun audit-key-cli.ts verify     # verify the log against active + archived public keys
+bun audit-key-cli.ts show       # print active public key + key id
+```
+
+The key is loaded at boot from SOPS+age-encrypted `.env`. Run with `--no-audit-signing` to fall back to hash-chain-only. Design + rotation lifecycle: [`000-docs/audit-journal-architecture.md`](000-docs/audit-journal-architecture.md) and [`000-docs/key-management.md`](000-docs/key-management.md).
+
+## Testing & Quality
+
+Security-critical code earns a hard gate. `ci.yml` runs nine checks in sequence on every PR — a red on any one blocks merge:
+
+| Gate | What it enforces |
+|---|---|
+| `bun run typecheck` | TypeScript strict, no `any` escape hatches |
+| Biome lint | curated rule set |
+| `bun test` | **986 tests / 6,017 assertions** across unit + property + Gherkin suites |
+| coverage floor | **≥ 95%** line + function (`scripts/coverage-floor.sh`) |
+| dependency-cruiser | architecture invariants (e.g. `policy.ts` may never import `manifest.ts`) |
+| Gherkin lint | acceptance-feature style, `--strict` |
+| harness-hash verify | SHA-256 tamper check on pinned `.feature` + arch-rule files |
+| `bun audit` | dependency CVEs at `--audit-level=high` |
+| crap-score | cyclomatic-complexity ceiling (30) |
+
+Out of band: **CodeQL**, **gitleaks** secret scanning, **OpenSSF Scorecard**, and manual **Stryker mutation testing** (`bunx stryker run`, baselines in [`000-docs/MUTATION_REPORT.md`](000-docs/MUTATION_REPORT.md)). The five Wall-1 acceptance primitives live in [`features/*.feature`](features/) and run against the real code via a hand-rolled Gherkin runner.
+
+```bash
+bun test                  # full suite
+bun run typecheck         # strict type check
+bunx @biomejs/biome check .
+```
 
 ## Development
 
@@ -225,6 +275,10 @@ claude --dangerously-load-development-channels server:slack
 ## One-Pager & System Analysis
 
 [Full project one-pager and operator-grade system analysis](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53)
+
+## Changelog
+
+Every user-visible change is recorded in [`CHANGELOG.md`](CHANGELOG.md) (Keep a Changelog format). Release notes: [GitHub Releases](https://github.com/jeremylongshore/claude-code-slack-channel/releases).
 
 ## Contributing
 
