@@ -1,0 +1,62 @@
+name: Mutation
+
+# Stryker mutation testing — the deferred CI gate from ccsc-0mn.
+#
+# A full run mutates lib.ts + policy.ts + manifest.ts + journal.ts (~1,860
+# mutants, ~42 min). That is far too slow for the per-PR `ci.yml` job — the
+# original blocker that kept this manual since v0.x. So it runs here instead:
+#
+#   - weekly on a schedule (catches mutation-score drift on main), and
+#   - on demand via workflow_dispatch (run before a release, or to re-baseline).
+#
+# The gate itself lives in stryker.conf.mjs: `thresholds.break = 80`. Stryker
+# exits non-zero when the overall mutation score drops below 80% (~5pp below
+# the documented 85.22% baseline), which fails this job. Update the baseline in
+# 000-docs/MUTATION_REPORT.md whenever the break threshold is intentionally moved.
+
+on:
+  schedule:
+    # 06:10 UTC every Monday — staggered off the Scorecard cron (06:32 Mon).
+    - cron: '10 6 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutation:
+    name: Stryker mutation score
+    runs-on: ubuntu-latest
+    # Generous ceiling over the observed ~42 min so a cold runner doesn't
+    # false-fail; the break threshold is the real gate, not wall-clock.
+    timeout-minutes: 75
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Stryker mutation run (break < 80%)
+        # Non-zero exit when overall score < thresholds.break (80) in
+        # stryker.conf.mjs fails the job. Baseline: 85.22% (MUTATION_REPORT.md).
+        run: bunx stryker run
+
+      - name: Upload mutation HTML report
+        # Always upload so a threshold failure still ships the survivor list.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-report
+          path: reports/mutation/
+          retention-days: 14
+          if-no-files-found: ignore
