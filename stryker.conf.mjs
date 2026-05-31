@@ -2,15 +2,19 @@
 /**
  * Stryker mutation testing configuration.
  *
- * One-time baseline, manual-run only (not wired into CI).
- * Targets pure-logic modules with dedicated test coverage in server.test.ts.
+ * Gated in CI via the scheduled/dispatch `Mutation` workflow
+ * (.github/workflows/mutation.yml) — NOT the per-PR `ci.yml` job, since a full
+ * run is ~42 min. `thresholds.break = 80` makes Stryker exit non-zero (failing
+ * that workflow) if the overall mutation score drops below 80%, ~5pp under the
+ * documented 85.22% baseline (000-docs/MUTATION_REPORT.md). Wired by ccsc-0mn.
  *
- * server.ts and supervisor.ts are excluded — they have boot-time side effects
- * and module-load globals that confuse the mutator. journal.ts is excluded
- * from this baseline run to keep the first pass fast (can expand later).
+ * Targets the four security-critical pure-logic modules. server.ts and
+ * supervisor.ts are excluded — they have boot-time side effects and module-load
+ * globals that confuse the mutator (supervisor mutants also time out under the
+ * command runner's cold-spawn overhead).
  *
- * Run: bunx stryker run
- * Bead: ccsc-ao9
+ * Run locally: bunx stryker run
+ * Beads: ccsc-ao9 (baseline), ccsc-l5z (expanded scope), ccsc-0mn (CI gate)
  */
 
 /** @type {import('@stryker-mutator/api/core').PartialStrykerOptions} */
@@ -36,7 +40,14 @@ export default {
   checkers: [],
   coverageAnalysis: 'off',
   reporters: ['html', 'clear-text', 'progress'],
-  thresholds: { high: 80, low: 60, break: null },
+  // break: 80 — fail the run if overall mutation score drops below 80%.
+  // Documented baseline is 85.22% (000-docs/MUTATION_REPORT.md, ccsc-y4e);
+  // 80 sits ~5pp below baseline, the regression margin called for in ccsc-0mn.
+  // Enforced by the scheduled/dispatch `Mutation` workflow
+  // (.github/workflows/mutation.yml), NOT the per-PR `ci.yml` job — a full run
+  // is ~42 min and would triple PR CI cost (the original ccsc-0mn blocker).
+  // Lower this only alongside a documented baseline re-measure.
+  thresholds: { high: 80, low: 60, break: 80 },
   timeoutMS: 60000,
   concurrency: 4,
   tempDirName: '.stryker-tmp',
