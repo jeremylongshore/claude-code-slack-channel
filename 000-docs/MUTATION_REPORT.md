@@ -48,6 +48,28 @@ Full 42-minute run against the four-file scope after `ccsc-y4e`'s survivor-kill 
 
 Overall **85.22%** — above the `high: 80` threshold in `stryker.conf.mjs`.
 
+### CI-validated run (2026-05-31, GitHub runner — `Mutation` workflow)
+
+First run of the gated `Mutation` workflow (ccsc-0mn) on a GitHub `ubuntu-24.04`
+runner. Completed in **27.9 min** (faster than the dev box's ~42 min; the local
+box now OOM-kills a full run). **Result: PASS** — overall **83.46%**, above the
+`break: 80` gate. Stryker exited 0; the workflow is green.
+
+| File | Mutants | Score (CI 2026-05-31) | vs baseline (2026-04-21) |
+|---|---|---|---|
+| `journal.ts` | 506 | **85.26%** | −2.50pp |
+| `lib.ts` | 818 | **85.01%** | +0.23pp |
+| `manifest.ts` | 196 | **92.02%** | −0.04pp |
+| `policy.ts` | 340 | **73.91%** | **−4.09pp** |
+| **All files** | **1 860** | **83.46%** | −1.76pp |
+
+**Drift note:** overall fell 1.76pp but stays above the 80 gate (the ~5pp margin
+the gate was designed to absorb). `policy.ts` dropped 4.09pp to 73.91% — the
+v0.10 tier-aware `evaluate()` + cross-tier shadow logic (`ccsc-8pw`, `ccsc-4g8`)
+added branches without matching mutation-killing tests. Survivor-kill follow-up
+tracked in **`ccsc-mut1`** (policy.ts mutation drift). Not a gate failure;
+flagged so the trend doesn't silently erode toward the 80 floor.
+
 `manifest.ts` leads at 92.06% — Epic 31-B's Zod schema + strict subset validation produces easily-killable mutants. `journal.ts` second at 87.76%. `lib.ts` at 84.78% matches the post-y4e intermediate run within noise. `policy.ts` is the outlier at 78.00% — below `high` but above `low: 60`. The surviving mutants cluster on error-string literals inside `detectShadowing` / `detectBroadAutoApprove` warnings — the behavior (warn on shadow / footgun) is fully exercised, but the exact warning text isn't asserted bit-for-bit.
 
 **Follow-up:** strengthening `policy.ts` warning-message assertions is a reasonable P3 follow-up — the primitive is exercised, the text isn't. Not urgent; the mutation score is above the `low` threshold and the behavior coverage is strong.
