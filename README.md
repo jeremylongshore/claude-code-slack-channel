@@ -134,7 +134,7 @@ Full troubleshooting matrix (10 failure modes): [`skills/install/references/trou
 
 ## Policy Engine (v0.6.0+)
 
-Author rules in `access.json.policy` to automate permission decisions for Claude Code tool calls. Three rule effects, first-applicable ordering:
+Author rules in `access.json.policy` to automate permission decisions for Claude Code tool calls. Three rule effects, evaluated strictest-tier-first then first-applicable within a tier (detailed below):
 
 ```json
 {
