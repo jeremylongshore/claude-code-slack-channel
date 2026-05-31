@@ -67,7 +67,7 @@ box now OOM-kills a full run). **Result: PASS** — overall **83.46%**, above th
 the gate was designed to absorb). `policy.ts` dropped 4.09pp to 73.91% — the
 v0.10 tier-aware `evaluate()` + cross-tier shadow logic (`ccsc-8pw`, `ccsc-4g8`)
 added branches without matching mutation-killing tests. Survivor-kill follow-up
-tracked in **`ccsc-mut1`** (policy.ts mutation drift). Not a gate failure;
+tracked in **`ccsc-2et`** (policy.ts mutation drift). Not a gate failure;
 flagged so the trend doesn't silently erode toward the 80 floor.
 
 `manifest.ts` leads at 92.06% — Epic 31-B's Zod schema + strict subset validation produces easily-killable mutants. `journal.ts` second at 87.76%. `lib.ts` at 84.78% matches the post-y4e intermediate run within noise. `policy.ts` is the outlier at 78.00% — below `high` but above `low: 60`. The surviving mutants cluster on error-string literals inside `detectShadowing` / `detectBroadAutoApprove` warnings — the behavior (warn on shadow / footgun) is fully exercised, but the exact warning text isn't asserted bit-for-bit.
