@@ -68,7 +68,34 @@ the gate was designed to absorb). `policy.ts` dropped 4.09pp to 73.91% — the
 v0.10 tier-aware `evaluate()` + cross-tier shadow logic (`ccsc-8pw`, `ccsc-4g8`)
 added branches without matching mutation-killing tests. Survivor-kill follow-up
 tracked in **`ccsc-2et`** (policy.ts mutation drift). Not a gate failure;
-flagged so the trend doesn't silently erode toward the 80 floor.
+flagged so the trend doesn't silently erode toward the 80 floor. **Resolved in
+the next run — see below.**
+
+### CI-validated run (2026-06-01, GitHub runner — after `ccsc-2et` survivor-kill tests)
+
+Re-validation after PR #205 (merged `afae4b4`) added 23 targeted mutation-killing
+tests to `server.test.ts`. Survivors were extracted from the json reporter's
+`mutation.json` (PR #203) — real per-mutant data, clustered on `matchesIntersect`
+field-boundary guards (695-705), `matchSubsetOrEqual` subset branches via
+`detectShadowing` (648-664), exact warning/violation message text (608/765/811-813),
+the cross-tier admin-skip (624), the approval-TTL `>` boundary (427), the
+`checkMonotonicity` deny-filter (752), and `policyDigest` order-independence (548).
+**Result: PASS** — overall **86.72%**, well above the `break: 80` gate. Stryker
+exited 0 (`Mutation` workflow run `26730834576`, conclusion success).
+
+| File | Mutants | Score (CI 2026-06-01) | vs prior CI (2026-05-31) |
+|---|---|---|---|
+| `journal.ts` | 506 | **85.26%** | ±0.00pp |
+| `lib.ts` | 818 | **85.01%** | ±0.00pp |
+| `manifest.ts` | 196 | **92.02%** | ±0.00pp |
+| `policy.ts` | 460 | **89.78%** | **+15.87pp** |
+| **All files** | **2 020** | **86.72%** | **+3.26pp** |
+
+**`policy.ts` recovered from 73.91% → 89.78%** (survivors 120 → 47), clearing both
+the original 78.00% baseline target and the `high: 80` threshold. Overall rose
+3.26pp to 86.72%. `ccsc-2et` closed on this measured result. The other three files
+are unchanged (the tests only touched `policy.ts` coverage; mutant counts on those
+files match the prior run exactly).
 
 `manifest.ts` leads at 92.06% — Epic 31-B's Zod schema + strict subset validation produces easily-killable mutants. `journal.ts` second at 87.76%. `lib.ts` at 84.78% matches the post-y4e intermediate run within noise. `policy.ts` is the outlier at 78.00% — below `high` but above `low: 60`. The surviving mutants cluster on error-string literals inside `detectShadowing` / `detectBroadAutoApprove` warnings — the behavior (warn on shadow / footgun) is fully exercised, but the exact warning text isn't asserted bit-for-bit.
 
