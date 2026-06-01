@@ -10317,6 +10317,315 @@ describe('detectShadowing (ccsc-4g8) — backward compatibility', () => {
 })
 
 // ---------------------------------------------------------------------------
+// policy.ts mutation-survivor kills (ccsc-2et)
+// ---------------------------------------------------------------------------
+//
+// Targets the real surviving mutants from the CI Mutation run that dropped
+// policy.ts to 73.91% (000-docs/MUTATION_REPORT.md, 2026-05-31). Survivors
+// were extracted from the json reporter's mutation.json (ccsc-2et). The
+// v0.10 tier-aware rewrite (ccsc-8pw / ccsc-4g8) added decision branches to
+// matchesIntersect / matchSubsetOrEqual / evaluate without enough
+// negative-path + boundary + exact-message assertions. Each test below names
+// the source line(s) and mutator family it kills so a future reader can map
+// the assertion back to the survivor it was written for.
+
+describe('matchesIntersect — field-boundary survivor kills (ccsc-2et)', () => {
+  // Lines 695/696/700: `a.X !== undefined && b.X !== undefined && a.X !== b.X`.
+  // Existing tests only exercised tool-equal-both-sides; the ConditionalExpression,
+  // EqualityOperator, and LogicalOperator mutants on the tool/channel/actor
+  // guards survived because no test drove "both set and DIFFER" or "one side only".
+
+  test('different tool on both sides — non-intersecting (line 695)', () => {
+    // Kills 695 `a.tool !== b.tool` → `===` and the conditional → true mutant.
+    expect(matchesIntersect({ tool: 'Bash' }, { tool: 'Write' })).toBe(false)
+  })
+
+  test('tool only on one side — intersects (line 695 undefined guards)', () => {
+    // Kills the `a.tool !== undefined && b.tool !== undefined` → `||` logical
+    // mutant: with b.tool unset the && short-circuits (no false-return), but the
+    // || mutant would proceed to `a.tool !== b.tool` (Bash !== undefined) → false.
+    expect(matchesIntersect({ tool: 'Bash' }, { channel: 'C001' })).toBe(true)
+  })
+
+  test('different channel on both sides — non-intersecting (line 696)', () => {
+    expect(
+      matchesIntersect({ tool: 'Bash', channel: 'C001' }, { tool: 'Bash', channel: 'C002' }),
+    ).toBe(false)
+  })
+
+  test('channel only on one side — intersects (line 696 undefined guards)', () => {
+    expect(matchesIntersect({ channel: 'C001' }, { tool: 'Bash' })).toBe(true)
+  })
+
+  test('different actor on both sides — non-intersecting (line 700)', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'claude_process' },
+      ),
+    ).toBe(false)
+  })
+
+  test('actor only on one side — intersects (line 700 undefined guards)', () => {
+    expect(matchesIntersect({ actor: 'session_owner' }, { tool: 'Bash' })).toBe(true)
+  })
+
+  test('pathPrefix only on one side — intersects (line 702 `&&` → `||`)', () => {
+    // Kills 702 `a.pathPrefix !== undefined && b.pathPrefix !== undefined` → `||`:
+    // with b unset the && skips the block (return true); the || mutant enters and
+    // dereferences b.pathPrefix.startsWith → throws / wrong-answer.
+    expect(matchesIntersect({ tool: 'Write', pathPrefix: '/home/a' }, { tool: 'Write' })).toBe(true)
+  })
+
+  test('a is the longer pathPrefix, b is its prefix — intersects (line 705)', () => {
+    // The existing "one prefixes the other" test put the SHORTER path in `a`,
+    // so the `!a.startsWith(b + sep)` clause on line 705 was always vacuously
+    // true and its ArithmeticOperator (`b.pathPrefix - sep`) and MethodExpression
+    // (`startsWith` → `endsWith`) mutants survived. Reversing the order makes
+    // line 705 the load-bearing clause.
+    expect(
+      matchesIntersect(
+        { tool: 'Write', pathPrefix: '/home/jeremy/projects' },
+        { tool: 'Write', pathPrefix: '/home/jeremy' },
+      ),
+    ).toBe(true)
+  })
+})
+
+describe('matchSubsetOrEqual via detectShadowing — within-tier subset survivor kills (ccsc-2et)', () => {
+  // matchSubsetOrEqual is private; it is reached through detectShadowing's
+  // Pass-1 within-tier subset check (default-tier rules, broader rule first).
+  // Lines 648 (actor), 650-657 (pathPrefix), 661-664 (argEquals) had
+  // Equality/Conditional/Logical/Method/Arithmetic survivors because the
+  // existing corpus exercised only the tool+channel subset path.
+
+  const withinTier = (earlier: Record<string, unknown>, later: Record<string, unknown>): number => {
+    const rules = [
+      { id: 'earlier', priority: 100, effect: 'auto_approve', match: earlier },
+      { id: 'later', priority: 100, effect: 'auto_approve', match: later },
+    ] as PolicyRule[]
+    return detectShadowingDirect(rules).filter((w) => !w.crossTier).length
+  }
+
+  // ── actor (line 648) ──
+  test('equal actor → earlier shadows later (line 648 `!==` → `===`)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'session_owner' },
+      ),
+    ).toBe(1)
+  })
+
+  test('different actor → no shadow (line 648 EqualityOperator)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'claude_process' },
+      ),
+    ).toBe(0)
+  })
+
+  // ── pathPrefix (lines 650-657) ──
+  test('earlier path is a prefix of later → shadow (lines 654-655)', () => {
+    expect(
+      withinTier({ tool: 'Write', pathPrefix: '/home' }, { tool: 'Write', pathPrefix: '/home/x' }),
+    ).toBe(1)
+  })
+
+  test('earlier constrains pathPrefix, later does not → no shadow (line 651)', () => {
+    // Kills the `inner.pathPrefix === undefined` → conditional/false mutant.
+    expect(withinTier({ tool: 'Write', pathPrefix: '/home' }, { tool: 'Write' })).toBe(0)
+  })
+
+  test('disjoint pathPrefixes → no shadow (lines 654-655 startsWith/+sep)', () => {
+    expect(
+      withinTier(
+        { tool: 'Write', pathPrefix: '/home/a' },
+        { tool: 'Write', pathPrefix: '/home/b' },
+      ),
+    ).toBe(0)
+  })
+
+  // ── argEquals (lines 661-664) ──
+  test('equal argEquals → shadow (line 664 jsonEqual true path)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+      ),
+    ).toBe(1)
+  })
+
+  test('earlier constrains argEquals, later does not → no shadow (line 662)', () => {
+    expect(withinTier({ tool: 'Bash', argEquals: { cmd: 'ls' } }, { tool: 'Bash' })).toBe(0)
+  })
+
+  test('argEquals value disagreement → no shadow (line 664 jsonEqual false path)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'rm' } },
+      ),
+    ).toBe(0)
+  })
+})
+
+describe('policy warning/decision exact-text + boundary survivor kills (ccsc-2et)', () => {
+  test('within-tier shadow message is exact (line 608 StringLiteral)', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      { id: 'r1', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      { id: 'r2', priority: 100, effect: 'auto_approve', match: { tool: 'Bash', channel: 'C001' } },
+    ] as PolicyRule[]
+    const warnings = detectShadowing(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toBe(
+      "rule 'r2' is shadowed by earlier rule 'r1' — every call the later rule would match is already caught by the earlier one",
+    )
+  })
+
+  test('checkMonotonicity violation message is exact (line 765 StringLiteral)', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [
+      {
+        id: 'deny-all',
+        priority: 100,
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      },
+    ] as PolicyRule[]
+    const next = [
+      {
+        id: 'deny-all',
+        priority: 100,
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      },
+      {
+        id: 'allow-pdf',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'upload_file', argEquals: { mime: 'pdf' } },
+      },
+    ] as PolicyRule[]
+    const violations = checkMonotonicity(prev, next)
+    expect(violations).toHaveLength(1)
+    expect(violations[0]!.message).toBe(
+      "new auto_approve rule 'allow-pdf' weakens existing deny 'deny-all' — reload refused",
+    )
+  })
+
+  test('detectBroadAutoApprove message is exact (lines 811-813 StringLiterals)', async () => {
+    const { detectBroadAutoApprove } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'too-broad',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { actor: 'claude_process' },
+      },
+    ] as PolicyRule[]
+    const warnings = detectBroadAutoApprove(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toBe(
+      "auto_approve rule 'too-broad' has no 'tool' or 'pathPrefix' in its match — " +
+        'this rule auto-approves ANY tool call within its scope, which is almost always ' +
+        'a misconfiguration. Narrow the rule or convert to require_approval.',
+    )
+  })
+
+  test('admin auto_approve vs admin deny produces no cross-tier warning (line 624 `=== admin`)', async () => {
+    // Pass-2 skips lower-tier auto_approve only AFTER the `effectiveTier === 'admin'`
+    // continue. The StringLiteral mutant ('admin' → "") would stop skipping admin
+    // rules and wrongly emit a cross-tier warning for an admin/admin pair.
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'admin-deny',
+        priority: 100,
+        effect: 'deny',
+        reason: 'locked',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+      {
+        id: 'admin-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+    ] as PolicyRule[]
+    const warnings = detectShadowing(rules)
+    expect(warnings.filter((w) => w.crossTier === true)).toEqual([])
+  })
+
+  test('approval exactly at expiry millisecond does NOT allow (line 427 `>` → `>=`)', async () => {
+    const { evaluate, approvalKey } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'r1',
+        priority: 100,
+        effect: 'require_approval',
+        ttlMs: 60_000,
+        match: { tool: 'reply' },
+      },
+    ] as PolicyRule[]
+    // now === ttlExpires === 1000: `ttlExpires > now` is false (expired), so the
+    // decision must be `require`. The `>=` mutant would flip this to `allow`.
+    const approvals = new Map([
+      [approvalKey('r1', { channel: 'C_CHAN', thread: 'T1.0' }), { ttlExpires: 1_000 }],
+    ])
+    const decision = evaluate(
+      {
+        tool: 'reply',
+        input: {},
+        sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+        actor: 'claude_process',
+      },
+      rules,
+      1_000,
+      { approvals },
+    )
+    expect(decision.kind).toBe('require')
+  })
+
+  test('checkMonotonicity only compares against existing DENY rules (line 752 `.filter`)', async () => {
+    // A broad auto_approve in prev + a narrower auto_approve added in next must
+    // NOT be a violation — only deny-weakening is. The `.filter(deny)` → bare
+    // `prev` mutant would compare the new rule against the prev auto_approve and
+    // emit a false violation.
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [
+      { id: 'broad-allow', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+    ] as PolicyRule[]
+    const next = [
+      { id: 'broad-allow', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      {
+        id: 'new-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', channel: 'C001' },
+      },
+    ] as PolicyRule[]
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('policyDigest is independent of authoring order (line 548 sort comparator)', async () => {
+    // The sort-by-id comparator makes the digest a content fingerprint, not an
+    // order fingerprint. A comparator that always returns 0 (ConditionalExpression
+    // mutants) would leave the array in input order → different digests.
+    const { policyDigest } = await import('./policy.ts')
+    const a = { id: 'aaa', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } }
+    const b = { id: 'bbb', priority: 100, effect: 'deny', reason: 'x', match: { tool: 'Write' } }
+    const rulesAB = [a, b] as PolicyRule[]
+    const rulesBA = [b, a] as PolicyRule[]
+    expect(policyDigest(rulesAB)).toBe(policyDigest(rulesBA))
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Journal v2 signing + verifier (ccsc-22l)
 // ---------------------------------------------------------------------------
 
