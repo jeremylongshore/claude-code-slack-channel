@@ -60,6 +60,13 @@ interface SessionConfig {
 interface SupervisorConfig {
   checkIntervalMs: number
   minRespawnMs: number
+  /** Grace window after a (re)spawn during which a live-but-unregistered tmux
+   *  session is assumed to still be booting (claude cold start + channel
+   *  connect), NOT dead. Prevents killing sessions before they can register. */
+  bootGraceMs: number
+  /** Cap on how many sessions to (re)spawn per tick, to avoid a cold-start
+   *  storm when several sessions need launching at once. */
+  maxSpawnPerTick: number
   routerPort: number
   router: { enabled: boolean }
   claudeBin: string
@@ -79,6 +86,8 @@ function defaultConfig(): SupervisorConfig {
   return {
     checkIntervalMs: 5000,
     minRespawnMs: 20_000,
+    bootGraceMs: 90_000,
+    maxSpawnPerTick: 2,
     routerPort: 8801,
     router: { enabled: true },
     claudeBin: 'claude',
@@ -148,6 +157,37 @@ function tmuxKill(name: string): void {
     /* not running */
   }
 }
+function tmuxCapture(name: string): string {
+  try {
+    return execFileSync('tmux', ['capture-pane', '-t', name, '-p'], { encoding: 'utf8' })
+  } catch {
+    return ''
+  }
+}
+function tmuxSend(name: string, keys: string): void {
+  try {
+    execFileSync('tmux', ['send-keys', '-t', name, keys], { stdio: 'ignore' })
+  } catch {
+    /* pane gone */
+  }
+}
+const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+
+/** `--dangerously-load-development-channels` shows a one-time interactive
+ *  confirmation ("1. I am using this for local development / Enter to confirm").
+ *  Option 1 is preselected, so a bare Enter accepts it. We poll the pane and
+ *  send Enter when the prompt appears. Fire-and-forget. */
+async function confirmDevChannelPrompt(tmuxName: string): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    await delay(1500)
+    const pane = tmuxCapture(tmuxName)
+    if (!pane) return // pane gone
+    if (/Loading development channels|local development|Enter to confirm/i.test(pane)) {
+      tmuxSend(tmuxName, 'Enter')
+      return
+    }
+  }
+}
 
 async function routerHealth(port: number): Promise<{ sessions: Array<{ name: string }> } | null> {
   try {
@@ -197,7 +237,8 @@ function buildLaunch(cfg: SupervisorConfig, s: SessionConfig, tmuxName: string):
     .replaceAll('{extra}', extra)
 }
 
-function ensureSession(cfg: SupervisorConfig, s: SessionConfig, healthyNames: Set<string>): void {
+/** Returns true if it (re)spawned this tick. */
+function ensureSession(cfg: SupervisorConfig, s: SessionConfig, healthyNames: Set<string>): boolean {
   const tmuxName = `slack-${s.name}`
   if (!state.sessions[s.name]) {
     state.sessions[s.name] = { sessionId: randomUUID(), spawnedOnce: false, lastSpawnAt: 0 }
@@ -205,13 +246,27 @@ function ensureSession(cfg: SupervisorConfig, s: SessionConfig, healthyNames: Se
   }
   const st = state.sessions[s.name]
 
-  const healthy = tmuxHas(tmuxName) && healthyNames.has(s.name)
-  if (healthy) return
+  // Registered + live in the router = healthy. Mark spawnedOnce here (NOT at
+  // spawn time) — only once a session has actually registered do we know its
+  // conversation exists, so future respawns can safely --resume it. Marking it
+  // at spawn caused --resume against a never-created conversation after a crash.
+  if (healthyNames.has(s.name)) {
+    if (!st.spawnedOnce) {
+      st.spawnedOnce = true
+      saveState()
+    }
+    return false
+  }
 
   const now = Date.now()
-  if (now - st.lastSpawnAt < cfg.minRespawnMs) return // backoff
+  const tmuxAlive = tmuxHas(tmuxName)
+  // Live tmux but not yet registered → still booting (claude cold start +
+  // channel connect). Be patient up to bootGraceMs before assuming it's wedged.
+  if (tmuxAlive && now - st.lastSpawnAt < cfg.bootGraceMs) return false
+  // Hard floor between (re)spawns.
+  if (now - st.lastSpawnAt < cfg.minRespawnMs) return false
 
-  // Clear a stale/half-dead tmux session before recreating.
+  // tmux crashed, or alive-but-wedged past the grace → (re)spawn.
   tmuxKill(tmuxName)
   const launch = buildLaunch(cfg, s, tmuxName)
   try {
@@ -219,12 +274,13 @@ function ensureSession(cfg: SupervisorConfig, s: SessionConfig, healthyNames: Se
     execFileSync('tmux', ['send-keys', '-t', tmuxName, launch, 'Enter'], { stdio: 'ignore' })
   } catch (err) {
     log(`failed to (re)spawn session "${s.name}": ${err}`)
-    return
+    return false
   }
-  st.spawnedOnce = true
+  void confirmDevChannelPrompt(tmuxName) // auto-answer the dev-channel warning
   st.lastSpawnAt = now
   saveState()
-  log(`(re)spawned session "${s.name}" in tmux "${tmuxName}" (${s.resume ? 'resume' : 'fresh'})`)
+  log(`(re)spawned session "${s.name}" in tmux "${tmuxName}" (${st.spawnedOnce ? 'resume' : 'fresh'})`)
+  return true
 }
 
 // ── Tick ──────────────────────────────────────────────────────────────────────
@@ -232,7 +288,14 @@ async function tick(cfg: SupervisorConfig): Promise<void> {
   ensureRouter(cfg)
   const health = await routerHealth(cfg.routerPort)
   const healthyNames = new Set((health?.sessions ?? []).map(x => x.name))
-  for (const s of cfg.sessions) ensureSession(cfg, s, healthyNames)
+  let budget = cfg.maxSpawnPerTick
+  for (const s of cfg.sessions) {
+    const spawned = ensureSession(cfg, s, healthyNames)
+    if (spawned) {
+      budget--
+      if (budget <= 0) break // stagger remaining (re)spawns to the next tick
+    }
+  }
 }
 
 // ── Subcommands ────────────────────────────────────────────────────────────────
