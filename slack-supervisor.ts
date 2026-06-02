@@ -33,7 +33,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,6 +42,7 @@ import { randomUUID } from 'node:crypto'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROUTER_DIR = join(homedir(), '.claude', 'slack-router')
 const STATE_FILE = join(ROUTER_DIR, 'supervisor-state.json')
+const PIDFILE = join(ROUTER_DIR, 'supervisor.pid')
 mkdirSync(ROUTER_DIR, { recursive: true })
 
 function log(msg: string): void {
@@ -70,17 +71,25 @@ interface SupervisorConfig {
   routerPort: number
   router: { enabled: boolean }
   claudeBin: string
+  /** Path to the minimal --mcp-config JSON defining only the slack-session
+   *  server (used by {mcpConfig} in the launch template). */
+  mcpConfigPath: string
   /** Template for the claude launch line run inside tmux. Placeholders:
-   *  {cwd} {name} {bind} {tmux} {routerPort} {claudeBin} {resumeArg} {extra} */
+   *  {cwd} {name} {bind} {tmux} {routerPort} {claudeBin} {mcpConfig} {resumeArg} {extra} */
   launchTemplate: string
   skipPermissions: boolean
   sessions: SessionConfig[]
 }
 
+// Slim launch: --strict-mcp-config + --mcp-config loads ONLY slack-session and
+// ignores all the user's plugins (telegram/discord/forma-memory/m365), so each
+// session is lightweight. Without this, every session drags in the full plugin
+// set as heavy MCP servers.
 const DEFAULT_TEMPLATE =
-  'cd {cwd} && SLACK_MULTISESSION=1 SESSION_NAME={name} SLACK_BIND={bind} ' +
+  'cd {cwd} && SESSION_NAME={name} SLACK_BIND={bind} ' +
   'SLACK_TMUX_SESSION={tmux} ROUTER_PORT={routerPort} ' +
-  '{claudeBin} --dangerously-load-development-channels server:slack-session {resumeArg} {extra}'
+  '{claudeBin} --strict-mcp-config --mcp-config {mcpConfig} ' +
+  '--dangerously-load-development-channels server:slack-session {resumeArg} {extra}'
 
 function defaultConfig(): SupervisorConfig {
   return {
@@ -91,6 +100,7 @@ function defaultConfig(): SupervisorConfig {
     routerPort: 8801,
     router: { enabled: true },
     claudeBin: 'claude',
+    mcpConfigPath: join(ROUTER_DIR, 'slack-session.mcp.json'),
     launchTemplate: DEFAULT_TEMPLATE,
     skipPermissions: false,
     sessions: [],
@@ -233,6 +243,7 @@ function buildLaunch(cfg: SupervisorConfig, s: SessionConfig, tmuxName: string):
     .replaceAll('{tmux}', tmuxName)
     .replaceAll('{routerPort}', String(cfg.routerPort))
     .replaceAll('{claudeBin}', cfg.claudeBin)
+    .replaceAll('{mcpConfig}', cfg.mcpConfigPath)
     .replaceAll('{resumeArg}', resumeArg)
     .replaceAll('{extra}', extra)
 }
@@ -340,9 +351,37 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'status') return status(cfg)
-  if (cmd === 'down') return down(cfg)
+  if (cmd === 'down') {
+    down(cfg)
+    try {
+      unlinkSync(PIDFILE)
+    } catch {
+      /* none */
+    }
+    return
+  }
 
-  // up
+  // up — singleton guard: refuse to start if another supervisor is alive.
+  // Without this, repeated launches stack up (each spawns its own router and
+  // fights over the same tmux sessions) — a runaway cascade.
+  if (existsSync(PIDFILE)) {
+    const oldPid = Number(readFileSync(PIDFILE, 'utf8').trim())
+    if (pidAlive(oldPid)) {
+      log(`another supervisor is already running (pid ${oldPid}). Refusing to start a second one.`)
+      log(`Stop it first:  ./node_modules/.bin/tsx slack-supervisor.ts down   (or: kill ${oldPid})`)
+      process.exit(1)
+    }
+  }
+  writeFileSync(PIDFILE, String(process.pid))
+  const clearPidfile = () => {
+    try {
+      unlinkSync(PIDFILE)
+    } catch {
+      /* already gone */
+    }
+  }
+  process.on('exit', clearPidfile)
+
   log(`supervising (router:${cfg.router.enabled} sessions:${cfg.sessions.length} interval:${cfg.checkIntervalMs}ms)`)
   await tick(cfg)
   if (once) return
