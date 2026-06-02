@@ -8,6 +8,7 @@
     "start": "bun install --frozen-lockfile --no-summary && bun server.ts",
     "start:node": "npx tsx server.ts",
     "router": "npx tsx slack-router.ts",
+    "supervisor": "npx tsx slack-supervisor.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "prepare": "husky"

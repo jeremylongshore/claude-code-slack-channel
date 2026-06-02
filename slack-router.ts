@@ -555,7 +555,11 @@ const http = createServer((req, res) => {
   void (async () => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     if (req.method === 'GET' && url.pathname === '/health') {
-      return sendJson(res, 200, { ok: true, sessions: Object.keys(state.sessions) })
+      // Live sessions only (ground truth for the supervisor) + current bindings.
+      const live = Object.values(state.sessions)
+        .filter(isAlive)
+        .map(s => ({ name: s.name, pid: s.pid, claims: s.claims }))
+      return sendJson(res, 200, { ok: true, sessions: live, bindings: state.bindings })
     }
     if (req.method !== 'POST') {
       res.writeHead(404)

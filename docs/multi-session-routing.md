@@ -151,6 +151,24 @@ resolution rule. (Mirrors the reference's reaper.)
 - **Phase 3** — `react`/`edit`/`fetch` parity; tests (extend `server.test.ts`);
   update the `install` skill + README; bump version; tracking notes.
 
+## Operations: the supervisor
+
+`slack-supervisor.ts` keeps everything alive (config: `~/.claude/slack-router/supervisor.json`, sample `supervisor.example.json`):
+
+- **Router** — run as a direct detached child (a plain server; no pty needed). Liveness via pid + `/health`. Respawned if dead.
+- **Sessions** — each launched inside a **tmux** window `slack-<name>` (a long-lived `claude` channel session needs a persistent pty; tmux also matches the plugin's `SLACK_TMUX_SESSION` admin path). A session is *healthy* only when its tmux window exists **and** it is registered+live in the router `/health` — that proves the whole chain (claude → slack-session MCP → registered). Respawn has a `minRespawnMs` backoff to avoid thrash.
+- **Resume** — each configured session gets a stable UUID. First launch uses `--session-id <uuid>`; every respawn uses `--resume <uuid>`, so the conversation persists across crashes.
+- **Subcommands** — `up` (supervise forever), `status` (one snapshot), `down` (stop router + kill session tmux windows). `--once` runs a single tick.
+
+Verified: router spawn/health/teardown work end to end. Session (tmux) path is structurally validated; full exercise needs tmux installed + a live channel session.
+
+### Claude-Code constraints (verified against v2.1.160)
+
+- `--dangerously-load-development-channels` is **required every launch** for a non-official (local) channel; there is **no** user-level settings/env allowlist (only org-managed `allowedChannelPlugins`). The supervisor always passes it.
+- The channels flags are hidden from `claude --help` (Research Preview), so the launch line is a configurable `launchTemplate`, defaulting to the reference repo's `claude --dangerously-load-development-channels server:slack-session`.
+- Sessions register the channel as a **user MCP server** (`claude mcp add -s user slack-session -- <tsx> slack-session.ts`) and load it via `server:slack-session` — no plugin install needed on the session side. (The `plugin:` + `slack-entry.ts` path remains for the plugin-install UX.)
+- `--bg` does **not** exist; background-agent is a separate subcommand. Persistent sessions = tmux.
+
 ## Open questions
 
 - Conflict policy when two sessions both declare `SLACK_BIND` for the same

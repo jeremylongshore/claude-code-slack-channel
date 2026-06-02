@@ -1,0 +1,24 @@
+{
+  "checkIntervalMs": 5000,
+  "minRespawnMs": 20000,
+  "routerPort": 8801,
+  "router": { "enabled": true },
+  "claudeBin": "claude",
+  "skipPermissions": false,
+  "launchTemplate": "cd {cwd} && SLACK_MULTISESSION=1 SESSION_NAME={name} SLACK_BIND={bind} SLACK_TMUX_SESSION={tmux} ROUTER_PORT={routerPort} {claudeBin} --dangerously-load-development-channels server:slack-session {resumeArg} {extra}",
+  "sessions": [
+    {
+      "name": "forma",
+      "cwd": "/Users/you/code/forma",
+      "bind": ["C0123FORMA"],
+      "resume": true
+    },
+    {
+      "name": "2brain",
+      "cwd": "/Users/you/code/second-brain",
+      "bind": ["C0456BRAIN"],
+      "resume": true,
+      "extraArgs": ""
+    }
+  ]
+}
