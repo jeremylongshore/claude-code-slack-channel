@@ -146,10 +146,14 @@ resolution rule. (Mirrors the reference's reaper.)
 - **Phase 1** — router/session split; per-**channel** binding via `!bind` +
   `SLACK_BIND`; `reply` (text, chunked); `!sessions`/`!route`/`!unbind`/
   `!default`; single-session mode preserved.
-- **Phase 2** — per-**thread** binding override; permission relay; file
-  attachments; streaming-reply parity; router auto-spawn.
-- **Phase 3** — `react`/`edit`/`fetch` parity; tests (extend `server.test.ts`);
-  update the `install` skill + README; bump version; tracking notes.
+- **Phase 2 (done)** — outbound file attachments (`reply` `files`, exfil-guarded
+  via `assertSendable`/`INBOX_DIR`/`SLACK_SENDABLE_ROOTS`); `download_attachment`
+  (fetch Slack files with the bot token, `isSlackFileUrl`-validated, into
+  `INBOX_DIR`); streaming replies (`stream` → progressive `chat.update` via
+  `streamReply`). Per-thread binding override + permission relay landed in Phase 1.
+  **Deferred:** router auto-spawn — the supervisor already guarantees the router's
+  lifecycle, so a session auto-spawning it is low value and adds race risk.
+- **Phase 3** — tests (extend `server.test.ts`); bump version; tracking notes.
 
 ## Operations: the supervisor
 

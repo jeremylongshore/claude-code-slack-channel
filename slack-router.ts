@@ -33,7 +33,7 @@ import {
   chmodSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve, basename } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import {
   gate as libGate,
@@ -43,11 +43,16 @@ import {
   deliveredThreadKey,
   sanitizeDisplayName,
   sanitizeFilename,
+  assertSendable as libAssertSendable,
+  parseSendableRoots,
+  validateSendableRoots,
+  isSlackFileUrl,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   type Access,
   type GateResult,
 } from './lib.ts'
+import { streamReply } from './stream-reply.ts'
 
 // ── Paths & config ────────────────────────────────────────────────────────────
 const ROUTER_PORT = Number(process.env.ROUTER_PORT ?? 8801)
@@ -58,11 +63,30 @@ const ROUTER_DIR = join(homedir(), '.claude', 'slack-router')
 const STATE_FILE = join(ROUTER_DIR, 'state.json')
 const STATIC_MODE = (process.env.SLACK_ACCESS_MODE || '').toLowerCase() === 'static'
 const CHUNK_LIMIT = 3800 // Slack hard cap is 4000 chars/message; leave headroom.
+const INBOX_DIR = join(STATE_DIR, 'inbox')
+// File-exfil allowlist: roots beyond INBOX_DIR the reply tool may attach from
+// (colon-separated absolute paths via SLACK_SENDABLE_ROOTS). Default: inbox only.
+const SENDABLE_ROOTS = parseSendableRoots(process.env.SLACK_SENDABLE_ROOTS)
 
 mkdirSync(ROUTER_DIR, { recursive: true })
+mkdirSync(INBOX_DIR, { recursive: true })
 
 function log(msg: string): void {
   process.stderr.write(`slack-router: ${msg}\n`)
+}
+
+try {
+  validateSendableRoots(SENDABLE_ROOTS)
+} catch (e) {
+  log(`invalid SLACK_SENDABLE_ROOTS: ${e}`)
+  process.exit(1)
+}
+
+/** File-exfil guard: reply attachments must resolve inside INBOX_DIR or a
+ *  configured sendable root, and never inside the state dir / denylisted dirs.
+ *  Throws on violation. (Mirrors server.ts's guard, reusing lib.assertSendable.) */
+function assertSendable(filePath: string): void {
+  libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS, STATE_DIR)
 }
 
 // ── Tokens (same loader contract as server.ts) ───────────────────────────────
@@ -268,6 +292,62 @@ async function sendReply(args: {
     last = (res.ts as string) || last
   }
   return chunks.length === 1 ? `sent (ts: ${last})` : `sent ${chunks.length} parts (last ts: ${last})`
+}
+
+/** Upload attachment files to a channel/thread (exfil-guarded). */
+async function uploadFiles(
+  files: readonly string[],
+  chatId: string,
+  threadTs: string | undefined,
+): Promise<void> {
+  for (const filePath of files) {
+    assertSendable(filePath) // throws on exfil violation
+    const resolved = resolve(filePath)
+    const uploadArgs: Record<string, unknown> = {
+      channel_id: chatId,
+      file: resolved,
+      filename: basename(resolved),
+    }
+    if (threadTs) uploadArgs.thread_ts = threadTs
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await web.filesUploadV2(uploadArgs as any)
+  }
+}
+
+/** Progressive reply: one message that grows via chat.update (reuses
+ *  stream-reply.ts). The router has already gated the destination, so the
+ *  outbound check + journal deps are no-ops here. */
+async function streamReplyToSlack(
+  chatId: string,
+  threadTs: string | undefined,
+  text: string,
+): Promise<string> {
+  const result = await streamReply(
+    { channel: chatId, threadTs, text, chunkSize: CHUNK_LIMIT },
+    {
+      assertOutboundAllowed: () => {},
+      postMessage: async a => {
+        const res = await web.chat.postMessage({
+          channel: a.channel,
+          text: a.text,
+          thread_ts: a.thread_ts,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+        const ts = res.ts as string | undefined
+        if (!ts) throw new Error('chat.postMessage returned no ts')
+        return { ts }
+      },
+      updateMessage: async a => {
+        await web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
+      },
+      journalWrite: async () => {},
+      sleep: ms => new Promise<void>(r => setTimeout(r, ms)),
+    },
+  )
+  if (result.kind === 'gate_rejected_at_start') throw new Error(`stream rejected: ${result.reason}`)
+  const suffix = result.kind === 'failed_mid_stream' ? ` (failed mid-stream: ${result.reason})` : ''
+  return `streamed ${result.chunksSent} chunk(s) (ts: ${result.ts})${suffix}`
 }
 
 // ── Permission relay state ────────────────────────────────────────────────────
@@ -620,16 +700,26 @@ const http = createServer((req, res) => {
           return sendJson(res, 200, { ok: true })
         }
         case '/reply': {
-          const { session, chat_id, thread_ts, text } = body as {
+          const { session, chat_id, thread_ts, text, files, stream } = body as {
             session: string
             chat_id: string
             thread_ts?: string
             text: string
+            files?: string[]
+            stream?: boolean
           }
           if (!sessionAuthorizedFor(session, chat_id, thread_ts)) {
             return sendJson(res, 403, { ok: false, error: 'session not bound to this destination' })
           }
-          const summary = await sendReply({ chat_id, thread_ts, text })
+          const textSummary =
+            stream && text.length > CHUNK_LIMIT
+              ? await streamReplyToSlack(chat_id, thread_ts, text)
+              : await sendReply({ chat_id, thread_ts, text })
+          let summary = textSummary
+          if (files && files.length > 0) {
+            await uploadFiles(files, chat_id, thread_ts) // throws on exfil violation → 500
+            summary += ` + ${files.length} file(s)`
+          }
           return sendJson(res, 200, { ok: true, text: summary })
         }
         case '/react': {
@@ -680,10 +770,41 @@ const http = createServer((req, res) => {
           return sendJson(res, 200, { ok: true, text: msgs || '(no messages)' })
         }
         case '/download_attachment': {
-          // Phase 2 — needs the file URL + auth-bearer download into the inbox dir.
+          const { session, chat_id, message_id, thread_ts } = body as {
+            session: string
+            chat_id: string
+            message_id: string
+            thread_ts?: string
+          }
+          if (!sessionAuthorizedFor(session, chat_id, thread_ts)) {
+            return sendJson(res, 403, { ok: false, error: 'session not bound to this destination' })
+          }
+          const replies = await web.conversations.replies({
+            channel: chat_id,
+            ts: message_id,
+            limit: 1,
+            inclusive: true,
+          })
+          const msg = replies.messages?.[0] as { files?: Array<Record<string, unknown>> } | undefined
+          if (!msg?.files?.length) {
+            return sendJson(res, 200, { ok: true, text: 'No files found on that message.' })
+          }
+          const paths: string[] = []
+          for (const file of msg.files) {
+            const url = (file.url_private_download || file.url_private) as string | undefined
+            if (!url || !isSlackFileUrl(url)) continue // only https files.slack.com gets the bot token
+            const safeName = sanitizeFilename((file.name as string) || `file_${message_id}`)
+            const outPath = join(INBOX_DIR, `${message_id.replace('.', '_')}_${safeName}`)
+            const resp = await fetch(url, { headers: { Authorization: `Bearer ${botToken}` } })
+            if (!resp.ok) continue
+            writeFileSync(outPath, Buffer.from(await resp.arrayBuffer()))
+            paths.push(outPath)
+          }
           return sendJson(res, 200, {
-            ok: false,
-            error: 'download_attachment is not yet supported in multi-session mode (Phase 2)',
+            ok: true,
+            text: paths.length
+              ? `Downloaded ${paths.length} file(s):\n${paths.join('\n')}`
+              : 'Failed to download any files.',
           })
         }
         case '/permission_request': {
