@@ -81,15 +81,15 @@ interface SupervisorConfig {
   sessions: SessionConfig[]
 }
 
-// Slim launch: --strict-mcp-config + --mcp-config loads ONLY slack-session and
-// ignores all the user's plugins (telegram/discord/forma-memory/m365), so each
-// session is lightweight. Without this, every session drags in the full plugin
-// set as heavy MCP servers.
+// Full-plugin launch: each session loads the user's complete plugin set
+// (forma-memory, m365, telegram, discord) plus the slack-session channel.
+// server:slack-session resolves the user-scoped MCP server registered via
+// `claude mcp add -s user slack-session`. Orphaned plugin MCP servers (left by
+// a killed/crashed session) are swept by reapOrphans() so they can't pile up.
 const DEFAULT_TEMPLATE =
   'cd {cwd} && SESSION_NAME={name} SLACK_BIND={bind} ' +
   'SLACK_TMUX_SESSION={tmux} ROUTER_PORT={routerPort} ' +
-  '{claudeBin} --strict-mcp-config --mcp-config {mcpConfig} ' +
-  '--dangerously-load-development-channels server:slack-session {resumeArg} {extra}'
+  '{claudeBin} --dangerously-load-development-channels server:slack-session {resumeArg} {extra}'
 
 function defaultConfig(): SupervisorConfig {
   return {
@@ -295,7 +295,36 @@ function ensureSession(cfg: SupervisorConfig, s: SessionConfig, healthyNames: Se
 }
 
 // ── Tick ──────────────────────────────────────────────────────────────────────
+/** Kill orphaned (PPID 1) plugin MCP servers left behind when a session's
+ *  claude was killed/crashed. Without this, plugins (esp. telegram/discord) can
+ *  spin at high CPU after their parent dies. Scoped to plugin MCP patterns;
+ *  never reaps the router or the supervisor itself. */
+function reapOrphans(): void {
+  let out = ''
+  try {
+    out = execFileSync('ps', ['-Ao', 'pid,ppid,command'], { encoding: 'utf8' })
+  } catch {
+    return
+  }
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)
+    if (!m) continue
+    const [, pid, ppid, cmd] = m
+    if (ppid !== '1') continue
+    if (/slack-router\.ts|slack-supervisor\.ts/.test(cmd)) continue // never our own management procs
+    if (/\/plugins\/cache\/|forma-memory\/mcp-server|server\.ts|slack-session\.ts/.test(cmd)) {
+      try {
+        process.kill(Number(pid), 'SIGKILL')
+        log(`reaped orphan pid ${pid}: ${cmd.slice(0, 70)}`)
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
 async function tick(cfg: SupervisorConfig): Promise<void> {
+  reapOrphans()
   ensureRouter(cfg)
   const health = await routerHealth(cfg.routerPort)
   const healthyNames = new Set((health?.sessions ?? []).map(x => x.name))
@@ -331,7 +360,8 @@ function down(cfg: SupervisorConfig): void {
   }
   state.routerPid = null
   saveState()
-  log('down: killed session tmux windows + router')
+  reapOrphans() // sweep any MCP servers orphaned by the killed sessions
+  log('down: killed session tmux windows + router + swept orphans')
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

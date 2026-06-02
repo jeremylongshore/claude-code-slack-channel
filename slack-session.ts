@@ -24,7 +24,12 @@ import { basename } from 'node:path'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-const SESSION_NAME = process.env.SESSION_NAME ?? basename(process.cwd())
+// Only sessions launched with an explicit SESSION_NAME (i.e. the supervisor's
+// channel sessions) register with the router. A stray `claude` that merely
+// loads this MCP server (via the user-scoped registration) has no SESSION_NAME
+// and stays inert — so it never pollutes the router's session registry.
+const EXPLICIT_NAME = process.env.SESSION_NAME
+const SESSION_NAME = EXPLICIT_NAME ?? basename(process.cwd())
 const ROUTER_PORT = Number(process.env.ROUTER_PORT ?? 8801)
 const ROUTER = `http://127.0.0.1:${ROUTER_PORT}`
 const CLAIMS = (process.env.SLACK_BIND ?? '')
@@ -290,17 +295,21 @@ async function registerWithRouter(): Promise<void> {
   }
 }
 
-await registerWithRouter()
+if (EXPLICIT_NAME) {
+  await registerWithRouter()
 
-// ── Heartbeat (re-register so sessions auto-reconnect if the router restarts) ─
-const heartbeat = setInterval(() => {
-  void fetch(`${ROUTER}/register`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: SESSION_NAME, port: httpPort, pid: process.pid, claims: CLAIMS }),
-  }).catch(() => {})
-}, 10_000)
-heartbeat.unref()
+  // Heartbeat (re-register so sessions auto-reconnect if the router restarts).
+  const heartbeat = setInterval(() => {
+    void fetch(`${ROUTER}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: SESSION_NAME, port: httpPort, pid: process.pid, claims: CLAIMS }),
+    }).catch(() => {})
+  }, 10_000)
+  heartbeat.unref()
+} else {
+  logErr('SESSION_NAME not set — running inert (not registering with router).')
+}
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
 let shuttingDown = false
