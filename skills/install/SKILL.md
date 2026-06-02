@@ -144,6 +144,7 @@ Ask the user if they want any of these:
 | Author a custom policy rule | `/slack-channel:policy` |
 | Enable signed audit log (Ed25519) | `bun scripts/audit-key.ts init` — see [`000-docs/key-management.md`](../../000-docs/key-management.md) |
 | Wire in a second bot (multi-agent) | See [`000-docs/multi-agent-channels.md`](../../000-docs/multi-agent-channels.md) |
+| Run multiple sessions across channels/threads | Start the router (`npm run router`), launch sessions with `SLACK_MULTISESSION=1` — see [`docs/multi-session-routing.md`](../../docs/multi-session-routing.md) |
 | Tighten access (allowlist mode) | `/slack-channel:access policy allowlist`, then `add <user-id>` per user |
 | Run a health check anytime | `/slack-channel:install doctor` |
 
