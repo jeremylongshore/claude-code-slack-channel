@@ -84,6 +84,15 @@ bunx stryker run                         # lib+policy+manifest+journal; see 000-
 claude --dangerously-load-development-channels server:slack
 ```
 
+### Local git hooks (husky — run before code reaches CI)
+
+Husky owns `core.hooksPath`; hooks live in `.husky/` (not `.git/hooks/`). Both wrap a beads-integration block (`bd hooks run`, soft-fails on timeout/uninit) ahead of the quality gate:
+
+- `.husky/pre-commit` — runs `bunx lint-staged` → Biome `check --write` on staged `*.{ts,js,json}` only (fast, per-file).
+- `.husky/pre-push` — runs `bun run typecheck` (cross-file guarantee that lint-staged's per-file pass can't give).
+
+`bun run prepare` (husky) installs them on `bun install`. Both are intentionally lighter than CI — the full nine-gate chain runs server-side on push.
+
 ### CI workflows (`.github/workflows/`)
 
 - `ci.yml` — single job `Typecheck` that runs nine gates in order: typecheck → Biome lint → test → coverage floor → depcruise → gherkin-lint → harness-hash verify → bun audit → crap-score. Required by branch protection (`strict: true`).
@@ -141,6 +150,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `scripts/harness-hash.sh` — tamper-detect pinned artifacts (mirrored from skill)
 - `scripts/bias-count.sh` — test-bias pattern scanner (mirrored from skill with pipefail fix)
 - `scripts/policy-validate.ts` — CLI wrapper around `parsePolicyRules` + `detectShadowing` + `detectBroadAutoApprove` used by `/slack-channel:policy`
+- `scripts/audit-key.ts` — production runner for the audit-key CLI (`audit-key-cli.ts`): `init` / `rotate` / `help` for the Ed25519 journal-signing keypair (journal v2)
 
 ### Skills & docs
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
@@ -165,7 +175,7 @@ The design-in-public commitment: the doc ships before the code, and the doc is t
 ### Audit + quality-gate reports (snapshots — diff against on next audit)
 - `000-docs/TEST_AUDIT.md` — Seven Walls scorecard, suite metrics, bias audit (produced by `/audit-tests`).
 - `000-docs/QUALITY_GATES.md` — Step 5.5 gate-sweep matrix: one row per quality-gate category, current state, CI wiring.
-- `000-docs/MUTATION_REPORT.md` — Stryker baselines per file. Current: `journal.ts` 87.76% / `lib.ts` 84.78% / `manifest.ts` 92.06% / `policy.ts` 78.00% / All 85.22%.
+- `000-docs/MUTATION_REPORT.md` — Stryker baselines per file. Current: `journal.ts` 85.26% / `lib.ts` 85.01% / `manifest.ts` 92.02% / `policy.ts` 89.78% / All 86.72% (post-`ccsc-2et`, CI run 26730834576).
 - `000-docs/AUTO_REMEDIATION_REPORT.md` — Step 8 gap analysis (no-op on this suite; rubric-driven remediation would add nothing today).
 
 When a design doc and code disagree, the code is wrong. When an audit report and current state disagree, the code is right and the report is stale — file a bd for the refresh.
