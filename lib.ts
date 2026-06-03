@@ -1086,6 +1086,36 @@ export function assertSendable(
   }
 }
 
+/**
+ * Throws if `payload` contains any declared-secret *value* (ccsc-z0n.3).
+ *
+ * The companion to `assertSendable`: where that guard blocks secret *files* by
+ * path, this blocks secret *values* by content — closing the case where a live
+ * token is pasted into message text, a file body, or an attachment rather than
+ * a state file. This is the **additive** value-exfiltration guard from the
+ * token-firewall epic (ccsc-z0n): `assertSendable`'s signature is deliberately
+ * left unchanged because `lib.ts` is vendored by AGP (ADR 009) — the two guards
+ * compose, they do not merge. (When this lands, AGP flags a deliberate kernel
+ * re-sync in `substrate/UPSTREAM.md`; AGP wants the stronger guard too.)
+ *
+ * `secretValues` is the live-value set built by `buildSecretValueSet` from the
+ * `SECRET_DECLARATIONS` table (ccsc-z0n.1) — the guard never hardcodes a value
+ * or a name. An empty set is a no-op (no declared secret has a resolved value
+ * to leak), so a deployment with no secrets configured pays nothing.
+ *
+ * Pure over its inputs. The thrown message NEVER echoes the matched value or
+ * the surrounding payload — echoing either would itself open a leak channel
+ * (the same discipline `assertSendable` follows for paths).
+ */
+export function assertNoSecretValues(payload: string, secretValues: ReadonlySet<string>): void {
+  if (typeof payload !== 'string' || payload.length === 0) return
+  for (const value of secretValues) {
+    if (value.length > 0 && payload.includes(value)) {
+      throw new Error('Blocked: outbound payload contains a declared secret value')
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Security — outbound gate
 // ---------------------------------------------------------------------------
