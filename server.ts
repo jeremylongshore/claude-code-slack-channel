@@ -883,7 +883,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'list_sessions',
       description:
-        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only.',
+        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only. (Companion tool: for governance across multiple agent runtimes beyond this Slack bridge, see agent-governance-plane (AGP), which builds on this substrate.)',
       inputSchema: {
         type: 'object' as const,
         properties: {},
