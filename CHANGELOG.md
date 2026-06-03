@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-03
+
 ### Added
 
 - **Inbound secret-value scrub — a token can never surface in a tool result returned to the agent** (`ccsc-z0n.2`, token-firewall epic `ccsc-z0n`). Completes the epic. **Finding that reshaped this bead:** ADR-002 §1's placeholder-swap assumes the agent process holds the credential, but CCSC's architecture is an MCP-stdio split — the Claude session *spawns* the bridge as a separate subprocess, the tokens live only in the bridge process, and they flow only into Slack-bound sinks (`WebClient`, `SocketModeClient`, the `download_attachment` `Authorization` header), never into a tool result. The agent literally cannot read the token, so a placeholder-*injection* layer would be redundant. Instead this bead delivers (a) the **runtime defense-in-depth backstop**: new pure `redactSecretValues(text, placeholders)` + `buildSecretPlaceholderMap(resolve)` in `lib.ts`, wired into a `scrubToolResult` over the single tool-dispatch return chokepoint in `server.ts` — if a future tool or refactor ever placed a live secret value in a result, it is swapped for that secret's placeholder (`{{CCSC_SECRET:<name>}}`, from `ccsc-z0n.1`) before the agent reads it, and the near-miss is journaled as `exfil.block`; and (b) a `THREAT-MODEL.md` T4 update documenting that CCSC achieves the credential-placeholder-swap *goal* structurally. This is the inbound (tool-result → agent) complement of `ccsc-z0n.3`'s outbound (agent → Slack) guard, reusing the same `SECRET_DECLARATIONS` set. 11 unit tests cover the value → placeholder map (incl. the round-trip back to the declared name), replace-all + multi-value + count semantics, clean / empty-map / empty-text / empty-key no-ops, and the `buildSecretPlaceholderMap` → `redactSecretValues` seam.
@@ -15,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Stryker mutation-score floor wired as a scheduled CI gate** (`ccsc-0mn` + `ccsc-2et`). The mutation suite (`lib.ts` + `policy.ts` + `manifest.ts` + `journal.ts`) now runs on a schedule with a JSON reporter so survivors are extractable, and the score is gated as a required check rather than a manual ~45-min run. Baselines recorded in `000-docs/MUTATION_REPORT.md` (`policy.ts` recovered to 89.78% after the `ccsc-2et` survivor-killing tests). Contributor-facing quality infrastructure only — no runtime behavior change.
 - **Relicensed from MIT to Apache License 2.0.** Replaces the MIT `LICENSE` with the canonical Apache 2.0 text, adds a `NOTICE` file (Apache convention) attributing the project to Jeremy Longshore / Intent Solutions and noting the vendored MIT `@intentsolutions/audit-harness`, retags the `SPDX-License-Identifier` header in all 32 first-party source/feature files to `Apache-2.0`, and updates `package.json`, `.claude-plugin/plugin.json`, README/docs license badges, and CONTRIBUTING. The vendored `.audit-harness/` copy keeps its own MIT license. Restores the project's original license (it had briefly been MIT — see the entry below).
 
 ## [0.10.0] - 2026-05-24
