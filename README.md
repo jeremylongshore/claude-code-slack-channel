@@ -226,7 +226,7 @@ Each layer's limit, and an explicit **"what this does NOT protect against"** sec
 
 ## Audit Signing
 
-Every decision the gate makes is journaled to `~/.claude/channels/slack/audit.log` — hash-chained (tamper-evident) and, as of v0.10, **Ed25519-signed** so a third party can verify the log against a public key without trusting the host.
+Every decision the gate makes is journaled to `~/.claude/channels/slack/audit.log` — hash-chained and, as of v0.10, **Ed25519-signed** — so a third party can verify the log against a public key without trusting the host.
 
 ```bash
 # Verify a journal end-to-end (hash chain + signatures):
