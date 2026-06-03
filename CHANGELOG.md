@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Secret-declaration schema — one table is the source of placeholder, guard, and routing** (`ccsc-z0n.1`, first of the token-firewall epic `ccsc-z0n`). New `SECRET_DECLARATIONS` frozen table in `lib.ts` is the single place a secret's identity is defined; the placeholder the agent sees (`secretPlaceholder` / `secretNameFromPlaceholder`, `{{CCSC_SECRET:<name>}}` form), the outbound value-exfiltration guard watch-set (`declaredSecretNames` / `buildSecretValueSet`), and the host-bound routing rule (`allowedSinkFor`, `SecretSink`) all *derive* from it — no drift across the three consumers (ADR-002 §1 credential placeholder-swap + §6 declaration-as-enforcement). Declares the two Slack tokens the runtime loads (`SLACK_BOT_TOKEN`/`xoxb-` → `slack-web-api`, `SLACK_APP_TOKEN`/`xapp-` → `slack-socket-api`). Pure / side-effect-free — `buildSecretValueSet` takes a resolver so `lib.ts` stays free of `process.env` reads. Schema only: the boundary injection (`ccsc-z0n.2`) and the `assertSendable` value-guard extension (`ccsc-z0n.3`) build additively on this table. 17 unit tests cover the placeholder round-trip, frozen / no-duplicate table, the guard set deriving from the table (not the resolver's keys), empty-skip + dedup, and the no-drift property across all three consumers.
+
 ### Changed
 
 - **Relicensed from MIT to Apache License 2.0.** Replaces the MIT `LICENSE` with the canonical Apache 2.0 text, adds a `NOTICE` file (Apache convention) attributing the project to Jeremy Longshore / Intent Solutions and noting the vendored MIT `@intentsolutions/audit-harness`, retags the `SPDX-License-Identifier` header in all 32 first-party source/feature files to `Apache-2.0`, and updates `package.json`, `.claude-plugin/plugin.json`, README/docs license badges, and CONTRIBUTING. The vendored `.audit-harness/` copy keeps its own MIT license. Restores the project's original license (it had briefly been MIT — see the entry below).

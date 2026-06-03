@@ -723,6 +723,140 @@ export function generateCode(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Secret declarations — single source of placeholder, guard, and routing
+// (ccsc-z0n.1; ADR-002 §1 credential placeholder-swap + §6 declaration-as-enforcement)
+// ---------------------------------------------------------------------------
+
+/**
+ * The outbound destinations a declared secret's *real* value is allowed to
+ * reach. A secret value appearing in a payload bound for any other sink — or in
+ * any agent-readable surface — is an exfiltration attempt (see ccsc-z0n.3,
+ * which makes the outbound guard a value-exfiltration guard over this set).
+ *
+ * `'none'` is the deny-all sink: a secret declared with `allowedSink: 'none'`
+ * may never appear in any outbound payload at all.
+ */
+export type SecretSink = 'slack-web-api' | 'slack-socket-api' | 'none'
+
+/**
+ * One declared secret. This is the ONLY place a secret's identity is defined.
+ * The placeholder the agent sees, the outbound value-exfiltration guard, and
+ * the host-bound routing rule are all *derived* from this table — never
+ * redeclared — so the three enforcement points cannot drift apart
+ * (ADR-002 §6, declaration-as-enforcement).
+ */
+export interface SecretDeclaration {
+  /** Canonical identity. Conventionally equal to `envVar`, but the identity is
+   *  the contract; the transport (env var) is incidental. */
+  readonly name: string
+  /** The environment variable the real value is loaded from on the host. */
+  readonly envVar: string
+  /** Literal prefix every live value of this secret carries (e.g. `xoxb-`).
+   *  Lets a shape check distinguish a real value from a placeholder without
+   *  hardcoding the prefix at each call site. Empty = no known prefix. */
+  readonly valuePrefix: string
+  /** Where the real value is swapped in for its placeholder — the single
+   *  outbound boundary that resolves it (ccsc-z0n.2). Description only; the
+   *  injection code names this point. */
+  readonly injectionPoint: string
+  /** The only sink the real value may travel to. Routing + the guard read
+   *  their decision from here. */
+  readonly allowedSink: SecretSink
+  /** Operator/doc-facing note. */
+  readonly description: string
+}
+
+/**
+ * The declared-secret table — the single source of truth for every secret
+ * CCSC's host process holds. Adding a secret means adding a row here and
+ * nowhere else; the placeholder, guard watch-set, and routing all derive from
+ * it. Frozen so it cannot be mutated at runtime.
+ *
+ * Today: the two Slack tokens the runtime loads from `.env` (server.ts).
+ */
+export const SECRET_DECLARATIONS: readonly SecretDeclaration[] = Object.freeze([
+  {
+    name: 'SLACK_BOT_TOKEN',
+    envVar: 'SLACK_BOT_TOKEN',
+    valuePrefix: 'xoxb-',
+    injectionPoint: 'slack-web-client',
+    allowedSink: 'slack-web-api',
+    description: 'Slack bot user OAuth token; authenticates outbound Web API calls.',
+  },
+  {
+    name: 'SLACK_APP_TOKEN',
+    envVar: 'SLACK_APP_TOKEN',
+    valuePrefix: 'xapp-',
+    injectionPoint: 'slack-socket-client',
+    allowedSink: 'slack-socket-api',
+    description: 'Slack app-level token; authenticates the Socket Mode WebSocket.',
+  },
+] as const)
+
+/**
+ * The placeholder string the agent sees in place of a real secret value.
+ * A pure, total function of the declared name — there is no second source for
+ * it, so the placeholder can never drift from the declaration. The wrapping
+ * `{{CCSC_SECRET:…}}` form is deliberately unmistakable and round-trips via
+ * `secretNameFromPlaceholder`.
+ */
+export function secretPlaceholder(name: string): string {
+  return `{{CCSC_SECRET:${name}}}`
+}
+
+const SECRET_PLACEHOLDER_RE = /^\{\{CCSC_SECRET:([A-Za-z0-9_]+)\}\}$/
+
+/**
+ * Inverse of `secretPlaceholder`: returns the declared name encoded in a
+ * placeholder string, or `undefined` if `s` is not a well-formed placeholder.
+ * Used by the injector (ccsc-z0n.2) to know which secret to swap in.
+ */
+export function secretNameFromPlaceholder(s: string): string | undefined {
+  const m = SECRET_PLACEHOLDER_RE.exec(s)
+  return m ? m[1] : undefined
+}
+
+/** Look up a single declaration by canonical name. */
+export function findSecretDeclaration(name: string): SecretDeclaration | undefined {
+  return SECRET_DECLARATIONS.find((d) => d.name === name)
+}
+
+/** Every declared secret name. The guard (ccsc-z0n.3) derives its watch-set
+ *  from this — it never maintains its own list of secret names. */
+export function declaredSecretNames(): string[] {
+  return SECRET_DECLARATIONS.map((d) => d.name)
+}
+
+/** The allowed sink for a declared secret, or `undefined` if not declared.
+ *  The routing layer and the value-exfiltration guard (ccsc-z0n.3) both read
+ *  their routing decision from here. */
+export function allowedSinkFor(name: string): SecretSink | undefined {
+  return findSecretDeclaration(name)?.allowedSink
+}
+
+/**
+ * Build the set of *live* secret values the outbound guard must block, derived
+ * from the declaration table by resolving each declared secret through
+ * `resolve` (typically `(d) => process.env[d.envVar]`). Secrets that resolve to
+ * an empty / undefined value are skipped — an unset secret has no value to
+ * leak.
+ *
+ * This is the seam ccsc-z0n.3 consumes: the guard never hardcodes a value or a
+ * name; it asks the table. The returned Set keeps membership checks O(1) and
+ * collapses duplicates if two declarations happen to share a value.
+ */
+export function buildSecretValueSet(
+  resolve: (declaration: SecretDeclaration) => string | undefined,
+): Set<string> {
+  const out = new Set<string>()
+  for (const d of SECRET_DECLARATIONS) {
+    const v = resolve(d)
+    if (typeof v === 'string' && v.length > 0) out.add(v)
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
 

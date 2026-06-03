@@ -21,17 +21,21 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  allowedSinkFor,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
+  declaredSecretNames,
   defaultAccess,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
+  findSecretDeclaration,
   type GateOptions,
   gate,
   generateCode,
@@ -48,11 +52,16 @@ import {
   parseSendableRoots,
   pruneExpired,
   resolveJournalPath,
+  SECRET_DECLARATIONS,
+  type SecretDeclaration,
+  type SecretSink,
   type Session,
   type SessionKey,
   sanitizeDisplayName,
   sanitizeFilename,
   saveSession,
+  secretNameFromPlaceholder,
+  secretPlaceholder,
   sessionPath,
   shouldPostAuditReceipt,
   validateSendableRoots,
@@ -623,6 +632,137 @@ describe('gate', () => {
 // The new allowlist-based assertSendable uses realpathSync to follow symlinks,
 // so tests must operate on real files under a temp directory rather than
 // purely-lexical paths.
+
+// ---------------------------------------------------------------------------
+// Secret declarations (ccsc-z0n.1) — one table, three consumers, no drift
+// ---------------------------------------------------------------------------
+
+describe('secret declarations (ccsc-z0n.1)', () => {
+  test('declares the two Slack tokens the runtime loads', () => {
+    const names = SECRET_DECLARATIONS.map((d) => d.name).sort()
+    expect(names).toEqual(['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN'])
+  })
+
+  test('table is frozen and has no duplicate names', () => {
+    expect(Object.isFrozen(SECRET_DECLARATIONS)).toBe(true)
+    const names = SECRET_DECLARATIONS.map((d) => d.name)
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  test('every declaration carries a non-empty value prefix and injection point', () => {
+    for (const d of SECRET_DECLARATIONS) {
+      expect(d.valuePrefix.length).toBeGreaterThan(0)
+      expect(d.injectionPoint.length).toBeGreaterThan(0)
+      expect(d.envVar.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('declared value prefixes match the boot-time token shape checks', () => {
+    // server.ts validates xoxb-/xapp- at boot; the table is the source those
+    // prefixes should ultimately derive from. Lock the correspondence here.
+    expect(findSecretDeclaration('SLACK_BOT_TOKEN')?.valuePrefix).toBe('xoxb-')
+    expect(findSecretDeclaration('SLACK_APP_TOKEN')?.valuePrefix).toBe('xapp-')
+  })
+
+  describe('placeholder consumer', () => {
+    test('round-trips name → placeholder → name for every declared secret', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        const ph = secretPlaceholder(d.name)
+        expect(secretNameFromPlaceholder(ph)).toBe(d.name)
+      }
+    })
+
+    test('placeholder never contains the declared live-value prefix', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        expect(secretPlaceholder(d.name)).not.toContain(d.valuePrefix)
+      }
+    })
+
+    test('non-placeholder strings decode to undefined', () => {
+      expect(secretNameFromPlaceholder('xoxb-1-2-realtokenlike')).toBeUndefined()
+      expect(secretNameFromPlaceholder('{{CCSC_SECRET:}}')).toBeUndefined()
+      expect(secretNameFromPlaceholder('SLACK_BOT_TOKEN')).toBeUndefined()
+      expect(secretNameFromPlaceholder('  {{CCSC_SECRET:SLACK_BOT_TOKEN}}  ')).toBeUndefined()
+    })
+  })
+
+  describe('guard consumer', () => {
+    test('watch-set is exactly the declared names — no second list', () => {
+      expect(declaredSecretNames().sort()).toEqual(SECRET_DECLARATIONS.map((d) => d.name).sort())
+    })
+
+    test('buildSecretValueSet collects only resolved declared values', () => {
+      const set = buildSecretValueSet((d) =>
+        d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : 'xapp-live-app',
+      )
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.has('xapp-live-app')).toBe(true)
+      expect(set.size).toBe(2)
+    })
+
+    test('buildSecretValueSet skips empty/undefined values', () => {
+      const set = buildSecretValueSet((d) => (d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : ''))
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.size).toBe(1)
+
+      const none = buildSecretValueSet(() => undefined)
+      expect(none.size).toBe(0)
+    })
+
+    test('buildSecretValueSet derives from the table, not the resolver keys', () => {
+      // A resolver that also "knows" an undeclared secret must NOT leak it into
+      // the guard set — the set is keyed by the declaration table only.
+      const set = buildSecretValueSet((d) => `value-for-${d.name}`)
+      expect([...set]).not.toContain('value-for-UNDECLARED_SECRET')
+      expect(set.size).toBe(SECRET_DECLARATIONS.length)
+    })
+
+    test('buildSecretValueSet collapses duplicate values', () => {
+      const set = buildSecretValueSet(() => 'same-value-everywhere')
+      expect(set.size).toBe(1)
+    })
+  })
+
+  describe('routing consumer', () => {
+    test('allowedSinkFor returns the declared sink for each secret', () => {
+      expect(allowedSinkFor('SLACK_BOT_TOKEN')).toBe('slack-web-api')
+      expect(allowedSinkFor('SLACK_APP_TOKEN')).toBe('slack-socket-api')
+    })
+
+    test('allowedSinkFor returns undefined for an undeclared name', () => {
+      expect(allowedSinkFor('SLACK_NOT_A_TOKEN')).toBeUndefined()
+    })
+
+    test('every declared sink is a valid SecretSink', () => {
+      const valid: SecretSink[] = ['slack-web-api', 'slack-socket-api', 'none']
+      for (const d of SECRET_DECLARATIONS) {
+        expect(valid).toContain(d.allowedSink)
+      }
+    })
+  })
+
+  test('all three consumers derive from the same declaration (no drift)', () => {
+    // The core declaration-as-enforcement property: for every row in the one
+    // table, the placeholder, the guard watch-set, and the routing rule are all
+    // keyed on that row's `name` — there is no fourth place a secret is defined.
+    const guardNames = new Set(declaredSecretNames())
+    for (const d of SECRET_DECLARATIONS) {
+      // placeholder consumer
+      expect(secretNameFromPlaceholder(secretPlaceholder(d.name))).toBe(d.name)
+      // guard consumer
+      expect(guardNames.has(d.name)).toBe(true)
+      // routing consumer
+      expect(allowedSinkFor(d.name)).toBe(d.allowedSink)
+    }
+  })
+
+  test('SecretDeclaration shape is structurally enforced at compile time', () => {
+    // Type-level assertion (compiled by tsc --noEmit): a declaration assembled
+    // from the public type must match a table row by value.
+    const sample: SecretDeclaration = SECRET_DECLARATIONS[0]!
+    expect(sample.name).toBe('SLACK_BOT_TOKEN')
+  })
+})
 
 describe('assertSendable', () => {
   let root: string // tmp root that stands in for HOME
