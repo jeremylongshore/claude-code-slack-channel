@@ -27,6 +27,7 @@ import {
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildSecretPlaceholderMap,
   buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
@@ -52,6 +53,7 @@ import {
   PERMISSION_REPLY_RE,
   parseSendableRoots,
   pruneExpired,
+  redactSecretValues,
   resolveJournalPath,
   SECRET_DECLARATIONS,
   type SecretDeclaration,
@@ -869,6 +871,109 @@ describe('assertNoSecretValues (ccsc-z0n.3)', () => {
     expect(partial.size).toBe(1)
     expect(() => assertNoSecretValues(BOT, partial)).not.toThrow()
     expect(() => assertNoSecretValues(APP, partial)).toThrow(BLOCK_MSG)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Inbound secret-value scrub (ccsc-z0n.2) — buildSecretPlaceholderMap + redactSecretValues
+// ---------------------------------------------------------------------------
+
+describe('inbound secret-value scrub (ccsc-z0n.2)', () => {
+  // Non-token-shaped sentinels (the scrub is value-agnostic; no real shapes
+  // added to the repo — same discipline as the outbound-guard tests above).
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const BOT_PH = secretPlaceholder('SLACK_BOT_TOKEN')
+  const APP_PH = secretPlaceholder('SLACK_APP_TOKEN')
+  const resolve = (d: SecretDeclaration): string | undefined =>
+    d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined
+
+  describe('buildSecretPlaceholderMap', () => {
+    test('maps each declared live value to that declaration’s placeholder', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      expect(map.get(APP)).toBe(APP_PH)
+      expect(map.size).toBe(2)
+    })
+
+    test('the mapped placeholder is exactly secretPlaceholder(name) — ties to ccsc-z0n.1', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      // Round-trips back to the declared name via the .1 inverse.
+      expect(secretNameFromPlaceholder(map.get(BOT)!)).toBe('SLACK_BOT_TOKEN')
+      expect(secretNameFromPlaceholder(map.get(APP)!)).toBe('SLACK_APP_TOKEN')
+    })
+
+    test('skips secrets with no resolved value', () => {
+      const map = buildSecretPlaceholderMap((d) => (d.name === 'SLACK_BOT_TOKEN' ? BOT : undefined))
+      expect(map.size).toBe(1)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      const none = buildSecretPlaceholderMap(() => undefined)
+      expect(none.size).toBe(0)
+    })
+  })
+
+  describe('redactSecretValues', () => {
+    const map = buildSecretPlaceholderMap(resolve)
+
+    test('replaces a secret value with its placeholder and counts it', () => {
+      const { text, redactedCount } = redactSecretValues(`token is ${BOT} ok`, map)
+      expect(text).toBe(`token is ${BOT_PH} ok`)
+      expect(redactedCount).toBe(1)
+      expect(text).not.toContain(BOT)
+    })
+
+    test('replaces every occurrence of the same value', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} and again ${BOT}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} and again ${BOT_PH}`)
+    })
+
+    test('replaces multiple distinct values', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} then ${APP}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} then ${APP_PH}`)
+    })
+
+    test('clean text is returned unchanged with redactedCount 0', () => {
+      const { text, redactedCount } = redactSecretValues('a normal tool result', map)
+      expect(text).toBe('a normal tool result')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty map is a no-op even for text that contains a value', () => {
+      const { text, redactedCount } = redactSecretValues(BOT, new Map())
+      expect(text).toBe(BOT)
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty / non-string text is a safe no-op', () => {
+      expect(redactSecretValues('', map)).toEqual({ text: '', redactedCount: 0 })
+      expect(redactSecretValues(undefined as unknown as string, map)).toEqual({
+        text: '',
+        redactedCount: 0,
+      })
+    })
+
+    test('an empty-string key never matches (would otherwise match everywhere)', () => {
+      const withEmpty = new Map<string, string>([
+        ['', 'SHOULD-NOT-APPEAR'],
+        [BOT, BOT_PH],
+      ])
+      const { text, redactedCount } = redactSecretValues('clean text', withEmpty)
+      expect(text).toBe('clean text')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('seam: buildSecretPlaceholderMap → redactSecretValues swaps value for placeholder', () => {
+      // End-to-end mirror of how server.ts scrubs a tool result: the value the
+      // guard set knows becomes its declared placeholder; everything else is
+      // untouched.
+      const fileResult = `cat .env =>\nSLACK_APP_TOKEN=${APP}\n`
+      const { text, redactedCount } = redactSecretValues(fileResult, map)
+      expect(redactedCount).toBe(1)
+      expect(text).toBe(`cat .env =>\nSLACK_APP_TOKEN=${APP_PH}\n`)
+      expect(text).not.toContain(APP)
+    })
   })
 })
 

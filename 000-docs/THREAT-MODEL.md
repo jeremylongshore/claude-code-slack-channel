@@ -237,15 +237,37 @@ missed primitive is a bypass.
 
 ### T4. Token exfiltration (CC → HA / PA)
 
-> Claude is coerced into sending a token or state file over Slack.
+> Claude is coerced into sending a token or state file over Slack, or into
+> surfacing one back to itself.
 
 - `assertSendable()` rejects any absolute or relative path that resolves
-  into the state dir (realpath-guarded).
+  into the state dir (realpath-guarded) — secret *files* by path.
+- **Outbound value guard (`ccsc-z0n.3`)**: `assertNoSecretValues()` rejects any
+  outbound payload — reply text, `edit_message` text, uploaded-file body or
+  filename — that *contains* a declared secret value, closing the case where a
+  live token is pasted into content rather than a state file. The watch-set is
+  derived from the `SECRET_DECLARATIONS` table (`ccsc-z0n.1`); a block journals
+  `exfil.block` and the error never echoes the value.
+- **Architectural placeholder-swap (`ccsc-z0n.2`)**: CCSC achieves the
+  credential-placeholder-swap *goal* structurally rather than with an injection
+  layer. The Claude session *spawns* the bridge as a separate MCP-stdio
+  subprocess (see `ARCHITECTURE.md`); the bot/app tokens live only in the bridge
+  process and flow only into Slack-bound sinks (`WebClient`, `SocketModeClient`,
+  the `download_attachment` `Authorization` header) — never into a tool result.
+  The agent therefore never holds the raw value, so there is nothing to inject a
+  placeholder *for*.
 - Tokens are read once at boot; `.env` is never re-read after init, so even
   a tool that could read arbitrary files would not observe a fresh token.
-- Structured MCP results never include the raw bot or app token.
+- Structured MCP results never include the raw bot or app token. **Backstop
+  (`ccsc-z0n.2`)**: a defense-in-depth scrub on the tool-dispatch return swaps
+  any declared secret value that *would* surface in a result for its placeholder
+  (`{{CCSC_SECRET:<name>}}`) before the agent reads it, and journals the
+  near-miss — so a future tool or refactor that regressed this invariant fails
+  loud-and-safe rather than silently leaking.
 - **Residual risk**: tokens held in process memory remain a compromise
-  vector under RCE on the host — out of scope.
+  vector under RCE on the host — out of scope. The scrub matches exact declared
+  values, not arbitrary token *shapes* — pattern-shaped leaks are the journal
+  redactor's job (T8), not this guard's.
 
 ### T5. State-file tampering (HA / PA / CC → state dir)
 

@@ -32,6 +32,7 @@ import {
   AUDIT_RECEIPTS_MAX,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
+  buildSecretPlaceholderMap,
   buildSecretValueSet,
   chunkText,
   decidePermissionRoute,
@@ -58,6 +59,7 @@ import {
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
+  redactSecretValues,
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
@@ -165,7 +167,12 @@ try {
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-function loadEnv(): { botToken: string; appToken: string; secretValues: Set<string> } {
+function loadEnv(): {
+  botToken: string
+  appToken: string
+  secretValues: Set<string>
+  secretPlaceholders: Map<string, string>
+} {
   if (!existsSync(ENV_FILE)) {
     console.error(
       `[slack] No .env found at ${ENV_FILE}\n` +
@@ -210,10 +217,16 @@ function loadEnv(): { botToken: string; appToken: string; secretValues: Set<stri
   // secret means adding a table row and nothing here changes.
   const secretValues = buildSecretValueSet((d) => vars[d.envVar])
 
-  return { botToken, appToken, secretValues }
+  // ccsc-z0n.2 — live-value → placeholder map for the inbound tool-result scrub.
+  // Same declaration-driven derivation; the agent sees a secret's stable
+  // placeholder if a live value ever surfaces in a result (defense-in-depth —
+  // the process boundary already keeps tokens out of agent-readable surfaces).
+  const secretPlaceholders = buildSecretPlaceholderMap((d) => vars[d.envVar])
+
+  return { botToken, appToken, secretValues, secretPlaceholders }
 }
 
-const { botToken, appToken, secretValues } = loadEnv()
+const { botToken, appToken, secretValues, secretPlaceholders } = loadEnv()
 
 // ---------------------------------------------------------------------------
 // Slack clients
@@ -1814,6 +1827,33 @@ const toolHandlers: Record<string, ToolHandler> = {
   publish_manifest: executePublishManifest,
 }
 
+/** ccsc-z0n.2 — inbound (tool-result → agent) defense-in-depth scrub. Every
+ *  tool result flows back to the Claude process through here; if a declared
+ *  secret value ever surfaces in one (it cannot today — tokens live only in
+ *  this bridge process and never enter a result — but a future tool/refactor
+ *  could regress), swap it for its placeholder BEFORE the agent reads it and
+ *  journal the near-miss. The scrub touches only `content[].text`; the reason
+ *  names the tool and the count, NEVER the value. Returns the result unchanged
+ *  in the common (clean) case. */
+function scrubToolResult(result: ToolResult, toolName: string): ToolResult {
+  if (secretPlaceholders.size === 0 || !Array.isArray(result.content)) return result
+  let totalRedacted = 0
+  const content = result.content.map((part) => {
+    if (part?.type !== 'text' || typeof part.text !== 'string') return part
+    const { text, redactedCount } = redactSecretValues(part.text, secretPlaceholders)
+    totalRedacted += redactedCount
+    return redactedCount > 0 ? { ...part, text } : part
+  })
+  if (totalRedacted === 0) return result
+  journalWrite({
+    kind: 'exfil.block',
+    outcome: 'deny',
+    toolName,
+    reason: `scrubbed ${totalRedacted} declared secret value(s) from tool result before returning to agent`,
+  })
+  return { ...result, content }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params
   let args = (request.params.arguments || {}) as Record<string, any>
@@ -1867,7 +1907,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       INBOX_DIR,
       DEFAULT_CHUNK_LIMIT,
     }
-    return handler(args, ctx)
+    // ccsc-z0n.2 — scrub the result of any declared secret value before it
+    // crosses back to the agent (defense-in-depth; see scrubToolResult).
+    return scrubToolResult(await handler(args, ctx), name)
   }
   return {
     content: [{ type: 'text', text: `Unknown tool: ${name}` }],
