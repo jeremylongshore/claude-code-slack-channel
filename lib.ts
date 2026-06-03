@@ -856,6 +856,66 @@ export function buildSecretValueSet(
   return out
 }
 
+/**
+ * Build a live-value → placeholder map from the declaration table (ccsc-z0n.2),
+ * resolving each declaration's value via `resolve` (typically
+ * `(d) => process.env[d.envVar]`). The inbound result scrub uses this to replace
+ * any live secret value that surfaces in an agent-facing tool result with that
+ * secret's stable placeholder — the same `secretPlaceholder(name)` the
+ * declaration defines (ccsc-z0n.1), so the agent sees a recognizable placeholder
+ * rather than a raw or generically-redacted value. Secrets with no resolved
+ * value are skipped (nothing to scrub).
+ */
+export function buildSecretPlaceholderMap(
+  resolve: (declaration: SecretDeclaration) => string | undefined,
+): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const d of SECRET_DECLARATIONS) {
+    const v = resolve(d)
+    if (typeof v === 'string' && v.length > 0) out.set(v, secretPlaceholder(d.name))
+  }
+  return out
+}
+
+/**
+ * Replace every occurrence of a declared secret value in `text` with its
+ * placeholder (ccsc-z0n.2). The inbound (tool-result → agent) complement of
+ * `assertNoSecretValues` on the outbound (agent → Slack) direction.
+ *
+ * **Why this is defense-in-depth, not the primary control.** CCSC's architecture
+ * already keeps tokens out of agent-readable surfaces: the Claude Code session
+ * *spawns* the bridge as a separate MCP-stdio subprocess (ARCHITECTURE.md), and
+ * the tokens live only in the bridge process, flowing only into Slack-bound
+ * sinks — never into a tool result. This scrub is the backstop: if a future tool
+ * or refactor ever placed a live token in a result, it is swapped to a
+ * placeholder before the agent can read it, and the caller can journal the
+ * near-miss (the non-zero `redactedCount`). It is *not* a placeholder-injection
+ * layer — there is nothing to inject, because the agent never holds the value.
+ *
+ * Uses literal split/join (not regex) so secret values need no escaping. Returns
+ * the input unchanged with `redactedCount: 0` when nothing matched (the common
+ * case, kept allocation-light). Pure over its inputs.
+ */
+export function redactSecretValues(
+  text: string,
+  placeholders: ReadonlyMap<string, string>,
+): { text: string; redactedCount: number } {
+  if (typeof text !== 'string' || text.length === 0 || placeholders.size === 0) {
+    return { text: typeof text === 'string' ? text : '', redactedCount: 0 }
+  }
+  let out = text
+  let redactedCount = 0
+  for (const [value, placeholder] of placeholders) {
+    if (value.length === 0) continue
+    const parts = out.split(value)
+    if (parts.length > 1) {
+      redactedCount += parts.length - 1
+      out = parts.join(placeholder)
+    }
+  }
+  return { text: out, redactedCount }
+}
+
 // ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
