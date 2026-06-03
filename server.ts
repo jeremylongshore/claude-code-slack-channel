@@ -32,6 +32,7 @@ import {
   AUDIT_RECEIPTS_MAX,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
+  buildSecretValueSet,
   chunkText,
   decidePermissionRoute,
   defaultAccess,
@@ -44,6 +45,7 @@ import {
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
+  assertNoSecretValues as libAssertNoSecretValues,
   assertOutboundAllowed as libAssertOutboundAllowed,
   assertSendable as libAssertSendable,
   deliveredThreadKey as libDeliveredThreadKey,
@@ -163,7 +165,7 @@ try {
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-function loadEnv(): { botToken: string; appToken: string } {
+function loadEnv(): { botToken: string; appToken: string; secretValues: Set<string> } {
   if (!existsSync(ENV_FILE)) {
     console.error(
       `[slack] No .env found at ${ENV_FILE}\n` +
@@ -202,10 +204,16 @@ function loadEnv(): { botToken: string; appToken: string } {
     process.exit(1)
   }
 
-  return { botToken, appToken }
+  // ccsc-z0n.3 — build the live-secret-value set the outbound value-exfiltration
+  // guard blocks. Derived from the SECRET_DECLARATIONS table (ccsc-z0n.1) by
+  // resolving each declaration's env var against the parsed .env, so adding a
+  // secret means adding a table row and nothing here changes.
+  const secretValues = buildSecretValueSet((d) => vars[d.envVar])
+
+  return { botToken, appToken, secretValues }
 }
 
-const { botToken, appToken } = loadEnv()
+const { botToken, appToken, secretValues } = loadEnv()
 
 // ---------------------------------------------------------------------------
 // Slack clients
@@ -511,6 +519,13 @@ function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
 
 function assertSendable(filePath: string): void {
   libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS, STATE_DIR)
+}
+
+/** ccsc-z0n.3 — value-exfiltration guard bound to this process's live secret
+ *  values. Composes with assertSendable: that blocks secret *files* by path,
+ *  this blocks secret *values* by content (message text, file body). */
+function assertNoSecretValues(payload: string): void {
+  libAssertNoSecretValues(payload, secretValues)
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +960,7 @@ interface ToolContext {
   botToken: string
   assertOutboundAllowed: (chatId: string, threadTs: string | undefined) => void
   assertSendable: (filePath: string) => void
+  assertNoSecretValues: (payload: string) => void
   journalWrite: (input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0]) => void
   getAccess: () => import('./lib.ts').Access
   resolveUserName: (userId: string) => Promise<string>
@@ -963,6 +979,25 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 // ---------------------------------------------------------------------------
 // Per-tool handler functions
 // ---------------------------------------------------------------------------
+
+/** ccsc-z0n.3 — run the value-exfiltration guard over an outbound payload,
+ *  journaling an `exfil.block` (reason names the value-guard, NEVER the value
+ *  or the payload) and rethrowing on a hit. Mirrors the assertSendable block
+ *  path in executeReplyFileUploads so text leaks and file-path leaks land in
+ *  the journal the same way. */
+function guardOutboundSecretValues(payload: string, toolName: string, ctx: ToolContext): void {
+  try {
+    ctx.assertNoSecretValues(payload)
+  } catch (secretErr) {
+    ctx.journalWrite({
+      kind: 'exfil.block',
+      outcome: 'deny',
+      toolName,
+      reason: secretErr instanceof Error ? secretErr.message : String(secretErr),
+    })
+    throw secretErr
+  }
+}
 
 // -----------------------------------------------------------------------
 // reply
@@ -995,6 +1030,20 @@ async function executeReplyFileUploads(
       throw exfilErr
     }
     const resolved = resolve(filePath)
+    // ccsc-z0n.3 — value-exfiltration guard on file *content*: assertSendable
+    // blocked secret files by path; this blocks a live secret value embedded in
+    // an otherwise-allowlisted file's body. Read as latin1 so every byte maps
+    // 1:1 to a character (a token is ASCII; no decode can split or drop it).
+    // The filename is checked too — an attacker who can't put the token in the
+    // body might smuggle it as the name.
+    let body: string
+    try {
+      body = readFileSync(resolved, 'latin1')
+    } catch {
+      body = '' // unreadable here → filesUploadV2 surfaces the real error
+    }
+    guardOutboundSecretValues(body, 'reply', ctx)
+    guardOutboundSecretValues(basename(resolved), 'reply', ctx)
     const uploadArgs: Record<string, any> = {
       channel_id: chatId,
       file: resolved,
@@ -1097,6 +1146,11 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     })
     throw outboundErr
   }
+
+  // ccsc-z0n.3 — value-exfiltration guard on the reply text. Runs BEFORE the
+  // streaming/non-streaming branch (so both paths are covered) and before the
+  // gate.outbound.allow event (a blocked send was never allowed).
+  guardOutboundSecretValues(text, 'reply', ctx)
 
   const access = ctx.getAccess()
   const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
@@ -1215,6 +1269,9 @@ async function executeEditMessage(
     })
     throw outboundErr
   }
+  // ccsc-z0n.3 — value-exfiltration guard on the edited text, before the
+  // gate.outbound.allow event (a blocked edit was never allowed).
+  guardOutboundSecretValues(args.text, 'edit_message', ctx)
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -1798,6 +1855,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       botToken,
       assertOutboundAllowed,
       assertSendable,
+      assertNoSecretValues,
       journalWrite,
       getAccess,
       resolveUserName,

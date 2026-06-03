@@ -22,6 +22,7 @@ import {
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
   allowedSinkFor,
+  assertNoSecretValues,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
@@ -761,6 +762,113 @@ describe('secret declarations (ccsc-z0n.1)', () => {
     // from the public type must match a table row by value.
     const sample: SecretDeclaration = SECRET_DECLARATIONS[0]!
     expect(sample.name).toBe('SLACK_BOT_TOKEN')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// assertNoSecretValues (ccsc-z0n.3) — value-exfiltration guard
+// ---------------------------------------------------------------------------
+
+describe('assertNoSecretValues (ccsc-z0n.3)', () => {
+  // Sentinel stand-in values, NOT real token shapes. The guard does pure
+  // substring matching (it is value-agnostic), so the test exercises identical
+  // logic without embedding `xoxb-`/`xapp-`-shaped strings that would (a) trip
+  // GitHub push protection and (b) violate the repo's no-token-fixtures rule.
+  // The real token *shapes* are validated separately in the schema tests above.
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const secrets = new Set([BOT, APP])
+  const BLOCK_MSG = 'Blocked: outbound payload contains a declared secret value'
+
+  test('throws when the payload IS a secret value', () => {
+    expect(() => assertNoSecretValues(BOT, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('detects a secret value anywhere in the payload (start / middle / end)', () => {
+    expect(() => assertNoSecretValues(`${BOT} trailing text`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`leading ${BOT} trailing`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`text then ${APP}`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  // The three wired call sites in server.ts all reduce to "string contains
+  // value" at the guard — the guard is content-agnostic; the wiring chooses
+  // which strings to scan (reply/edit text, file body, attachment filename).
+  test('blocks the value embedded in message text', () => {
+    expect(() => assertNoSecretValues(`here is the token: ${BOT}, oops`, secrets)).toThrow(
+      BLOCK_MSG,
+    )
+  })
+
+  test('blocks the value embedded in a file body', () => {
+    const fileBody = `# config\nSLACK_BOT_TOKEN=${BOT}\nDEBUG=true\n`
+    expect(() => assertNoSecretValues(fileBody, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('blocks the value smuggled into an attachment filename', () => {
+    expect(() => assertNoSecretValues(`leak-${APP}.txt`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('the error message never echoes the matched value or the payload', () => {
+    try {
+      assertNoSecretValues(`secret is ${BOT} do not log`, secrets)
+      throw new Error('expected assertNoSecretValues to throw')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      expect(msg).toBe(BLOCK_MSG)
+      expect(msg).not.toContain(BOT)
+      expect(msg).not.toContain('do not log')
+    }
+  })
+
+  test('allows a clean payload that contains no secret value', () => {
+    expect(() => assertNoSecretValues('a perfectly ordinary reply', secrets)).not.toThrow()
+    // A near-miss (a strict prefix of the value, not the whole value) must NOT
+    // trip the guard — only the full secret value matches.
+    expect(() => assertNoSecretValues('CCSC-TEST-BOT-SECRET only', secrets)).not.toThrow()
+  })
+
+  test('empty value set is a no-op even for token-shaped text', () => {
+    expect(() => assertNoSecretValues(BOT, new Set())).not.toThrow()
+  })
+
+  test('empty / non-string payloads are no-ops', () => {
+    expect(() => assertNoSecretValues('', secrets)).not.toThrow()
+    // Defensive: a non-string slipping through must not throw a TypeError.
+    expect(() => assertNoSecretValues(undefined as unknown as string, secrets)).not.toThrow()
+    expect(() => assertNoSecretValues(null as unknown as string, secrets)).not.toThrow()
+  })
+
+  test('blocks if ANY one of several declared values is present', () => {
+    expect(() => assertNoSecretValues(`only the app token ${APP} here`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('an empty-string entry in the set never matches', () => {
+    // buildSecretValueSet skips empty values, but guard must be robust anyway:
+    // an empty string is a substring of every payload and must NOT trip it.
+    const withEmpty = new Set(['', BOT])
+    expect(() => assertNoSecretValues('clean text', withEmpty)).not.toThrow()
+    expect(() => assertNoSecretValues(BOT, withEmpty)).toThrow(BLOCK_MSG)
+  })
+
+  test('seam: buildSecretValueSet drives the guard end-to-end (ccsc-z0n.1 → .3)', () => {
+    // Mirror how server.ts builds the set: resolve each declaration to a live
+    // value, then guard against it. Proves the guard's watch-set comes from the
+    // declaration table, not a hand-maintained list.
+    const resolved = buildSecretValueSet((d) =>
+      d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined,
+    )
+    expect(() => assertNoSecretValues(`payload with ${BOT}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`payload with ${APP}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues('payload with no secret', resolved)).not.toThrow()
+  })
+
+  test('an unset secret contributes no value to block (resolver returns undefined)', () => {
+    // If the bot token is unset in .env, its (absent) value cannot be leaked,
+    // and the guard must not block arbitrary text on its behalf.
+    const partial = buildSecretValueSet((d) => (d.name === 'SLACK_APP_TOKEN' ? APP : undefined))
+    expect(partial.size).toBe(1)
+    expect(() => assertNoSecretValues(BOT, partial)).not.toThrow()
+    expect(() => assertNoSecretValues(APP, partial)).toThrow(BLOCK_MSG)
   })
 })
 
