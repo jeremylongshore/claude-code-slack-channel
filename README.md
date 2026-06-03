@@ -1,6 +1,6 @@
 # claude-code-slack-channel v0.10.0
 
-Enterprise Slack-native governance substrate where humans, Claude Code sessions, and peer agents converse safely in shared channels. Every tool call passes through a declarative, tier-aware policy engine; every decision lands in a hash-chained, **Ed25519-signed** audit journal you can verify offline. Per-thread session isolation, identity-aware permission gates, operator admin commands with cross-channel approval, peer-bot loop control, and defense-in-depth against prompt injection.
+The Slack-native governance substrate for Claude Code — the kernel other governance tooling builds on. Humans, Claude Code sessions, and peer agents converse safely in shared channels: every tool call passes through a declarative, tier-aware policy engine; every decision lands in a hash-chained, **Ed25519-signed** audit journal you can verify offline. Per-thread session isolation, identity-aware permission gates, operator admin commands with cross-channel approval, peer-bot loop control, and defense-in-depth against prompt injection. The policy/journal/relay kernel here is the substrate that the companion **[agent-governance-plane (AGP)](#companion-tooling)** vendors for cross-runtime governance.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -208,7 +208,7 @@ Self-echoes from this bot are always filtered regardless of `allowBotIds`. Peer 
 
 **For the full multi-agent recipe** — registering a second bot, configuring `allowBotIds` mutually, mention-driven addressing, loop-prevention rate limit, `!mute`/`!unmute` operator verbs, common failure modes, what you DON'T get — see [`000-docs/multi-agent-channels.md`](000-docs/multi-agent-channels.md).
 
-This is a prompt-injection vector by design, so it's built defense-in-depth. The layers:
+This is a prompt-injection vector by design. The security model is documented threat-model-first in [`SECURITY.md`](SECURITY.md): (1) the adversary and the four principals, (2) the mitigations below — each with its own stated limit, and (3) an explicit list of **what this does NOT protect against** (same-UID host compromise, in-process token exposure, supply-chain, Slack/Anthropic platform bugs). Start there for the full picture; the defense-in-depth layers are:
 
 - **Sender gating**: Every inbound message hits a gate. Ungated messages are silently dropped before reaching Claude.
 - **Outbound gate**: Replies only work to channels that passed the inbound gate.
@@ -222,7 +222,7 @@ This is a prompt-injection vector by design, so it's built defense-in-depth. The
 - **Admin-command hardening**: Operator verbs (`!clear`, `!restart`) route through gate → policy → journal → execute and require a server-minted **HMAC nonce confirmed from a second channel**. Claude cannot self-invoke them — no MCP tool name begins with `admin.`. This closes the EchoLeak / operator-coercion class ([CVE-2025-32711](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/000-docs/THREAT-MODEL.md), threat T11): a prompt injected into one channel cannot drive a privileged action, because confirmation must come from a channel the attacker doesn't control.
 - **Peer-bot loop control**: A per-`(channel, bot_id)` sliding-window rate limit (default 10 msg/60s) breaks A→B→A runaway loops; operators can `!mute <@bot>` / `!unmute <@bot>` a misbehaving peer.
 
-Trust boundaries, per-primitive attack surface, and threats T1–T11 are documented in [`000-docs/THREAT-MODEL.md`](000-docs/THREAT-MODEL.md).
+Each layer's limit, and an explicit **"what this does NOT protect against"** section, are in [`SECURITY.md`](SECURITY.md). Trust boundaries, per-primitive attack surface, and threats T1–T11 are documented in [`000-docs/THREAT-MODEL.md`](000-docs/THREAT-MODEL.md).
 
 ## Audit Signing
 
@@ -240,6 +240,10 @@ bun audit-key-cli.ts show       # print active public key + key id
 ```
 
 The key is loaded at boot from SOPS+age-encrypted `.env`. Run with `--no-audit-signing` to fall back to hash-chain-only. Design + rotation lifecycle: [`000-docs/audit-journal-architecture.md`](000-docs/audit-journal-architecture.md) and [`000-docs/key-management.md`](000-docs/key-management.md).
+
+## Companion tooling
+
+**agent-governance-plane (AGP)** is a companion governance tool that builds **on** this substrate. AGP vendors a pinned copy of CCSC's governance kernel — the policy engine (`policy.ts`), the hash-chained signed journal (`journal.ts`), the Slack relay, and nonce-bound HITL — to govern agent runtimes beyond a single Slack bridge. The relationship is one-way by design: **CCSC is the substrate and has zero knowledge of AGP**; AGP is the downstream consumer. If you need governance across multiple agent runtimes (not just Claude Code in Slack), AGP is the layer to look at; if you need a governed Slack channel for Claude Code, CCSC is all you need. The substrate-extraction contract is documented in AGP's `000-docs/009-AT-ADR-ccsc-substrate-extraction-strategy.md`, and the patterns shared between the two are recorded in [`000-docs/ADR-002`](000-docs/ADR-002-architecture-patterns-from-peer-runtime-audit.md).
 
 ## Testing & Quality
 
