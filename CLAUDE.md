@@ -196,7 +196,7 @@ Any change to `gate()`, `assertSendable()`, or `assertOutboundAllowed()` is secu
 
 Two distinct surfaces, often confused:
 
-- **Authoritative log** (Epic 30-A) — `~/.claude/channels/slack/audit.log`. Hash-chained, tamper-evident, redacted per fixed rules. Every tool-call decision (`policy.allow` / `policy.deny` / `policy.require` / `policy.approved`) is written here regardless of any Slack state. Verify with `bun server.ts --verify-audit-log <path>`. This is the record.
+- **Authoritative log** (Epic 30-A) — `~/.claude/channels/slack/audit.log`. Hash-chained, Ed25519-signed, redacted per fixed rules. Every tool-call decision (`policy.allow` / `policy.deny` / `policy.require` / `policy.approved`) is written here regardless of any Slack state. Verify with `bun server.ts --verify-audit-log <path>`. This is the record.
 
 - **Projection** (Epic 30-B) — best-effort Slack-thread mirror of selected journal events. Controlled per-channel via `ChannelPolicy.audit` (`'off'` | `'compact'` | `'full'`). Posts receipts into the originating thread so operators can see what Claude is doing without leaving Slack. **Not** authoritative: Slack API errors, rate limits, missing messages, or lost events in the stream all mean a projected event may never appear. Operators who need ground truth read the local log.
 
