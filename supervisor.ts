@@ -37,7 +37,7 @@
  */
 
 import type { JournalWriter } from './journal'
-import type { InFlightTurn, Session, SessionKey } from './lib'
+import type { DeliveryObligation, InFlightTurn, Session, SessionKey } from './lib'
 import { listSessions, loadSession, saveSession, sessionPath } from './lib'
 
 // ---------------------------------------------------------------------------
@@ -203,6 +203,20 @@ export interface SessionHandle {
    *  Fenced by the current lease when one is held; a no-op persist when the
    *  marker is already absent. */
   recordTurnEnd(): Promise<void>
+
+  /** Record a durable "reply owed" obligation as the turn reaches its terminal
+   *  state (ccsc-o7x.2.1) — the transactional-outbox write. In ONE atomic save
+   *  it appends a fresh `pending` obligation to the session's `outbox` AND
+   *  clears the in-flight-turn marker, so "turn done, reply owed" is a single
+   *  durable fact. Must run BEFORE the Slack send is attempted; a crash after
+   *  this write but before the send leaves a pending obligation the delivery
+   *  poller (ccsc-o7x.2.2) honors. Fenced by `token` (the current lease's). The
+   *  caller supplies the message identity + content; `attempts` (0), `state`
+   *  (`pending`), and `createdAt` are stamped here. */
+  recordTerminalDelivery(
+    token: number,
+    reply: { id: string; channel: string; thread: string; payload: string },
+  ): Promise<void>
 
   /** Serialise an update through the per-session mutex, persist it via
    *  the atomic writer (`saveSession()`), and refresh `this.session`.
@@ -384,6 +398,14 @@ export interface SessionSupervisor {
    *      is live. Errors on a single file do not stop the sweep.
    *    - Returns a `RecoveryReport` for the caller / tests. */
   recoverOnStartup(): Promise<RecoveryReport>
+
+  /** Read side of the transactional outbox (ccsc-o7x.2.1): scan every session
+   *  file and return all `pending` delivery obligations across the population.
+   *  This is the delivery poller's (ccsc-o7x.2.2) input — it consumes each
+   *  obligation, sends it, and resolves it. Best-effort: a file that cannot be
+   *  read is skipped (logged), never throwing. Reads from disk so a fresh
+   *  process after a crash sees obligations recorded by the prior one. */
+  pendingDeliveries(): Promise<DeliveryObligation[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +983,37 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
 
       return report
     },
+
+    async pendingDeliveries(): Promise<DeliveryObligation[]> {
+      const out: DeliveryObligation[] = []
+      let summaries: ReturnType<typeof listSessions>
+      try {
+        summaries = listSessions(stateRoot)
+      } catch (err) {
+        log('outbox.scan_error', { error: errorMessage(err) })
+        return out
+      }
+      for (const summary of summaries) {
+        const key: SessionKey = { channel: summary.channel, thread: summary.thread }
+        let session: Session
+        try {
+          session = await loadSession(stateRoot, sessionPath(stateRoot, key))
+        } catch (err) {
+          // Best-effort: an unreadable file is skipped (the recovery sweep is
+          // the path that quarantines it), never throwing here.
+          log('outbox.read_error', {
+            channel: key.channel,
+            thread: key.thread,
+            error: errorMessage(err),
+          })
+          continue
+        }
+        for (const ob of session.outbox ?? []) {
+          if (ob.state === 'pending') out.push(ob)
+        }
+      }
+      return out
+    },
   }
 }
 
@@ -1110,6 +1163,28 @@ class ConcreteHandle implements SessionHandle {
       if (prev.inFlightTurn === undefined) return prev
       const { inFlightTurn: _cleared, ...rest } = prev
       return rest as Session
+    }, token)
+  }
+
+  recordTerminalDelivery(
+    token: number,
+    reply: { id: string; channel: string; thread: string; payload: string },
+  ): Promise<void> {
+    const obligation: DeliveryObligation = {
+      id: reply.id,
+      channel: reply.channel,
+      thread: reply.thread,
+      payload: reply.payload,
+      attempts: 0,
+      state: 'pending',
+      createdAt: this.clock(),
+    }
+    // One atomic save: append the obligation AND clear the in-flight marker, so
+    // "turn done, reply owed" is a single durable fact. Fenced by the lease
+    // token — a turn that lost its lease must not enqueue a delivery.
+    return this.update((prev) => {
+      const { inFlightTurn: _cleared, ...rest } = prev
+      return { ...rest, outbox: [...(prev.outbox ?? []), obligation] }
     }, token)
   }
 

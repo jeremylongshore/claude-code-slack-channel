@@ -186,6 +186,39 @@ export interface InFlightTurn {
   heartbeatAt: number
 }
 
+/** A durable "reply owed" obligation — the transactional-outbox record for one
+ *  outbound Slack message a completed turn still owes (ccsc-o7x.2.1). Persisted
+ *  on the `Session` file (in `outbox`) atomically with the turn's terminal
+ *  marker, BEFORE the Slack send is attempted, so a crash after
+ *  terminal-but-before-send leaves a pending obligation the delivery poller
+ *  (ccsc-o7x.2.2) can later honor. The send becomes a *consumer* of this record,
+ *  not a fire-and-forget side effect.
+ *
+ *  This is a SEPARATE sink from the audit journal/projection: the outbox is
+ *  authoritative for *delivery*, the journal for *what happened*. They never
+ *  cross — the obligation is NOT written to `audit.log`, and the audit
+ *  projection is never made authoritative for delivery (audit-journal-
+ *  architecture.md invariant 1). */
+export interface DeliveryObligation {
+  /** Stable delivery id — the idempotency / dedup key (consumed by
+   *  ccsc-o7x.2.3 so redelivery never double-posts). Two records with the same
+   *  id denote the same logical message. */
+  id: string
+  /** Destination channel. */
+  channel: string
+  /** Destination `thread_ts`, or '' for a top-level channel post. */
+  thread: string
+  /** The reply payload to send (message text). */
+  payload: string
+  /** Delivery attempts made so far. Starts at 0; the poller increments. */
+  attempts: number
+  /** Lifecycle state. `pending` awaits delivery; `delivered` / `dead` are
+   *  terminal and set by the poller (ccsc-o7x.2.2). */
+  state: 'pending' | 'delivered' | 'dead'
+  /** Epoch-ms the obligation was recorded. */
+  createdAt: number
+}
+
 export interface Session {
   /** Schema version of this session file. */
   v: SessionSchemaVersion
@@ -211,6 +244,11 @@ export interface Session {
    *  is in flight; absent on a cleanly-idle session. Additive + optional, so
    *  pre-existing session files (which never carry it) load unchanged. */
   inFlightTurn?: InFlightTurn
+  /** Optional transactional-outbox: pending "reply owed" obligations for this
+   *  thread (ccsc-o7x.2.1). Written atomically with the turn's terminal marker,
+   *  drained by the delivery poller (ccsc-o7x.2.2). Additive + optional, so
+   *  pre-existing session files load unchanged. */
+  outbox?: DeliveryObligation[]
 }
 
 /** Zod schema mirroring the `Session` interface.
@@ -247,6 +285,23 @@ export const SessionSchema = z
         heartbeatAt: z.number(),
       })
       .strict()
+      .optional(),
+    // ccsc-o7x.2.1 — optional transactional outbox of pending reply obligations.
+    // Optional so existing session files validate under the outer `.strict()`.
+    outbox: z
+      .array(
+        z
+          .object({
+            id: z.string(),
+            channel: z.string(),
+            thread: z.string(),
+            payload: z.string(),
+            attempts: z.number(),
+            state: z.enum(['pending', 'delivered', 'dead']),
+            createdAt: z.number(),
+          })
+          .strict(),
+      )
       .optional(),
   })
   .strict()
