@@ -31,6 +31,8 @@ import {
   buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
+  classifyDeliveryError,
+  computeBackoffMs,
   type DeliveryObligation,
   declaredSecretNames,
   defaultAccess,
@@ -38,6 +40,7 @@ import {
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
+  extractSlackErrorCode,
   findSecretDeclaration,
   type GateOptions,
   gate,
@@ -51,6 +54,7 @@ import {
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
   migrateFlatSessions,
+  NON_RETRYABLE_SLACK_ERRORS,
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
   parseSendableRoots,
@@ -75,10 +79,12 @@ import {
   classifyRecovery,
   createSessionSupervisor,
   DEFAULT_LEASE_TTL_MS,
+  DEFAULT_MAX_DELIVERY_ATTEMPTS,
   heartbeatLease,
   isLeaseStale,
   type Lease,
   resolveLeaseTtlMs,
+  type SessionHandle,
 } from './supervisor.ts'
 
 // ---------------------------------------------------------------------------
@@ -5945,6 +5951,376 @@ describe('reply-delivery outbox (ccsc-o7x.2.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Delivery classification + backoff — pure helpers (ccsc-o7x.2.2)
+// ---------------------------------------------------------------------------
+
+describe('delivery error classification (ccsc-o7x.2.2)', () => {
+  test('known permanent Slack codes classify non-retryable', () => {
+    for (const code of [
+      'channel_not_found',
+      'not_in_channel',
+      'is_archived',
+      'invalid_auth',
+      'account_inactive',
+      'token_revoked',
+      'no_permission',
+      'msg_too_long',
+      'no_text',
+      'restricted_action',
+      'cannot_dm_bot',
+    ]) {
+      expect(classifyDeliveryError(code)).toBe('non-retryable')
+    }
+  })
+
+  test('transient / unknown / undefined codes default to retryable', () => {
+    expect(classifyDeliveryError('rate_limited')).toBe('retryable')
+    expect(classifyDeliveryError('internal_error')).toBe('retryable')
+    expect(classifyDeliveryError('service_unavailable')).toBe('retryable')
+    expect(classifyDeliveryError('ECONNRESET')).toBe('retryable')
+    expect(classifyDeliveryError('slack_webapi_rate_limited_error')).toBe('retryable')
+    expect(classifyDeliveryError('some_brand_new_code')).toBe('retryable')
+    expect(classifyDeliveryError(undefined)).toBe('retryable')
+  })
+
+  test('NON_RETRYABLE_SLACK_ERRORS holds the permanent codes and excludes rate_limited', () => {
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('channel_not_found')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('invalid_auth')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('rate_limited')).toBe(false)
+  })
+})
+
+describe('extractSlackErrorCode (ccsc-o7x.2.2)', () => {
+  test('prefers err.data.error (the canonical Slack Web API code)', () => {
+    expect(extractSlackErrorCode({ data: { error: 'channel_not_found' } })).toBe(
+      'channel_not_found',
+    )
+    // A real @slack/web-api WebAPIPlatformError shape: Error + .data.error.
+    const platformErr = Object.assign(new Error('An API error occurred'), {
+      code: 'slack_webapi_platform_error',
+      data: { ok: false, error: 'not_in_channel' },
+    })
+    expect(extractSlackErrorCode(platformErr)).toBe('not_in_channel')
+  })
+
+  test('falls back to err.code when no data.error is present', () => {
+    expect(extractSlackErrorCode({ code: 'slack_webapi_rate_limited_error' })).toBe(
+      'slack_webapi_rate_limited_error',
+    )
+    expect(
+      extractSlackErrorCode(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })),
+    ).toBe('ECONNRESET')
+  })
+
+  test('returns undefined for non-object throws and empty/absent codes', () => {
+    expect(extractSlackErrorCode(undefined)).toBeUndefined()
+    expect(extractSlackErrorCode(null)).toBeUndefined()
+    expect(extractSlackErrorCode('a string')).toBeUndefined()
+    expect(extractSlackErrorCode(new Error('plain'))).toBeUndefined()
+    expect(extractSlackErrorCode({ data: { error: '' } })).toBeUndefined()
+    expect(extractSlackErrorCode({ code: '' })).toBeUndefined()
+  })
+})
+
+describe('computeBackoffMs (ccsc-o7x.2.2)', () => {
+  test('no wait before the first attempt', () => {
+    expect(computeBackoffMs(0)).toBe(0)
+    expect(computeBackoffMs(-3)).toBe(0)
+  })
+
+  test('exponential growth with the defaults (250ms base, x2)', () => {
+    expect(computeBackoffMs(1)).toBe(250)
+    expect(computeBackoffMs(2)).toBe(500)
+    expect(computeBackoffMs(3)).toBe(1000)
+    expect(computeBackoffMs(4)).toBe(2000)
+  })
+
+  test('clamps to maxMs and honors custom tunables', () => {
+    expect(computeBackoffMs(100)).toBe(30_000) // default cap
+    expect(computeBackoffMs(3, { baseMs: 100, factor: 3, maxMs: 10_000 })).toBe(900)
+    expect(computeBackoffMs(10, { baseMs: 100, factor: 3, maxMs: 10_000 })).toBe(10_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Delivery poller — drainOutbox (ccsc-o7x.2.2)
+// ---------------------------------------------------------------------------
+
+describe('delivery poller drainOutbox (ccsc-o7x.2.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_POLL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-poller-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  const reply = { id: 'd-1', channel: 'C_POLL', thread: 'T1', payload: 'hello' }
+
+  /** Supersede a handle's lease in place to simulate a newer owner taking over —
+   *  the only way to drive `heartbeat(oldToken) === false` through a realistic
+   *  path (a fresh activation by a new owner re-acquires the lease). */
+  function supersedeLease(handle: SessionHandle, owner: string, token: number): void {
+    ;(handle as unknown as { acquireLease(o: string, t: number): Lease }).acquireLease(owner, token)
+  }
+
+  /** A Slack-shaped error carrying a canonical Web API code. */
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  async function seedObligation(over: Partial<typeof reply> = {}): Promise<void> {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, { ...reply, ...over })
+  }
+
+  test('empty outbox → zero report, send never called', async () => {
+    const sup = makeSupervisor()
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+    expect(report).toEqual({ scanned: 0, delivered: [], deadLettered: [], skipped: [] })
+    expect(calls).toBe(0)
+  })
+
+  test('successful send marks the obligation delivered and clears it from pending', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const sent: DeliveryObligation[] = []
+    const report = await sup.drainOutbox(async (ob) => {
+      sent.push(ob)
+    })
+
+    expect(sent.map((o) => o.id)).toEqual(['d-1'])
+    expect(report.scanned).toBe(1)
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+    expect(report.skipped).toEqual([])
+
+    // Persisted: state delivered, attempts incremented, no lastError on success.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(1)
+    expect(reloaded.outbox?.[0]?.lastError).toBeUndefined()
+    // No longer pending.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('non-retryable Slack error dead-letters immediately with the error recorded (no retry)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('channel_not_found')
+      },
+      { delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(1) // no retry on a permanent error
+    expect(delays).toEqual([]) // never backed off
+    expect(report.delivered).toEqual([])
+    expect(report.deadLettered).toEqual([{ id: 'd-1', error: 'channel_not_found' }])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('dead')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(1)
+    expect(reloaded.outbox?.[0]?.lastError).toBe('channel_not_found')
+  })
+
+  test('retryable error retries with exponential backoff up to the cap, then dead-letters', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('rate_limited') // always fails, always retryable
+      },
+      { maxAttempts: 3, delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(3) // attempts capped
+    expect(delays).toEqual([250, 500]) // backoff before retries 2 and 3
+    expect(report.deadLettered).toEqual([{ id: 'd-1', error: 'rate_limited' }])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('dead')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(3)
+    expect(reloaded.outbox?.[0]?.lastError).toBe('rate_limited')
+  })
+
+  test('retryable error that recovers is delivered (no dead-letter)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        if (calls < 2) throw slackError('service_unavailable')
+      },
+      { delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(2) // failed once, succeeded on the retry
+    expect(delays).toEqual([250]) // one backoff
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(2)
+    // lastError is not retained on a delivered record.
+    expect(reloaded.outbox?.[0]?.lastError).toBeUndefined()
+  })
+
+  test('default attempt cap is DEFAULT_MAX_DELIVERY_ATTEMPTS', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    let calls = 0
+    await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('internal_error')
+      },
+      { delayMs: async () => {} },
+    )
+    expect(calls).toBe(DEFAULT_MAX_DELIVERY_ATTEMPTS)
+  })
+
+  test('lease contention: a lease superseded mid-retry yields without a second send (no double-send)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key) // same cached handle the poller will use
+    const token = handle.lease!.token
+
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('rate_limited') // retryable → would normally retry
+      },
+      {
+        // During the first backoff a newer owner takes the lease. The next
+        // iteration's pre-send heartbeat check fails → the poller yields.
+        delayMs: async () => {
+          supersedeLease(handle, 'OWNER-2', token + 100)
+        },
+      },
+    )
+
+    expect(calls).toBe(1) // sent once, then yielded — never double-sent
+    expect(report.delivered).toEqual([])
+    expect(report.deadLettered).toEqual([])
+    expect(report.skipped).toEqual(['d-1'])
+
+    // Obligation is left pending for the live owner.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('pending')
+  })
+
+  test('lease contention: a lease superseded before the persist yields without committing (delivery not marked)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key)
+    const token = handle.lease!.token
+
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+      // The send itself "succeeds", but a newer owner takes the lease before the
+      // persist. The pre-persist lease check yields → the obligation is not
+      // marked delivered (and the session is NOT quarantined).
+      supersedeLease(handle, 'OWNER-2', token + 100)
+    })
+
+    expect(calls).toBe(1)
+    expect(report.delivered).toEqual([])
+    expect(report.skipped).toEqual(['d-1'])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('pending') // still owed, for 2.3 to dedup
+    // The legitimate new owner is not locked out — the key was not quarantined.
+    expect(reloaded.outbox?.[0]?.attempts).toBe(0)
+  })
+
+  test('drains obligations across multiple sessions independently', async () => {
+    const seed = makeSupervisor()
+    const ha = await seed.activate({ channel: 'C_POLL', thread: 'a' }, 'U')
+    await ha.recordTerminalDelivery(ha.lease!.token, { ...reply, id: 'a-1', thread: 'a' })
+    const hb = await seed.activate({ channel: 'C_POLL', thread: 'b' }, 'U')
+    await hb.recordTerminalDelivery(hb.lease!.token, { ...reply, id: 'b-1', thread: 'b' })
+
+    const sup = makeSupervisor()
+    const sentIds: string[] = []
+    const report = await sup.drainOutbox(
+      async (ob) => {
+        if (ob.id === 'b-1') throw slackError('not_in_channel') // one fails permanently
+        sentIds.push(ob.id)
+      },
+      { delayMs: async () => {} },
+    )
+
+    expect(report.scanned).toBe(2)
+    expect(report.delivered).toEqual(['a-1'])
+    expect(report.deadLettered).toEqual([{ id: 'b-1', error: 'not_in_channel' }])
+    expect(sentIds).toEqual(['a-1'])
+  })
+
+  test('a corrupt/unreadable session file is skipped, never throwing', async () => {
+    // Seed an obligation, then corrupt the file. The outbox scan skips an
+    // unreadable session (the recovery sweep is the path that quarantines it),
+    // so the drain neither sees the obligation nor throws.
+    await seedObligation()
+    writeFileSync(sessionPath(tmpRoot, key), 'not json at all', 'utf8')
+
+    const sup = makeSupervisor()
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+
+    // pendingDeliveries skips the unreadable file, so nothing is scanned.
+    expect(report.scanned).toBe(0)
+    expect(calls).toBe(0)
+  })
+
+  test('a second pass does not re-process delivered/dead obligations', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    await sup.drainOutbox(async () => {}) // first pass delivers d-1
+
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+    expect(report.scanned).toBe(0) // d-1 is delivered, no longer pending
+    expect(calls).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
 // ---------------------------------------------------------------------------
 
@@ -9947,6 +10323,7 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
       reapIdle: async () => {},
       recoverOnStartup: async () => ({ scanned: 0, requeued: [], orphaned: [] }),
       pendingDeliveries: async () => [],
+      drainOutbox: async () => ({ scanned: 0, delivered: [], deadLettered: [], skipped: [] }),
       shutdown: () => {
         shutdownCalled = true
         return new Promise<void>((res) => {

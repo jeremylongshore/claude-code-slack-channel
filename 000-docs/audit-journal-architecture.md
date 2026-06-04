@@ -301,6 +301,41 @@ Three rules keep them disjoint:
    marker and drained by a *separate* leased poller (`ccsc-o7x.2.2`), so a
    Slack outage delays delivery without stalling the turn.
 
+#### The delivery poller (`ccsc-o7x.2.2`)
+
+`supervisor.drainOutbox(send, opts?)` is the **consumer** side of the outbox —
+one pass over every `pending` obligation (`pendingDeliveries()`). For each it
+performs the real Slack send via the injected `send` and resolves the obligation
+in one fenced write, replacing the old stderr-and-swallow on a failed
+`chat.postMessage`:
+
+- **success** → `state: 'delivered'`, `attempts` incremented;
+- **retryable** error (rate limiting, transient 5xx, network — `classifyDeliveryError`
+  in `lib.ts`) → retried in-pass with exponential backoff (`computeBackoffMs`) up
+  to `maxAttempts` (default `DEFAULT_MAX_DELIVERY_ATTEMPTS = 5`), then dead-lettered
+  if still failing — bounded, never an infinite loop;
+- **non-retryable** error (channel gone, bad auth, payload malformed — the
+  `NON_RETRYABLE_SLACK_ERRORS` set) → `state: 'dead'` immediately, the Slack error
+  code recorded in `lastError` (a dead-letter is never a silent black hole).
+
+The classification + backoff helpers are pure functions in `lib.ts` (so they are
+unit-testable and the supervisor keeps zero Slack-SDK coupling); the send loop +
+state transitions live in `supervisor.ts` (outside AGP's vendored kernel).
+
+**Lease discipline — why the poller can't double-send.** Every obligation is
+delivered under the fencing lease held over its session (`ccsc-o7x.1.1`). The
+poller re-checks the lease (`heartbeat`) immediately *before each send* and again
+*before the persist*; if a newer owner has superseded it, the poller yields
+without sending (or without committing) and leaves the obligation `pending` for
+that owner — so a stale owner never races a live one into a duplicate post. The
+benign lease-loss yield does **not** quarantine the session (that would lock out
+the legitimate new owner); only a genuine fenced write or save failure does. The
+residual crash-window duplicate — *sent but not yet marked delivered* — is closed
+by the idempotency key (`DeliveryObligation.id`) in `ccsc-o7x.2.3`; the lease
+covers the in-process superseded-owner race, idempotency covers the cross-restart
+one. Throughout, the poller touches **only** the outbox — never `audit.log`,
+never the projection (the three rules above hold unchanged).
+
 ---
 
 ## Signed events — journal v2 (ccsc-22l)

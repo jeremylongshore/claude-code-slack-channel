@@ -38,7 +38,15 @@
 
 import type { JournalWriter } from './journal'
 import type { DeliveryObligation, InFlightTurn, Session, SessionKey } from './lib'
-import { listSessions, loadSession, saveSession, sessionPath } from './lib'
+import {
+  classifyDeliveryError,
+  computeBackoffMs,
+  extractSlackErrorCode,
+  listSessions,
+  loadSession,
+  saveSession,
+  sessionPath,
+} from './lib'
 
 // ---------------------------------------------------------------------------
 // Lifecycle state
@@ -119,6 +127,16 @@ export function isLeaseStale(lease: Lease, now: number, ttlMs: number): boolean 
   return now - lease.heartbeatAt > ttlMs
 }
 
+/** Default cap on send attempts per delivery obligation before the poller
+ *  dead-letters it (ccsc-o7x.2.2). Bounds retries on a persistently-failing
+ *  retryable error so it can never loop forever. */
+export const DEFAULT_MAX_DELIVERY_ATTEMPTS = 5
+
+/** Default inter-retry wait used by `drainOutbox` — a real timer. Tests inject
+ *  a recording / no-op stub so backoff is asserted without wall-clock waits. */
+const defaultDelayMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms))
+
 /** Return a copy of `lease` with its heartbeat advanced to `now`. Pure — the
  *  input is never mutated; `token` and `owner` carry forward unchanged. */
 export function heartbeatLease(lease: Lease, now: number): Lease {
@@ -150,6 +168,25 @@ export interface RecoveryReport {
   /** Keys orphaned into quarantine — in-flight turn not provably abandoned, or
    *  the file could not be read during the sweep. */
   orphaned: SessionKey[]
+}
+
+/** Outcome of one `drainOutbox()` pass (ccsc-o7x.2.2). Every pending obligation
+ *  examined this pass lands in exactly one of the three result lists (or is
+ *  skipped). */
+export interface OutboxDrainReport {
+  /** Total pending obligations examined this pass. */
+  scanned: number
+  /** Obligation ids delivered successfully (state → `delivered`). */
+  delivered: string[]
+  /** Obligations dead-lettered (state → `dead`) with the recorded failure —
+   *  either a non-retryable Slack error or a retryable one that exhausted the
+   *  attempt cap. */
+  deadLettered: { id: string; error: string }[]
+  /** Obligation ids left `pending` and NOT sent this pass because the session's
+   *  fencing lease was lost/superseded before the send (a newer owner exists),
+   *  the session was unactivatable (quarantined), or persisting the resolved
+   *  state was fenced. They are retried on a later pass by the live owner. */
+  skipped: string[]
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +443,45 @@ export interface SessionSupervisor {
    *  read is skipped (logged), never throwing. Reads from disk so a fresh
    *  process after a crash sees obligations recorded by the prior one. */
   pendingDeliveries(): Promise<DeliveryObligation[]>
+
+  /** Delivery poller (ccsc-o7x.2.2) — the consumer side of the transactional
+   *  outbox. One pass over every `pending` obligation (`pendingDeliveries()`):
+   *  for each, deliver it via `send` under the session's fencing lease, then
+   *  persist the resolved state in one fenced write. Replaces the old
+   *  stderr-and-swallow on a failed `chat.postMessage`.
+   *
+   *    - **success** → obligation `delivered`, `attempts` incremented.
+   *    - **retryable error** (rate limit, transient 5xx, network — see
+   *      `classifyDeliveryError`) → retried in-pass with exponential backoff
+   *      (`computeBackoffMs`) up to `maxAttempts`; on exhaustion it is
+   *      dead-lettered (`dead`) with the last error recorded — bounded, never
+   *      an infinite retry.
+   *    - **non-retryable error** (channel gone, bad auth, payload malformed) →
+   *      dead-lettered immediately (`dead`) with the error recorded; no retry.
+   *
+   *  Lease discipline: each obligation is delivered under the lease held over
+   *  its session. The lease is re-checked (via `heartbeat`) immediately before
+   *  every send; if it has been superseded by a newer owner the poller yields
+   *  without sending and leaves the obligation `pending` — so a stale owner can
+   *  never race a live one into a double-send. (The residual crash-window
+   *  duplicate — sent-but-not-yet-marked — is closed by the idempotency key in
+   *  ccsc-o7x.2.3; the lease covers the in-process superseded-owner race.)
+   *
+   *  This is a SEPARATE sink from the audit journal/projection: the outbox is
+   *  authoritative for *delivery*; the obligation is never written to the audit
+   *  log and the projection is never made authoritative for delivery
+   *  (audit-journal-architecture.md invariants).
+   *
+   *  `send` performs the real Slack post (injected so this stays unit-testable
+   *  and the supervisor keeps zero Slack-SDK coupling). `opts.maxAttempts`
+   *  defaults to `DEFAULT_MAX_DELIVERY_ATTEMPTS`; `opts.delayMs` defaults to a
+   *  real timer (tests inject a stub). Best-effort + never throws: a per-
+   *  obligation failure is recorded in the report and the pass continues.
+   *  Returns an `OutboxDrainReport`. */
+  drainOutbox(
+    send: (obligation: DeliveryObligation) => Promise<void>,
+    opts?: { maxAttempts?: number; delayMs?: (ms: number) => Promise<void> },
+  ): Promise<OutboxDrainReport>
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1089,160 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
         }
       }
       return out
+    },
+
+    async drainOutbox(
+      send: (obligation: DeliveryObligation) => Promise<void>,
+      opts?: { maxAttempts?: number; delayMs?: (ms: number) => Promise<void> },
+    ): Promise<OutboxDrainReport> {
+      const maxAttempts = opts?.maxAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS
+      const delayMs = opts?.delayMs ?? defaultDelayMs
+      const report: OutboxDrainReport = {
+        scanned: 0,
+        delivered: [],
+        deadLettered: [],
+        skipped: [],
+      }
+
+      const pending = await this.pendingDeliveries()
+      for (const ob of pending) {
+        report.scanned++
+        const key: SessionKey = { channel: ob.channel, thread: ob.thread }
+
+        // Activate to obtain the session's live handle + its fencing lease. A
+        // quarantined / unloadable session is skipped (recovery owns it); the
+        // obligation stays pending for a later pass.
+        let handle: SessionHandle
+        try {
+          handle = await this.activate(key)
+        } catch (err) {
+          log('outbox.activate_error', {
+            channel: key.channel,
+            thread: key.thread,
+            id: ob.id,
+            error: errorMessage(err),
+          })
+          report.skipped.push(ob.id)
+          continue
+        }
+        const lease = handle.lease
+        if (lease === null) {
+          report.skipped.push(ob.id)
+          continue
+        }
+        const token = lease.token
+
+        // In-pass retry loop with exponential backoff, bounded by maxAttempts.
+        // `attempts` starts from the obligation's persisted count so retries
+        // accumulate across passes too. `finalState === null` means we yielded
+        // on lease loss without sending — leave the obligation pending.
+        let attempts = ob.attempts
+        let finalState: 'delivered' | 'dead' | null = null
+        let lastError: string | undefined
+        for (;;) {
+          // Re-check the lease immediately before each send. `heartbeat` returns
+          // false if a newer owner superseded the token (or the handle was
+          // quarantined) — yield without sending so a stale owner never races a
+          // live one into a double-send. On success it also renews the lease,
+          // keeping it live across legitimate backoff waits.
+          if (!handle.heartbeat(token)) {
+            log('outbox.lease_lost', { channel: key.channel, thread: key.thread, id: ob.id })
+            break
+          }
+          try {
+            await send(ob)
+            attempts++
+            finalState = 'delivered'
+            break
+          } catch (err) {
+            attempts++
+            const code = extractSlackErrorCode(err)
+            lastError = code ?? errorMessage(err)
+            if (classifyDeliveryError(code) === 'non-retryable') {
+              finalState = 'dead'
+              break
+            }
+            if (attempts >= maxAttempts) {
+              // Retryable but persistently failing — dead-letter rather than
+              // loop forever.
+              finalState = 'dead'
+              break
+            }
+            await delayMs(computeBackoffMs(attempts))
+          }
+        }
+
+        if (finalState === null) {
+          report.skipped.push(ob.id)
+          continue
+        }
+
+        // Re-check the lease before committing. If it was superseded between the
+        // send and now (a newer owner exists), do NOT persist — leave the
+        // obligation pending for that owner. Crucially we skip *without* calling
+        // the fenced `update()`, because a fenced rejection would quarantine the
+        // session (the 1.3 lease-loss contract) and lock out the legitimate new
+        // owner. Benign lease loss in the poller is a yield, not a quarantine.
+        // (Any sent-but-not-committed duplicate is the idempotency key's job in
+        // ccsc-o7x.2.3.)
+        if (!handle.heartbeat(token)) {
+          log('outbox.lease_lost_pre_persist', {
+            channel: key.channel,
+            thread: key.thread,
+            id: ob.id,
+          })
+          report.skipped.push(ob.id)
+          continue
+        }
+
+        // Persist the resolved obligation state in one fenced write. The fence
+        // (same held token, just re-validated above) is belt-and-suspenders for
+        // the microtask-window race; a save failure self-quarantines the handle.
+        // Either way: record + skip, never throw.
+        const resolved = finalState
+        const resolvedAttempts = attempts
+        const resolvedError = lastError
+        try {
+          await handle.update(
+            (prev) => ({
+              ...prev,
+              outbox: (prev.outbox ?? []).map((o) =>
+                o.id === ob.id
+                  ? {
+                      ...o,
+                      attempts: resolvedAttempts,
+                      state: resolved,
+                      // Record WHY only on dead-letter — a `delivered` record needs
+                      // no outstanding error (the attempt count still signals any
+                      // transient retries it survived).
+                      ...(resolved === 'dead' && resolvedError !== undefined
+                        ? { lastError: resolvedError }
+                        : {}),
+                    }
+                  : o,
+              ),
+            }),
+            token,
+          )
+        } catch (err) {
+          log('outbox.persist_error', {
+            channel: key.channel,
+            thread: key.thread,
+            id: ob.id,
+            error: errorMessage(err),
+          })
+          report.skipped.push(ob.id)
+          continue
+        }
+
+        if (resolved === 'delivered') {
+          report.delivered.push(ob.id)
+        } else {
+          report.deadLettered.push({ id: ob.id, error: resolvedError ?? 'unknown' })
+        }
+      }
+
+      return report
     },
   }
 }

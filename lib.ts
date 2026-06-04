@@ -217,6 +217,108 @@ export interface DeliveryObligation {
   state: 'pending' | 'delivered' | 'dead'
   /** Epoch-ms the obligation was recorded. */
   createdAt: number
+  /** The most recent failure's Slack error code (or message when no code is
+   *  extractable), recorded by the delivery poller (ccsc-o7x.2.2) on each failed
+   *  attempt and on dead-letter — a dead-lettered obligation must carry WHY it
+   *  was abandoned, never a silent black hole. Absent until the first failure;
+   *  additive + optional so 2.1-era records and clean sends carry no field. */
+  lastError?: string
+}
+
+/** How the delivery poller (ccsc-o7x.2.2) treats a failed send. `retryable`
+ *  errors (rate limiting, transient 5xx, network blips) are retried with
+ *  backoff up to a cap; `non-retryable` errors are permanent for this
+ *  (channel, payload) — dead-letter the obligation rather than retry forever. */
+export type DeliveryErrorClass = 'retryable' | 'non-retryable'
+
+/** Slack Web API error codes that are permanent for a given (channel, payload):
+ *  no amount of retrying can make the send succeed, so the obligation is
+ *  dead-lettered immediately. Anything NOT in this set (rate limiting, 5xx,
+ *  network errors, unknown codes) defaults to `retryable` — bounded by the
+ *  poller's attempt cap, so even a persistently-failing "retryable" error
+ *  converges to dead-letter instead of looping forever. Conservative by design:
+ *  an unrecognised transient error gets retries (then dead-letters) rather than
+ *  being thrown away on the first failure. (ccsc-o7x.2.2) */
+export const NON_RETRYABLE_SLACK_ERRORS: ReadonlySet<string> = new Set([
+  // Destination is gone or unreachable for this bot.
+  'channel_not_found',
+  'not_in_channel',
+  'is_archived',
+  'cannot_dm_bot',
+  'user_not_found',
+  'user_disabled',
+  // Credentials / authorization are dead — retrying with the same token cannot
+  // succeed (rotation/operator action required).
+  'invalid_auth',
+  'account_inactive',
+  'token_revoked',
+  'token_expired',
+  'no_permission',
+  'ekm_access_denied',
+  // Payload is malformed — the same bytes will always be rejected.
+  'msg_too_long',
+  'no_text',
+  'messages_tab_disabled',
+  // Workspace/channel policy forbids the action.
+  'restricted_action',
+  'restricted_action_read_only_channel',
+  'restricted_action_thread_only_channel',
+  'restricted_action_non_threadable_channel',
+])
+
+/** Classify a Slack delivery failure by its extracted error `code` (see
+ *  `extractSlackErrorCode`). A code in `NON_RETRYABLE_SLACK_ERRORS` is permanent;
+ *  everything else — including `undefined` (no code extractable) and rate-limit /
+ *  network codes — is `retryable`. Pure. (ccsc-o7x.2.2) */
+export function classifyDeliveryError(code: string | undefined): DeliveryErrorClass {
+  if (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) return 'non-retryable'
+  return 'retryable'
+}
+
+/** Best-effort extraction of a stable error code from an unknown thrown value,
+ *  WITHOUT importing the Slack SDK (lib.ts stays dependency-light + vendored).
+ *  Order of preference:
+ *    1. `err.data.error` — the canonical Slack Web API code on a
+ *       `WebAPIPlatformError` (e.g. `'channel_not_found'`).
+ *    2. `err.code` — the SDK/runtime code fallback (e.g.
+ *       `'slack_webapi_rate_limited_error'`, or a Node network errno like
+ *       `'ECONNRESET'`), used only when no platform code is present.
+ *  Returns `undefined` for a non-object throw or when neither field is a
+ *  non-empty string, in which case `classifyDeliveryError` treats it as
+ *  retryable. Pure. (ccsc-o7x.2.2) */
+export function extractSlackErrorCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null) return undefined
+  const e = err as Record<string, unknown>
+  const data = e.data
+  if (typeof data === 'object' && data !== null) {
+    const dataErr = (data as Record<string, unknown>).error
+    if (typeof dataErr === 'string' && dataErr.length > 0) return dataErr
+  }
+  if (typeof e.code === 'string' && e.code.length > 0) return e.code
+  return undefined
+}
+
+/** Tunables for `computeBackoffMs`. */
+export interface BackoffOptions {
+  /** Delay before the first retry, in ms. Default 250. */
+  baseMs?: number
+  /** Multiplier applied per attempt. Default 2 (exponential). */
+  factor?: number
+  /** Upper bound on a single backoff, in ms. Default 30_000 (30s). */
+  maxMs?: number
+}
+
+/** Exponential backoff for the `n`-th retry (1-based): `baseMs * factor^(n-1)`,
+ *  clamped to `maxMs`. `attempt <= 0` yields `0` (no wait before the first try).
+ *  Deterministic (no jitter) so the poller's retry schedule is reproducible in
+ *  tests; a single-poller deployment has no thundering-herd to jitter against.
+ *  Pure. (ccsc-o7x.2.2) */
+export function computeBackoffMs(attempt: number, opts: BackoffOptions = {}): number {
+  if (attempt <= 0) return 0
+  const baseMs = opts.baseMs ?? 250
+  const factor = opts.factor ?? 2
+  const maxMs = opts.maxMs ?? 30_000
+  return Math.min(baseMs * factor ** (attempt - 1), maxMs)
 }
 
 export interface Session {
@@ -299,6 +401,9 @@ export const SessionSchema = z
             attempts: z.number(),
             state: z.enum(['pending', 'delivered', 'dead']),
             createdAt: z.number(),
+            // ccsc-o7x.2.2 — optional last-failure marker (Slack error code or
+            // message). Optional so 2.1-era records validate under `.strict()`.
+            lastError: z.string().optional(),
           })
           .strict(),
       )
