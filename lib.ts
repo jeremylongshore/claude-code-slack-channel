@@ -321,6 +321,58 @@ export function computeBackoffMs(attempt: number, opts: BackoffOptions = {}): nu
   return Math.min(baseMs * factor ** (attempt - 1), maxMs)
 }
 
+/** Slack message-metadata `event_type` marking a message as a CCSC reply
+ *  delivery. The production send stamps it (alongside the idempotency key) so a
+ *  redelivery's `findDelivered` can recognize our own prior post. (ccsc-o7x.2.3) */
+export const DELIVERY_METADATA_EVENT_TYPE = 'ccsc_reply_delivery'
+
+/** Deterministic idempotency key for a delivery obligation — derived purely from
+ *  its stable `id` (the dedup key from ccsc-o7x.2.1: two records with the same id
+ *  denote the same logical message). Stamped on the outbound Slack message so a
+ *  replayed send after an *ambiguous* failure (the message posted, but the ack
+ *  was lost before the obligation could be marked delivered — ccsc-o7x.2.2's
+ *  residual crash window) can be recognized and skipped: at-most-once visible
+ *  delivery. Pure. (ccsc-o7x.2.3) */
+export function deliveryIdempotencyKey(obligation: DeliveryObligation): string {
+  return `ccsc-reply:${obligation.id}`
+}
+
+/** Injected I/O for `makeIdempotentSend`. The production adapter lives in
+ *  `server.ts` (scans `conversations.replies` for our delivery metadata, posts
+ *  via `chat.postMessage` with the key stamped into message metadata); tests
+ *  inject a fake Slack store. Kept as an interface so `lib.ts` imports no Slack
+ *  SDK and stays in AGP's vendored kernel. (ccsc-o7x.2.3) */
+export interface IdempotentSendDeps {
+  /** Whether a message bearing `key` already exists in (channel, thread).
+   *  Returns a truthy marker (e.g. the existing Slack `ts`) if already posted,
+   *  else `null`. */
+  findDelivered(channel: string, thread: string, key: string): Promise<string | null>
+  /** Post `obligation.payload`, stamping `key` so a later `findDelivered` can
+   *  recognize it. Resolves on success; throws on failure (the delivery poller
+   *  classifies + retries / dead-letters). */
+  post(obligation: DeliveryObligation, key: string): Promise<void>
+}
+
+/** Wrap a raw Slack post with idempotency: before posting, check whether a
+ *  message bearing this obligation's deterministic key was already delivered; if
+ *  so the send is a **no-op** (the prior post stands). Otherwise post under the
+ *  key. This is what makes the delivery poller's redelivery safe across the
+ *  ack-loss crash window (`ccsc-o7x.2.2`'s residual): the poller may re-attempt
+ *  freely and never double-posts — exactly-once visible delivery is the lease
+ *  (in-process) plus this key (cross-restart). Pure combinator over injected I/O
+ *  (no Slack-SDK import → vendored-kernel safe); the returned function is the
+ *  `send` that `SessionSupervisor.drainOutbox` consumes. (ccsc-o7x.2.3) */
+export function makeIdempotentSend(
+  deps: IdempotentSendDeps,
+): (obligation: DeliveryObligation) => Promise<void> {
+  return async (obligation) => {
+    const key = deliveryIdempotencyKey(obligation)
+    const existing = await deps.findDelivered(obligation.channel, obligation.thread, key)
+    if (existing) return
+    await deps.post(obligation, key)
+  }
+}
+
 export interface Session {
   /** Schema version of this session file. */
   v: SessionSchemaVersion

@@ -336,6 +336,32 @@ covers the in-process superseded-owner race, idempotency covers the cross-restar
 one. Throughout, the poller touches **only** the outbox — never `audit.log`,
 never the projection (the three rules above hold unchanged).
 
+#### Idempotent redelivery (`ccsc-o7x.2.3`)
+
+The lease stops a *superseded owner* from double-sending, but it cannot help the
+**ambiguous failure**: the post reached Slack and the message landed, but the ack
+was lost (timeout / crash) before the obligation could be marked `delivered`. On
+the next pass the obligation is still `pending`, so a naive retry would post the
+reply twice. The fix is a deterministic idempotency key:
+
+- `deliveryIdempotencyKey(ob)` (pure, `lib.ts`) derives `ccsc-reply:<id>` from the
+  obligation's stable `id` (the same id the 2.1 doc calls the logical-message
+  identity). Same obligation → same key, across restarts.
+- `makeIdempotentSend(deps)` (pure combinator, `lib.ts`) wraps a raw Slack post:
+  before posting it asks `deps.findDelivered(channel, thread, key)` whether a
+  message bearing that key already exists in the thread; if so the send is a
+  **no-op** (the prior post stands), otherwise it posts under the key
+  (`deps.post` stamps it into Slack message `metadata`, `event_type`
+  `ccsc_reply_delivery`). The poller (`drainOutbox`) consumes the wrapped `send`
+  unchanged — idempotency is a property of the send, not of the poll loop.
+
+So **exactly-once visible delivery = lease (in-process) + idempotency key
+(cross-restart)**: the lease blocks the live race, the key makes any replay after
+an ack-loss window a no-op. `lib.ts` imports no Slack SDK — the production
+`findDelivered` (scan `conversations.replies` for our delivery metadata) and
+`post` (`chat.postMessage` with the key stamped) are injected from `server.ts`,
+so the combinator stays in AGP's vendored kernel.
+
 ---
 
 ## Signed events — journal v2 (ccsc-22l)

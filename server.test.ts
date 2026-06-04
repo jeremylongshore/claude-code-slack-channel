@@ -33,9 +33,11 @@ import {
   chunkText,
   classifyDeliveryError,
   computeBackoffMs,
+  DELIVERY_METADATA_EVENT_TYPE,
   type DeliveryObligation,
   declaredSecretNames,
   defaultAccess,
+  deliveryIdempotencyKey,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
@@ -46,6 +48,7 @@ import {
   gate,
   generateCode,
   generateCorrelationId,
+  type IdempotentSendDeps,
   type InFlightTurn,
   isDuplicateEvent,
   isSlackFileUrl,
@@ -53,6 +56,7 @@ import {
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
+  makeIdempotentSend,
   migrateFlatSessions,
   NON_RETRYABLE_SLACK_ERRORS,
   PAIRING_EXPIRY_MS,
@@ -6317,6 +6321,173 @@ describe('delivery poller drainOutbox (ccsc-o7x.2.2)', () => {
     })
     expect(report.scanned).toBe(0) // d-1 is delivered, no longer pending
     expect(calls).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Idempotent redelivery — makeIdempotentSend (ccsc-o7x.2.3)
+// ---------------------------------------------------------------------------
+
+interface FakePost {
+  key: string
+  channel: string
+  thread: string
+  payload: string
+}
+
+/** A fake Slack the idempotent send posts into, keyed by idempotency key. With
+ *  `failFirstPostAfterStoring` the first post LANDS the message then throws —
+ *  simulating an ack lost after Slack already accepted the post (the ambiguous
+ *  failure idempotency must survive). */
+function makeFakeSlack(opts: { failFirstPostAfterStoring?: boolean } = {}): {
+  store: FakePost[]
+  deps: IdempotentSendDeps
+  postCalls: () => number
+  findCalls: () => { channel: string; thread: string; key: string }[]
+} {
+  const store: FakePost[] = []
+  const finds: { channel: string; thread: string; key: string }[] = []
+  let postCalls = 0
+  const deps: IdempotentSendDeps = {
+    findDelivered: async (channel, thread, key) => {
+      finds.push({ channel, thread, key })
+      const hit = store.find((m) => m.key === key && m.channel === channel && m.thread === thread)
+      return hit ? `ts-${key}` : null
+    },
+    post: async (ob, key) => {
+      postCalls++
+      store.push({ key, channel: ob.channel, thread: ob.thread, payload: ob.payload })
+      if (opts.failFirstPostAfterStoring && postCalls === 1) {
+        // Message landed at Slack, but the ack never came back.
+        throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+      }
+    },
+  }
+  return { store, deps, postCalls: () => postCalls, findCalls: () => finds }
+}
+
+const obFixture: DeliveryObligation = {
+  id: 'd-1',
+  channel: 'C_IDEM',
+  thread: 'T1',
+  payload: 'hello',
+  attempts: 0,
+  state: 'pending',
+  createdAt: 1_700_000_000_000,
+}
+
+describe('deliveryIdempotencyKey (ccsc-o7x.2.3)', () => {
+  test('is deterministic and derived from the obligation id', () => {
+    expect(deliveryIdempotencyKey(obFixture)).toBe('ccsc-reply:d-1')
+    expect(deliveryIdempotencyKey(obFixture)).toBe(deliveryIdempotencyKey({ ...obFixture }))
+  })
+
+  test('distinct ids → distinct keys; same id across threads → same key', () => {
+    expect(deliveryIdempotencyKey({ ...obFixture, id: 'd-2' })).toBe('ccsc-reply:d-2')
+    // The id IS the logical-message identity; channel/thread do not perturb it.
+    expect(deliveryIdempotencyKey({ ...obFixture, channel: 'OTHER', thread: 'X' })).toBe(
+      'ccsc-reply:d-1',
+    )
+  })
+
+  test('the metadata event type is the stable CCSC delivery marker', () => {
+    expect(DELIVERY_METADATA_EVENT_TYPE).toBe('ccsc_reply_delivery')
+  })
+})
+
+describe('makeIdempotentSend (ccsc-o7x.2.3)', () => {
+  test('first delivery posts once under the derived key', async () => {
+    const fake = makeFakeSlack()
+    const send = makeIdempotentSend(fake.deps)
+    await send(obFixture)
+
+    expect(fake.postCalls()).toBe(1)
+    expect(fake.store).toEqual([
+      { key: 'ccsc-reply:d-1', channel: 'C_IDEM', thread: 'T1', payload: 'hello' },
+    ])
+    // The dedup lookup ran first, with the derived key.
+    expect(fake.findCalls()[0]).toEqual({ channel: 'C_IDEM', thread: 'T1', key: 'ccsc-reply:d-1' })
+  })
+
+  test('a replay when the key is already delivered is a no-op (no second post)', async () => {
+    const fake = makeFakeSlack()
+    const send = makeIdempotentSend(fake.deps)
+    await send(obFixture) // posts
+    await send(obFixture) // replay → findDelivered hits → no-op
+
+    expect(fake.postCalls()).toBe(1)
+    expect(fake.store).toHaveLength(1)
+  })
+
+  test('at-most-once under simulated ack loss: posted-then-throws, replay dedups', async () => {
+    const fake = makeFakeSlack({ failFirstPostAfterStoring: true })
+    const send = makeIdempotentSend(fake.deps)
+
+    // First attempt lands the message at Slack but the ack is lost → throws.
+    await expect(send(obFixture)).rejects.toThrow(/socket hang up/)
+    expect(fake.store).toHaveLength(1)
+
+    // The poller would retry. The replay finds the prior post and is a no-op —
+    // the visible message count stays at exactly one.
+    await send(obFixture)
+    expect(fake.postCalls()).toBe(1) // never posted twice
+    expect(fake.store).toHaveLength(1)
+  })
+})
+
+describe('idempotent delivery through the poller (ccsc-o7x.2.3 × 2.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_POLL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-idem-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('drainOutbox + makeIdempotentSend: ack loss yields exactly one visible delivery', async () => {
+    // Seed a pending obligation for the poller.
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: 'C_POLL',
+      thread: 'T1',
+      payload: 'hello',
+    })
+
+    // The first post lands at Slack then throws (ack lost). The poller's in-pass
+    // retry re-sends — but the idempotent wrapper finds the prior post and
+    // no-ops, so the obligation is delivered with exactly one visible message.
+    const fake = makeFakeSlack({ failFirstPostAfterStoring: true })
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(fake.deps), {
+      maxAttempts: 3,
+      delayMs: async () => {},
+    })
+
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+    expect(fake.postCalls()).toBe(1) // posted exactly once despite the retry
+    expect(fake.store).toHaveLength(1)
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
   })
 })
 
