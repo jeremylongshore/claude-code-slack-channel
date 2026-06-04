@@ -39,7 +39,31 @@ mkdir -p "$REPORT_DIR"
 emit_result() {
   local tool="$1" status="$2" violations="$3" log="$4"
   if [[ "$JSON_OUT" -eq 1 ]]; then
-    printf '{"tool":"%s","status":"%s","violations":%s,"log":"%s"}\n' \
+    # status: pass / fail / missing-tool / not-configured
+    local result
+    case "$status" in
+      pass) result="PASS" ;;
+      fail) result="FAIL" ;;
+      missing-tool|not-configured) result="NOT_APPLICABLE" ;;
+      *) result="ADVISORY" ;;
+    esac
+    local input_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    local policy_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    # Best-effort: input_hash is the source tree fingerprint when running against ROOT/src
+    if [[ -d "${ROOT}/src" ]]; then
+      input_hash=$(find "${ROOT}/src" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.kt" -o -name "*.cs" -o -name "*.php" \) -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print "sha256:"$1}')
+    fi
+    # Hash the architecture rule config (whichever tool's config was used)
+    for cfg in .dependency-cruiser.js .dependency-cruiser.cjs .importlinter deptrac.yaml arch-go.yml; do
+      if [[ -f "${ROOT}/${cfg}" ]]; then
+        policy_hash=$(sha256sum "${ROOT}/${cfg}" | awk '{print "sha256:"$1}')
+        break
+      fi
+    done
+    local fail_block=""
+    [[ "$result" == "FAIL" ]] && fail_block=',"failure_mode":"arch-violation"'
+    printf '{"gate_id":"audit-harness:%s:arch-check","result":"%s"%s,"input_hash":"%s","policy_hash":"%s","metadata":{"tool":"%s","status":"%s","violations":%s,"log":"%s"}}\n' \
+      "${AUDIT_HARNESS_SIDE:-ci}" "$result" "$fail_block" "$input_hash" "$policy_hash" \
       "$tool" "$status" "$violations" "$log"
   else
     echo "arch-check: tool=$tool status=$status violations=$violations"

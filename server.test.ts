@@ -21,17 +21,23 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  allowedSinkFor,
+  assertNoSecretValues,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildSecretPlaceholderMap,
+  buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
+  declaredSecretNames,
   defaultAccess,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
+  findSecretDeclaration,
   type GateOptions,
   gate,
   generateCode,
@@ -47,17 +53,30 @@ import {
   PERMISSION_REPLY_RE,
   parseSendableRoots,
   pruneExpired,
+  redactSecretValues,
   resolveJournalPath,
+  SECRET_DECLARATIONS,
+  type SecretDeclaration,
+  type SecretSink,
   type Session,
   type SessionKey,
   sanitizeDisplayName,
   sanitizeFilename,
   saveSession,
+  secretNameFromPlaceholder,
+  secretPlaceholder,
   sessionPath,
   shouldPostAuditReceipt,
   validateSendableRoots,
 } from './lib.ts'
-import { createSessionSupervisor } from './supervisor.ts'
+import {
+  createSessionSupervisor,
+  DEFAULT_LEASE_TTL_MS,
+  heartbeatLease,
+  isLeaseStale,
+  type Lease,
+  resolveLeaseTtlMs,
+} from './supervisor.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -623,6 +642,347 @@ describe('gate', () => {
 // The new allowlist-based assertSendable uses realpathSync to follow symlinks,
 // so tests must operate on real files under a temp directory rather than
 // purely-lexical paths.
+
+// ---------------------------------------------------------------------------
+// Secret declarations (ccsc-z0n.1) — one table, three consumers, no drift
+// ---------------------------------------------------------------------------
+
+describe('secret declarations (ccsc-z0n.1)', () => {
+  test('declares the two Slack tokens the runtime loads', () => {
+    const names = SECRET_DECLARATIONS.map((d) => d.name).sort()
+    expect(names).toEqual(['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN'])
+  })
+
+  test('table is frozen and has no duplicate names', () => {
+    expect(Object.isFrozen(SECRET_DECLARATIONS)).toBe(true)
+    const names = SECRET_DECLARATIONS.map((d) => d.name)
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  test('every declaration carries a non-empty value prefix and injection point', () => {
+    for (const d of SECRET_DECLARATIONS) {
+      expect(d.valuePrefix.length).toBeGreaterThan(0)
+      expect(d.injectionPoint.length).toBeGreaterThan(0)
+      expect(d.envVar.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('declared value prefixes match the boot-time token shape checks', () => {
+    // server.ts validates xoxb-/xapp- at boot; the table is the source those
+    // prefixes should ultimately derive from. Lock the correspondence here.
+    expect(findSecretDeclaration('SLACK_BOT_TOKEN')?.valuePrefix).toBe('xoxb-')
+    expect(findSecretDeclaration('SLACK_APP_TOKEN')?.valuePrefix).toBe('xapp-')
+  })
+
+  describe('placeholder consumer', () => {
+    test('round-trips name → placeholder → name for every declared secret', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        const ph = secretPlaceholder(d.name)
+        expect(secretNameFromPlaceholder(ph)).toBe(d.name)
+      }
+    })
+
+    test('placeholder never contains the declared live-value prefix', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        expect(secretPlaceholder(d.name)).not.toContain(d.valuePrefix)
+      }
+    })
+
+    test('non-placeholder strings decode to undefined', () => {
+      expect(secretNameFromPlaceholder('xoxb-1-2-realtokenlike')).toBeUndefined()
+      expect(secretNameFromPlaceholder('{{CCSC_SECRET:}}')).toBeUndefined()
+      expect(secretNameFromPlaceholder('SLACK_BOT_TOKEN')).toBeUndefined()
+      expect(secretNameFromPlaceholder('  {{CCSC_SECRET:SLACK_BOT_TOKEN}}  ')).toBeUndefined()
+    })
+  })
+
+  describe('guard consumer', () => {
+    test('watch-set is exactly the declared names — no second list', () => {
+      expect(declaredSecretNames().sort()).toEqual(SECRET_DECLARATIONS.map((d) => d.name).sort())
+    })
+
+    test('buildSecretValueSet collects only resolved declared values', () => {
+      const set = buildSecretValueSet((d) =>
+        d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : 'xapp-live-app',
+      )
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.has('xapp-live-app')).toBe(true)
+      expect(set.size).toBe(2)
+    })
+
+    test('buildSecretValueSet skips empty/undefined values', () => {
+      const set = buildSecretValueSet((d) => (d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : ''))
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.size).toBe(1)
+
+      const none = buildSecretValueSet(() => undefined)
+      expect(none.size).toBe(0)
+    })
+
+    test('buildSecretValueSet derives from the table, not the resolver keys', () => {
+      // A resolver that also "knows" an undeclared secret must NOT leak it into
+      // the guard set — the set is keyed by the declaration table only.
+      const set = buildSecretValueSet((d) => `value-for-${d.name}`)
+      expect([...set]).not.toContain('value-for-UNDECLARED_SECRET')
+      expect(set.size).toBe(SECRET_DECLARATIONS.length)
+    })
+
+    test('buildSecretValueSet collapses duplicate values', () => {
+      const set = buildSecretValueSet(() => 'same-value-everywhere')
+      expect(set.size).toBe(1)
+    })
+  })
+
+  describe('routing consumer', () => {
+    test('allowedSinkFor returns the declared sink for each secret', () => {
+      expect(allowedSinkFor('SLACK_BOT_TOKEN')).toBe('slack-web-api')
+      expect(allowedSinkFor('SLACK_APP_TOKEN')).toBe('slack-socket-api')
+    })
+
+    test('allowedSinkFor returns undefined for an undeclared name', () => {
+      expect(allowedSinkFor('SLACK_NOT_A_TOKEN')).toBeUndefined()
+    })
+
+    test('every declared sink is a valid SecretSink', () => {
+      const valid: SecretSink[] = ['slack-web-api', 'slack-socket-api', 'none']
+      for (const d of SECRET_DECLARATIONS) {
+        expect(valid).toContain(d.allowedSink)
+      }
+    })
+  })
+
+  test('all three consumers derive from the same declaration (no drift)', () => {
+    // The core declaration-as-enforcement property: for every row in the one
+    // table, the placeholder, the guard watch-set, and the routing rule are all
+    // keyed on that row's `name` — there is no fourth place a secret is defined.
+    const guardNames = new Set(declaredSecretNames())
+    for (const d of SECRET_DECLARATIONS) {
+      // placeholder consumer
+      expect(secretNameFromPlaceholder(secretPlaceholder(d.name))).toBe(d.name)
+      // guard consumer
+      expect(guardNames.has(d.name)).toBe(true)
+      // routing consumer
+      expect(allowedSinkFor(d.name)).toBe(d.allowedSink)
+    }
+  })
+
+  test('SecretDeclaration shape is structurally enforced at compile time', () => {
+    // Type-level assertion (compiled by tsc --noEmit): a declaration assembled
+    // from the public type must match a table row by value.
+    const sample: SecretDeclaration = SECRET_DECLARATIONS[0]!
+    expect(sample.name).toBe('SLACK_BOT_TOKEN')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// assertNoSecretValues (ccsc-z0n.3) — value-exfiltration guard
+// ---------------------------------------------------------------------------
+
+describe('assertNoSecretValues (ccsc-z0n.3)', () => {
+  // Sentinel stand-in values, NOT real token shapes. The guard does pure
+  // substring matching (it is value-agnostic), so the test exercises identical
+  // logic without embedding `xoxb-`/`xapp-`-shaped strings that would (a) trip
+  // GitHub push protection and (b) violate the repo's no-token-fixtures rule.
+  // The real token *shapes* are validated separately in the schema tests above.
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const secrets = new Set([BOT, APP])
+  const BLOCK_MSG = 'Blocked: outbound payload contains a declared secret value'
+
+  test('throws when the payload IS a secret value', () => {
+    expect(() => assertNoSecretValues(BOT, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('detects a secret value anywhere in the payload (start / middle / end)', () => {
+    expect(() => assertNoSecretValues(`${BOT} trailing text`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`leading ${BOT} trailing`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`text then ${APP}`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  // The three wired call sites in server.ts all reduce to "string contains
+  // value" at the guard — the guard is content-agnostic; the wiring chooses
+  // which strings to scan (reply/edit text, file body, attachment filename).
+  test('blocks the value embedded in message text', () => {
+    expect(() => assertNoSecretValues(`here is the token: ${BOT}, oops`, secrets)).toThrow(
+      BLOCK_MSG,
+    )
+  })
+
+  test('blocks the value embedded in a file body', () => {
+    const fileBody = `# config\nSLACK_BOT_TOKEN=${BOT}\nDEBUG=true\n`
+    expect(() => assertNoSecretValues(fileBody, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('blocks the value smuggled into an attachment filename', () => {
+    expect(() => assertNoSecretValues(`leak-${APP}.txt`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('the error message never echoes the matched value or the payload', () => {
+    try {
+      assertNoSecretValues(`secret is ${BOT} do not log`, secrets)
+      throw new Error('expected assertNoSecretValues to throw')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      expect(msg).toBe(BLOCK_MSG)
+      expect(msg).not.toContain(BOT)
+      expect(msg).not.toContain('do not log')
+    }
+  })
+
+  test('allows a clean payload that contains no secret value', () => {
+    expect(() => assertNoSecretValues('a perfectly ordinary reply', secrets)).not.toThrow()
+    // A near-miss (a strict prefix of the value, not the whole value) must NOT
+    // trip the guard — only the full secret value matches.
+    expect(() => assertNoSecretValues('CCSC-TEST-BOT-SECRET only', secrets)).not.toThrow()
+  })
+
+  test('empty value set is a no-op even for token-shaped text', () => {
+    expect(() => assertNoSecretValues(BOT, new Set())).not.toThrow()
+  })
+
+  test('empty / non-string payloads are no-ops', () => {
+    expect(() => assertNoSecretValues('', secrets)).not.toThrow()
+    // Defensive: a non-string slipping through must not throw a TypeError.
+    expect(() => assertNoSecretValues(undefined as unknown as string, secrets)).not.toThrow()
+    expect(() => assertNoSecretValues(null as unknown as string, secrets)).not.toThrow()
+  })
+
+  test('blocks if ANY one of several declared values is present', () => {
+    expect(() => assertNoSecretValues(`only the app token ${APP} here`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('an empty-string entry in the set never matches', () => {
+    // buildSecretValueSet skips empty values, but guard must be robust anyway:
+    // an empty string is a substring of every payload and must NOT trip it.
+    const withEmpty = new Set(['', BOT])
+    expect(() => assertNoSecretValues('clean text', withEmpty)).not.toThrow()
+    expect(() => assertNoSecretValues(BOT, withEmpty)).toThrow(BLOCK_MSG)
+  })
+
+  test('seam: buildSecretValueSet drives the guard end-to-end (ccsc-z0n.1 → .3)', () => {
+    // Mirror how server.ts builds the set: resolve each declaration to a live
+    // value, then guard against it. Proves the guard's watch-set comes from the
+    // declaration table, not a hand-maintained list.
+    const resolved = buildSecretValueSet((d) =>
+      d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined,
+    )
+    expect(() => assertNoSecretValues(`payload with ${BOT}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`payload with ${APP}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues('payload with no secret', resolved)).not.toThrow()
+  })
+
+  test('an unset secret contributes no value to block (resolver returns undefined)', () => {
+    // If the bot token is unset in .env, its (absent) value cannot be leaked,
+    // and the guard must not block arbitrary text on its behalf.
+    const partial = buildSecretValueSet((d) => (d.name === 'SLACK_APP_TOKEN' ? APP : undefined))
+    expect(partial.size).toBe(1)
+    expect(() => assertNoSecretValues(BOT, partial)).not.toThrow()
+    expect(() => assertNoSecretValues(APP, partial)).toThrow(BLOCK_MSG)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Inbound secret-value scrub (ccsc-z0n.2) — buildSecretPlaceholderMap + redactSecretValues
+// ---------------------------------------------------------------------------
+
+describe('inbound secret-value scrub (ccsc-z0n.2)', () => {
+  // Non-token-shaped sentinels (the scrub is value-agnostic; no real shapes
+  // added to the repo — same discipline as the outbound-guard tests above).
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const BOT_PH = secretPlaceholder('SLACK_BOT_TOKEN')
+  const APP_PH = secretPlaceholder('SLACK_APP_TOKEN')
+  const resolve = (d: SecretDeclaration): string | undefined =>
+    d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined
+
+  describe('buildSecretPlaceholderMap', () => {
+    test('maps each declared live value to that declaration’s placeholder', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      expect(map.get(APP)).toBe(APP_PH)
+      expect(map.size).toBe(2)
+    })
+
+    test('the mapped placeholder is exactly secretPlaceholder(name) — ties to ccsc-z0n.1', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      // Round-trips back to the declared name via the .1 inverse.
+      expect(secretNameFromPlaceholder(map.get(BOT)!)).toBe('SLACK_BOT_TOKEN')
+      expect(secretNameFromPlaceholder(map.get(APP)!)).toBe('SLACK_APP_TOKEN')
+    })
+
+    test('skips secrets with no resolved value', () => {
+      const map = buildSecretPlaceholderMap((d) => (d.name === 'SLACK_BOT_TOKEN' ? BOT : undefined))
+      expect(map.size).toBe(1)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      const none = buildSecretPlaceholderMap(() => undefined)
+      expect(none.size).toBe(0)
+    })
+  })
+
+  describe('redactSecretValues', () => {
+    const map = buildSecretPlaceholderMap(resolve)
+
+    test('replaces a secret value with its placeholder and counts it', () => {
+      const { text, redactedCount } = redactSecretValues(`token is ${BOT} ok`, map)
+      expect(text).toBe(`token is ${BOT_PH} ok`)
+      expect(redactedCount).toBe(1)
+      expect(text).not.toContain(BOT)
+    })
+
+    test('replaces every occurrence of the same value', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} and again ${BOT}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} and again ${BOT_PH}`)
+    })
+
+    test('replaces multiple distinct values', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} then ${APP}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} then ${APP_PH}`)
+    })
+
+    test('clean text is returned unchanged with redactedCount 0', () => {
+      const { text, redactedCount } = redactSecretValues('a normal tool result', map)
+      expect(text).toBe('a normal tool result')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty map is a no-op even for text that contains a value', () => {
+      const { text, redactedCount } = redactSecretValues(BOT, new Map())
+      expect(text).toBe(BOT)
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty / non-string text is a safe no-op', () => {
+      expect(redactSecretValues('', map)).toEqual({ text: '', redactedCount: 0 })
+      expect(redactSecretValues(undefined as unknown as string, map)).toEqual({
+        text: '',
+        redactedCount: 0,
+      })
+    })
+
+    test('an empty-string key never matches (would otherwise match everywhere)', () => {
+      const withEmpty = new Map<string, string>([
+        ['', 'SHOULD-NOT-APPEAR'],
+        [BOT, BOT_PH],
+      ])
+      const { text, redactedCount } = redactSecretValues('clean text', withEmpty)
+      expect(text).toBe('clean text')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('seam: buildSecretPlaceholderMap → redactSecretValues swaps value for placeholder', () => {
+      // End-to-end mirror of how server.ts scrubs a tool result: the value the
+      // guard set knows becomes its declared placeholder; everything else is
+      // untouched.
+      const fileResult = `cat .env =>\nSLACK_APP_TOKEN=${APP}\n`
+      const { text, redactedCount } = redactSecretValues(fileResult, map)
+      expect(redactedCount).toBe(1)
+      expect(text).toBe(`cat .env =>\nSLACK_APP_TOKEN=${APP_PH}\n`)
+      expect(text).not.toContain(APP)
+    })
+  })
+})
 
 describe('assertSendable', () => {
   let root: string // tmp root that stands in for HOME
@@ -4901,6 +5261,179 @@ describe('createSessionSupervisor.activate', () => {
     const handle = await sup.activate(key, 'U_OWNER')
     // update() is now wired (ccsc-9d9); an identity fn must resolve cleanly.
     await expect(handle.update((s) => s)).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — pure helpers
+// ---------------------------------------------------------------------------
+
+describe('lease helpers (ccsc-o7x.1.1)', () => {
+  const lease: Lease = { token: 7, owner: 'owner-A', heartbeatAt: 1_000_000 }
+
+  describe('resolveLeaseTtlMs', () => {
+    test('defaults when unset or empty', () => {
+      expect(resolveLeaseTtlMs({})).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '' })).toBe(DEFAULT_LEASE_TTL_MS)
+    })
+    test('defaults on non-numeric / non-positive / non-finite', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'abc' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '0' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '-5' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'Infinity' })).toBe(
+        DEFAULT_LEASE_TTL_MS,
+      )
+    })
+    test('parses and floors a valid value', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '5000' })).toBe(5000)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '1500.9' })).toBe(1500)
+    })
+  })
+
+  describe('isLeaseStale', () => {
+    test('not stale within the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 500, 1000)).toBe(false)
+    })
+    test('not stale at exactly the TTL boundary (strict >)', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1000, 1000)).toBe(false)
+    })
+    test('stale one ms past the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1001, 1000)).toBe(true)
+    })
+  })
+
+  describe('heartbeatLease', () => {
+    test('advances heartbeatAt, preserves token + owner, does not mutate input', () => {
+      const renewed = heartbeatLease(lease, 2_000_000)
+      expect(renewed).toEqual({ token: 7, owner: 'owner-A', heartbeatAt: 2_000_000 })
+      expect(lease.heartbeatAt).toBe(1_000_000) // input untouched
+      expect(renewed).not.toBe(lease)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — supervisor integration
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor fencing lease (ccsc-o7x.1.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const keyA = { channel: 'C_LEASE', thread: 'TA' }
+  const keyB = { channel: 'C_LEASE', thread: 'TB' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-lease-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('activation records a lease (token + owner + heartbeat-at)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U_OWNER')
+    expect(handle.lease).not.toBeNull()
+    expect(handle.lease?.owner).toBe('OWNER-1')
+    expect(handle.lease?.heartbeatAt).toBe(nowValue)
+    expect(typeof handle.lease?.token).toBe('number')
+  })
+
+  test('tokens are monotonic across owners', async () => {
+    const sup = makeSupervisor()
+    const a = await sup.activate(keyA, 'U')
+    const b = await sup.activate(keyB, 'U')
+    expect(b.lease!.token).toBeGreaterThan(a.lease!.token)
+  })
+
+  test('heartbeat renews the lease when the token matches', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(token)).toBe(true)
+    expect(handle.lease!.heartbeatAt).toBe(t0 + 500)
+    expect(handle.lease!.token).toBe(token) // token unchanged by heartbeat
+  })
+
+  test('heartbeat with a superseded token does not renew', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(handle.lease!.token + 999)).toBe(false)
+    expect(handle.lease!.heartbeatAt).toBe(t0) // unchanged
+  })
+
+  test('fenced write succeeds with the live token on a fresh lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(1)
+  })
+
+  test('fenced write is rejected when the token has been superseded', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const before = handle.session
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 2 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/fenced/)
+    expect(handle.session).toBe(before) // nothing persisted
+  })
+
+  test('fenced write is rejected when the lease heartbeat has lapsed', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const before = handle.session
+
+    nowValue += TTL + 1 // lapse the lease without heartbeating
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 3 } }), token),
+    ).rejects.toThrow(/lapsed/)
+    expect(handle.session).toBe(before)
+  })
+
+  test('a renewed heartbeat un-lapses the lease so the fenced write succeeds', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+
+    nowValue += TTL + 1 // would be stale...
+    expect(handle.heartbeat(token)).toBe(true) // ...but we renew at the new now
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 4 } }), token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(4)
+  })
+
+  test('an unfenced update still works regardless of lease (backward compatible)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    nowValue += TTL + 1 // lease is stale, but no fenceToken passed
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 5 } })),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(5)
   })
 })
 

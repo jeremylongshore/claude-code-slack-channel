@@ -723,6 +723,200 @@ export function generateCode(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Secret declarations — single source of placeholder, guard, and routing
+// (ccsc-z0n.1; ADR-002 §1 credential placeholder-swap + §6 declaration-as-enforcement)
+// ---------------------------------------------------------------------------
+
+/**
+ * The outbound destinations a declared secret's *real* value is allowed to
+ * reach. A secret value appearing in a payload bound for any other sink — or in
+ * any agent-readable surface — is an exfiltration attempt (see ccsc-z0n.3,
+ * which makes the outbound guard a value-exfiltration guard over this set).
+ *
+ * `'none'` is the deny-all sink: a secret declared with `allowedSink: 'none'`
+ * may never appear in any outbound payload at all.
+ */
+export type SecretSink = 'slack-web-api' | 'slack-socket-api' | 'none'
+
+/**
+ * One declared secret. This is the ONLY place a secret's identity is defined.
+ * The placeholder the agent sees, the outbound value-exfiltration guard, and
+ * the host-bound routing rule are all *derived* from this table — never
+ * redeclared — so the three enforcement points cannot drift apart
+ * (ADR-002 §6, declaration-as-enforcement).
+ */
+export interface SecretDeclaration {
+  /** Canonical identity. Conventionally equal to `envVar`, but the identity is
+   *  the contract; the transport (env var) is incidental. */
+  readonly name: string
+  /** The environment variable the real value is loaded from on the host. */
+  readonly envVar: string
+  /** Literal prefix every live value of this secret carries (e.g. `xoxb-`).
+   *  Lets a shape check distinguish a real value from a placeholder without
+   *  hardcoding the prefix at each call site. Empty = no known prefix. */
+  readonly valuePrefix: string
+  /** Where the real value is swapped in for its placeholder — the single
+   *  outbound boundary that resolves it (ccsc-z0n.2). Description only; the
+   *  injection code names this point. */
+  readonly injectionPoint: string
+  /** The only sink the real value may travel to. Routing + the guard read
+   *  their decision from here. */
+  readonly allowedSink: SecretSink
+  /** Operator/doc-facing note. */
+  readonly description: string
+}
+
+/**
+ * The declared-secret table — the single source of truth for every secret
+ * CCSC's host process holds. Adding a secret means adding a row here and
+ * nowhere else; the placeholder, guard watch-set, and routing all derive from
+ * it. Frozen so it cannot be mutated at runtime.
+ *
+ * Today: the two Slack tokens the runtime loads from `.env` (server.ts).
+ */
+export const SECRET_DECLARATIONS: readonly SecretDeclaration[] = Object.freeze([
+  {
+    name: 'SLACK_BOT_TOKEN',
+    envVar: 'SLACK_BOT_TOKEN',
+    valuePrefix: 'xoxb-',
+    injectionPoint: 'slack-web-client',
+    allowedSink: 'slack-web-api',
+    description: 'Slack bot user OAuth token; authenticates outbound Web API calls.',
+  },
+  {
+    name: 'SLACK_APP_TOKEN',
+    envVar: 'SLACK_APP_TOKEN',
+    valuePrefix: 'xapp-',
+    injectionPoint: 'slack-socket-client',
+    allowedSink: 'slack-socket-api',
+    description: 'Slack app-level token; authenticates the Socket Mode WebSocket.',
+  },
+] as const)
+
+/**
+ * The placeholder string the agent sees in place of a real secret value.
+ * A pure, total function of the declared name — there is no second source for
+ * it, so the placeholder can never drift from the declaration. The wrapping
+ * `{{CCSC_SECRET:…}}` form is deliberately unmistakable and round-trips via
+ * `secretNameFromPlaceholder`.
+ */
+export function secretPlaceholder(name: string): string {
+  return `{{CCSC_SECRET:${name}}}`
+}
+
+const SECRET_PLACEHOLDER_RE = /^\{\{CCSC_SECRET:([A-Za-z0-9_]+)\}\}$/
+
+/**
+ * Inverse of `secretPlaceholder`: returns the declared name encoded in a
+ * placeholder string, or `undefined` if `s` is not a well-formed placeholder.
+ * Used by the injector (ccsc-z0n.2) to know which secret to swap in.
+ */
+export function secretNameFromPlaceholder(s: string): string | undefined {
+  const m = SECRET_PLACEHOLDER_RE.exec(s)
+  return m ? m[1] : undefined
+}
+
+/** Look up a single declaration by canonical name. */
+export function findSecretDeclaration(name: string): SecretDeclaration | undefined {
+  return SECRET_DECLARATIONS.find((d) => d.name === name)
+}
+
+/** Every declared secret name. The guard (ccsc-z0n.3) derives its watch-set
+ *  from this — it never maintains its own list of secret names. */
+export function declaredSecretNames(): string[] {
+  return SECRET_DECLARATIONS.map((d) => d.name)
+}
+
+/** The allowed sink for a declared secret, or `undefined` if not declared.
+ *  The routing layer and the value-exfiltration guard (ccsc-z0n.3) both read
+ *  their routing decision from here. */
+export function allowedSinkFor(name: string): SecretSink | undefined {
+  return findSecretDeclaration(name)?.allowedSink
+}
+
+/**
+ * Build the set of *live* secret values the outbound guard must block, derived
+ * from the declaration table by resolving each declared secret through
+ * `resolve` (typically `(d) => process.env[d.envVar]`). Secrets that resolve to
+ * an empty / undefined value are skipped — an unset secret has no value to
+ * leak.
+ *
+ * This is the seam ccsc-z0n.3 consumes: the guard never hardcodes a value or a
+ * name; it asks the table. The returned Set keeps membership checks O(1) and
+ * collapses duplicates if two declarations happen to share a value.
+ */
+export function buildSecretValueSet(
+  resolve: (declaration: SecretDeclaration) => string | undefined,
+): Set<string> {
+  const out = new Set<string>()
+  for (const d of SECRET_DECLARATIONS) {
+    const v = resolve(d)
+    if (typeof v === 'string' && v.length > 0) out.add(v)
+  }
+  return out
+}
+
+/**
+ * Build a live-value → placeholder map from the declaration table (ccsc-z0n.2),
+ * resolving each declaration's value via `resolve` (typically
+ * `(d) => process.env[d.envVar]`). The inbound result scrub uses this to replace
+ * any live secret value that surfaces in an agent-facing tool result with that
+ * secret's stable placeholder — the same `secretPlaceholder(name)` the
+ * declaration defines (ccsc-z0n.1), so the agent sees a recognizable placeholder
+ * rather than a raw or generically-redacted value. Secrets with no resolved
+ * value are skipped (nothing to scrub).
+ */
+export function buildSecretPlaceholderMap(
+  resolve: (declaration: SecretDeclaration) => string | undefined,
+): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const d of SECRET_DECLARATIONS) {
+    const v = resolve(d)
+    if (typeof v === 'string' && v.length > 0) out.set(v, secretPlaceholder(d.name))
+  }
+  return out
+}
+
+/**
+ * Replace every occurrence of a declared secret value in `text` with its
+ * placeholder (ccsc-z0n.2). The inbound (tool-result → agent) complement of
+ * `assertNoSecretValues` on the outbound (agent → Slack) direction.
+ *
+ * **Why this is defense-in-depth, not the primary control.** CCSC's architecture
+ * already keeps tokens out of agent-readable surfaces: the Claude Code session
+ * *spawns* the bridge as a separate MCP-stdio subprocess (ARCHITECTURE.md), and
+ * the tokens live only in the bridge process, flowing only into Slack-bound
+ * sinks — never into a tool result. This scrub is the backstop: if a future tool
+ * or refactor ever placed a live token in a result, it is swapped to a
+ * placeholder before the agent can read it, and the caller can journal the
+ * near-miss (the non-zero `redactedCount`). It is *not* a placeholder-injection
+ * layer — there is nothing to inject, because the agent never holds the value.
+ *
+ * Uses literal split/join (not regex) so secret values need no escaping. Returns
+ * the input unchanged with `redactedCount: 0` when nothing matched (the common
+ * case, kept allocation-light). Pure over its inputs.
+ */
+export function redactSecretValues(
+  text: string,
+  placeholders: ReadonlyMap<string, string>,
+): { text: string; redactedCount: number } {
+  if (typeof text !== 'string' || text.length === 0 || placeholders.size === 0) {
+    return { text: typeof text === 'string' ? text : '', redactedCount: 0 }
+  }
+  let out = text
+  let redactedCount = 0
+  for (const [value, placeholder] of placeholders) {
+    if (value.length === 0) continue
+    const parts = out.split(value)
+    if (parts.length > 1) {
+      redactedCount += parts.length - 1
+      out = parts.join(placeholder)
+    }
+  }
+  return { text: out, redactedCount }
+}
+
+// ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
 
@@ -948,6 +1142,36 @@ export function assertSendable(
       if (components[i] === a && components[i + 1] === b) {
         throw new Error('Blocked: path descends through a sensitive directory')
       }
+    }
+  }
+}
+
+/**
+ * Throws if `payload` contains any declared-secret *value* (ccsc-z0n.3).
+ *
+ * The companion to `assertSendable`: where that guard blocks secret *files* by
+ * path, this blocks secret *values* by content — closing the case where a live
+ * token is pasted into message text, a file body, or an attachment rather than
+ * a state file. This is the **additive** value-exfiltration guard from the
+ * token-firewall epic (ccsc-z0n): `assertSendable`'s signature is deliberately
+ * left unchanged because `lib.ts` is vendored by AGP (ADR 009) — the two guards
+ * compose, they do not merge. (When this lands, AGP flags a deliberate kernel
+ * re-sync in `substrate/UPSTREAM.md`; AGP wants the stronger guard too.)
+ *
+ * `secretValues` is the live-value set built by `buildSecretValueSet` from the
+ * `SECRET_DECLARATIONS` table (ccsc-z0n.1) — the guard never hardcodes a value
+ * or a name. An empty set is a no-op (no declared secret has a resolved value
+ * to leak), so a deployment with no secrets configured pays nothing.
+ *
+ * Pure over its inputs. The thrown message NEVER echoes the matched value or
+ * the surrounding payload — echoing either would itself open a leak channel
+ * (the same discipline `assertSendable` follows for paths).
+ */
+export function assertNoSecretValues(payload: string, secretValues: ReadonlySet<string>): void {
+  if (typeof payload !== 'string' || payload.length === 0) return
+  for (const value of secretValues) {
+    if (value.length > 0 && payload.includes(value)) {
+      throw new Error('Blocked: outbound payload contains a declared secret value')
     }
   }
 }

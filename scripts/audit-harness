@@ -10,7 +10,7 @@ SCRIPTS="${HARNESS_DIR}/scripts"
 
 if [[ ! -d "${SCRIPTS}" ]]; then
   echo "✗ audit-harness: scripts not found at ${SCRIPTS}" >&2
-  echo "  re-run the installer: curl -sSL https://raw.githubusercontent.com/jeremylongshore/audit-harness/main/install.sh | bash" >&2
+  echo "  re-run the installer: curl -sSL https://raw.githubusercontent.com/jeremylongshore/intent-audit-harness/main/install.sh | bash" >&2
   exit 2
 fi
 
