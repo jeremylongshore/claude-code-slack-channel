@@ -223,7 +223,12 @@ export interface SessionHandle {
    *      token has been superseded by a newer owner, or if the lease's
    *      heartbeat has lapsed past the TTL. Omit `fenceToken` for an unfenced
    *      write (current default for callers that do not yet hold a lease).
-   *      (ccsc-o7x.1.1) */
+   *      (ccsc-o7x.1.1)
+   *    - A fenced rejection is treated as **lease loss**: the handle is
+   *      transitioned to `quarantined` (and removed from the supervisor's
+   *      active set) so the turn performs no further work, rather than retried.
+   *      `fenceToken` is the owner's own held lease token, so a mismatch is a
+   *      real loss, not a stray caller. (ccsc-o7x.1.3) */
   update(fn: (prev: Session) => Session, fenceToken?: number): Promise<void>
 }
 
@@ -1132,6 +1137,19 @@ class ConcreteHandle implements SessionHandle {
     this._state = 'quarantined'
   }
 
+  /** Drive this handle into the quarantine terminal AND notify the supervisor
+   *  so its live + quarantined maps stay in sync — without that, a subsequent
+   *  `activate()` would hand back this now-quarantined handle from the live map
+   *  instead of rejecting (sticky-quarantine invariant). Idempotent: a no-op
+   *  once already quarantined, so it never double-fires `onQuarantine`. Shared
+   *  by the save-failure path and the lease-loss fence in `update()`
+   *  (ccsc-o7x.1.3). */
+  private quarantineSelf(err: Error): void {
+    if (this._state === 'quarantined') return
+    this._state = 'quarantined'
+    this.onQuarantine?.(err)
+  }
+
   /** Begin a graceful drain. Transitions state `active` → `quiescing`
    *  and returns a promise that resolves when the in-flight map reaches
    *  zero entries. Contract:
@@ -1282,18 +1300,29 @@ class ConcreteHandle implements SessionHandle {
       // the mutex, because a newer owner could have superseded the token (or it
       // could have lapsed) while this write waited in the queue. `fn` is not
       // called and nothing is persisted on a fenced rejection.
+      // A fenced write means the owner has LOST its lease — either a newer
+      // owner superseded its token or its heartbeat lapsed. Per ccsc-o7x.1.3
+      // this is not a transient retry: route the session through the existing
+      // quarantine terminal so it performs no further tool calls or sends and
+      // is excluded from the active set, rather than letting a possibly-
+      // split-brained turn keep acting. (The fenceToken is the owner's own
+      // held lease token, so a mismatch is a real loss, not a stray caller.)
       if (fenceToken !== undefined) {
         const lease = this._lease
         if (lease === null || lease.token !== fenceToken) {
-          reject(
-            new Error(
-              `SessionHandle.update: write fenced — no live lease or token superseded (presented ${fenceToken})`,
-            ),
+          const err = new Error(
+            `SessionHandle.update: write fenced — lease lost (no live lease or token superseded; presented ${fenceToken}); handle quarantined`,
           )
+          this.quarantineSelf(err)
+          reject(err)
           return
         }
         if (isLeaseStale(lease, this.clock(), this.leaseTtlMs)) {
-          reject(new Error(`SessionHandle.update: write fenced — lease heartbeat lapsed`))
+          const err = new Error(
+            `SessionHandle.update: write fenced — lease heartbeat lapsed; handle quarantined`,
+          )
+          this.quarantineSelf(err)
+          reject(err)
           return
         }
       }
@@ -1310,13 +1339,8 @@ class ConcreteHandle implements SessionHandle {
         // activate() calls fail fast. In-memory session reverts to
         // `prev` (it was never reassigned). This mirrors the deactivate()
         // failure arm exactly (session-state-machine.md §132-137).
-        this._state = 'quarantined'
         const errObj = err instanceof Error ? err : new Error(String(err))
-        // Notify the supervisor so its quarantined map and live map stay
-        // in sync. Without this, a subsequent activate() would return the
-        // cached live handle (which is now quarantined) instead of
-        // rejecting — violating the sticky-quarantine invariant.
-        this.onQuarantine?.(errObj)
+        this.quarantineSelf(errObj)
         reject(
           new Error(`SessionHandle.update: save failed; handle quarantined`, {
             cause: errObj,
