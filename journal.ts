@@ -13,7 +13,7 @@
  *     v:        1,                          // schema version; chain refuses mixed versions
  *     ts:       '2026-04-19T12:34:56.789Z', // ISO-8601 UTC with ms precision
  *     seq:      42,                         // monotonic per chain
- *     kind:     'gate.inbound.drop',        // discriminated union of 22 event kinds
+ *     kind:     'gate.inbound.drop',        // discriminated union of 36 event kinds
  *     toolName?: 'reply',
  *     input?:   { chat_id: 'C01', text: '...' },     // post-redaction
  *     outcome?: 'allow' | 'deny' | 'require' | 'drop' | 'n/a',
@@ -81,6 +81,14 @@ export const EventKind = z.enum([
   'session.quiesce',
   'session.deactivate',
   'session.quarantine',
+  // Boot-time crash recovery (ccsc-o7x.1.2). `recoverOnStartup()` emits one
+  // event per session with a persisted in-flight-turn marker: `.requeued` when
+  // the marker's heartbeat has lapsed (owner provably dead → the marker is
+  // cleared and the session is left re-activatable); `.orphaned` when the
+  // marker is still fresh (a second live owner cannot be ruled out → the key is
+  // quarantined, fail closed) or the file could not be read.
+  'session.recovery.requeued',
+  'session.recovery.orphaned',
   'pairing.issued',
   'pairing.accepted',
   'pairing.expired',
@@ -135,7 +143,7 @@ export const EventKind = z.enum([
   'manifest.publish',
 ])
 
-/** TypeScript string union of the 22 event kinds. */
+/** TypeScript string union of the 36 event kinds. */
 export type EventKind = z.infer<typeof EventKind>
 
 // ---------------------------------------------------------------------------
