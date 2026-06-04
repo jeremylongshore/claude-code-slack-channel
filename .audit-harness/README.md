@@ -1,5 +1,11 @@
 # @intentsolutions/audit-harness
 
+[![npm](https://img.shields.io/npm/v/@intentsolutions/audit-harness?color=cb3837&logo=npm)](https://www.npmjs.com/package/@intentsolutions/audit-harness)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Provenance](https://img.shields.io/badge/sigstore-provenance-066da5)](https://www.npmjs.com/package/@intentsolutions/audit-harness)
+
+Part of the **[Intent Eval Platform](https://github.com/intent-solutions-io/intent-eval-platform)** — the umbrella mapping the six repos that converge via a shared Evidence Bundle schema.
+
 Deterministic test-enforcement toolkit. Companion to the `audit-tests` and `implement-tests` Claude Code skills — but usable standalone in any repo that wants hash-pinned, escape-scanned, AI-proof quality gates.
 
 ## What it is
@@ -19,10 +25,34 @@ A small CLI wrapping 6 deterministic scripts:
 
 ## Install
 
+Pick the install flavor that matches your repo's ecosystem — all three publish the same CLI surface.
+
+**Node / JS / TS** (from npm):
+
 ```bash
 pnpm add -D @intentsolutions/audit-harness
 # or: npm install --save-dev @intentsolutions/audit-harness
 # or: yarn add --dev @intentsolutions/audit-harness
+```
+
+**Python** (from PyPI):
+
+```bash
+pip install intent-audit-harness
+# or inside a project venv:
+python -m pip install intent-audit-harness
+```
+
+**Rust** (from crates.io):
+
+```bash
+cargo install intent-audit-harness
+```
+
+**Any other language** (Go, Ruby, PHP, Java, .NET, shell, etc.) — vendor the scripts:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/jeremylongshore/intent-audit-harness/main/install.sh | bash
 ```
 
 ## Quick usage
@@ -75,7 +105,7 @@ See `audit-tests/references/philosophy.md` in the companion skill for the full r
 
 This harness sits inside a larger framework:
 
-```
+```text
 L7  Acceptance / RTM / Personas / Journeys     ← WHAT are we proving?
 L6  E2E / BDD / Visual regression              ← User-level guarantees
 L5  Perf / Security (SAST/DAST) / A11y / Chaos ← Non-functional
@@ -115,12 +145,14 @@ Most scripts are language-agnostic (shell + regex). CRAP has per-language backen
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+Apache 2.0 — see [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
+
+**Note:** versions `0.x` shipped under the MIT license. Starting with `v1.0.0`, the project is licensed under Apache 2.0. Existing `0.x` releases on npm remain available under their original MIT terms; new releases (`>= 1.0.0`) are Apache 2.0.
 
 ## Related
 
-- [`audit-tests` Claude Code skill](https://github.com/jeremylongshore/audit-harness#related) — diagnostic pipeline that uses this harness
-- [`implement-tests` Claude Code skill](https://github.com/jeremylongshore/audit-harness#related) — filesystem-mutating installer that installs this harness as part of L1/L3 setup
+- [`audit-tests` Claude Code skill](https://github.com/jeremylongshore/intent-audit-harness#related) — diagnostic pipeline that uses this harness
+- [`implement-tests` Claude Code skill](https://github.com/jeremylongshore/intent-audit-harness#related) — filesystem-mutating installer that installs this harness as part of L1/L3 setup
 
 ## Versioning
 
