@@ -272,6 +272,35 @@ Why separate the projection?
 3. **The projection can be disabled** without losing anything; the
    journal is primary.
 
+### The reply-delivery outbox is NOT the audit projection (ccsc-o7x.2.1)
+
+The crash-safety epic (`ccsc-o7x`) adds a **reply-delivery outbox** — a durable
+"reply owed" record (`DeliveryObligation`) written when a turn reaches its
+terminal state, so a failed `chat.postMessage` is retried instead of swallowed.
+It is easy to confuse with the audit projection (both touch Slack), so the
+boundary is stated explicitly:
+
+| | **Audit projection** (30-B) | **Reply-delivery outbox** (`ccsc-o7x.2`) |
+|---|---|---|
+| Authoritative for | nothing — it is a best-effort *mirror* of the journal | **delivery** of one outbound reply |
+| Source of truth | the local hash-chained journal | the `outbox` field on the session file |
+| Stored where | derived from `audit.log` | `Session.outbox` (per-thread state file) — **never** `audit.log` |
+| May block tool execution? | never (invariant 1) | never — recorded *before* the send, drained out-of-band by the poller |
+| Direction | one-way journal → projection | one-way turn-terminal → outbox → poller → Slack |
+
+Three rules keep them disjoint:
+
+1. **The obligation is never written to `audit.log`.** It lives in the session
+   file. The journal records *that a reply was owed/sent* as ordinary events if
+   at all; it is not the delivery ledger.
+2. **The audit projection is never made authoritative for delivery.** A reply
+   appearing (or not) in the `#audit` projection says nothing about whether the
+   reply was delivered — only the outbox does.
+3. **Neither blocks tool execution.** The projection swallows failures
+   (invariant 1); the outbox is written atomically with the turn's terminal
+   marker and drained by a *separate* leased poller (`ccsc-o7x.2.2`), so a
+   Slack outage delays delivery without stalling the turn.
+
 ---
 
 ## Signed events — journal v2 (ccsc-22l)

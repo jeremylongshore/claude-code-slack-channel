@@ -31,6 +31,7 @@ import {
   buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
+  type DeliveryObligation,
   declaredSecretNames,
   defaultAccess,
   detectNewAllowFrom,
@@ -5792,6 +5793,158 @@ describe('lease-loss quarantine (ccsc-o7x.1.3)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Reply-delivery outbox — record obligation (ccsc-o7x.2.1)
+// ---------------------------------------------------------------------------
+
+describe('reply-delivery outbox (ccsc-o7x.2.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_OBX', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-outbox-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  const reply = { id: 'd-1', channel: 'C_OBX', thread: 'T1', payload: 'hello' }
+
+  test('recordTerminalDelivery persists a pending obligation (stamps attempts/state/createdAt)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, reply)
+
+    expect(handle.session.outbox).toEqual([
+      {
+        id: 'd-1',
+        channel: 'C_OBX',
+        thread: 'T1',
+        payload: 'hello',
+        attempts: 0,
+        state: 'pending',
+        createdAt: nowValue,
+      },
+    ])
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.id).toBe('d-1')
+  })
+
+  test('records the obligation atomically with the terminal marker — one write clears inFlightTurn AND appends', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTerminalDelivery(token, reply)
+    // Same write: marker gone, obligation present.
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    expect(handle.session.outbox).toHaveLength(1)
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    expect(reloaded.outbox).toHaveLength(1)
+  })
+
+  test('recordTerminalDelivery is fenced — a superseded token rejects and writes nothing', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.recordTerminalDelivery(handle.lease!.token + 999, reply)).rejects.toThrow(
+      /fenced|lease lost/,
+    )
+    expect(handle.session.outbox).toBeUndefined()
+  })
+
+  test('multiple terminal deliveries accumulate in the outbox', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTerminalDelivery(token, { ...reply, id: 'd-1' })
+    await handle.recordTerminalDelivery(token, { ...reply, id: 'd-2' })
+    expect(handle.session.outbox?.map((o) => o.id)).toEqual(['d-1', 'd-2'])
+  })
+
+  test('pendingDeliveries returns pending obligations across sessions', async () => {
+    const sup = makeSupervisor()
+    const h1 = await sup.activate({ channel: 'C_OBX', thread: 'a' }, 'U')
+    await h1.recordTerminalDelivery(h1.lease!.token, { ...reply, id: 'a-1', thread: 'a' })
+    const h2 = await sup.activate({ channel: 'C_OBX', thread: 'b' }, 'U')
+    await h2.recordTerminalDelivery(h2.lease!.token, { ...reply, id: 'b-1', thread: 'b' })
+
+    const pending = await sup.pendingDeliveries()
+    expect(pending.map((o) => o.id).sort()).toEqual(['a-1', 'b-1'])
+  })
+
+  test('a crash after terminal-but-before-send leaves a pending obligation a fresh supervisor sees', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, reply)
+
+    // Simulate a crash before the send: drop the supervisor, bring up a fresh
+    // one against the same state dir. The obligation is still pending.
+    const recovered = makeSupervisor()
+    const pending = await recovered.pendingDeliveries()
+    expect(pending).toHaveLength(1)
+    expect(pending[0]?.id).toBe('d-1')
+  })
+
+  test('pendingDeliveries excludes non-pending obligations and clean sessions', async () => {
+    // Seed a session whose obligation is already delivered — must be excluded.
+    const delivered: DeliveryObligation = {
+      id: 'gone',
+      channel: 'C_OBX',
+      thread: 'done',
+      payload: 'x',
+      attempts: 1,
+      state: 'delivered',
+      createdAt: nowValue,
+    }
+    const s: Session = {
+      v: 1,
+      key: { channel: 'C_OBX', thread: 'done' },
+      createdAt: nowValue,
+      lastActiveAt: nowValue,
+      ownerId: 'U',
+      data: {},
+      outbox: [delivered],
+    }
+    await saveSession(sessionPath(tmpRoot, { channel: 'C_OBX', thread: 'done' }), s)
+    // And a clean session with no outbox at all.
+    const clean: Session = {
+      v: 1,
+      key: { channel: 'C_OBX', thread: 'clean' },
+      createdAt: nowValue,
+      lastActiveAt: nowValue,
+      ownerId: 'U',
+      data: {},
+    }
+    await saveSession(sessionPath(tmpRoot, { channel: 'C_OBX', thread: 'clean' }), clean)
+
+    const sup = makeSupervisor()
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('pendingDeliveries on an empty state dir returns []', async () => {
+    const sup = makeSupervisor()
+    expect(await sup.pendingDeliveries()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
 // ---------------------------------------------------------------------------
 
@@ -9793,6 +9946,7 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
       clearQuarantine: () => {},
       reapIdle: async () => {},
       recoverOnStartup: async () => ({ scanned: 0, requeued: [], orphaned: [] }),
+      pendingDeliveries: async () => [],
       shutdown: () => {
         shutdownCalled = true
         return new Promise<void>((res) => {
