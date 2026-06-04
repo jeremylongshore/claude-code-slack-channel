@@ -5699,6 +5699,99 @@ describe('SessionHandle.recordTurnStart / recordTurnEnd (ccsc-o7x.1.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Lease-loss → quarantine (ccsc-o7x.1.3)
+// ---------------------------------------------------------------------------
+
+describe('lease-loss quarantine (ccsc-o7x.1.3)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const key = { channel: 'C_QL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-leaseloss-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('a fenced write with a superseded token quarantines the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { x: 1 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/lease lost/)
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a fenced write whose lease has lapsed quarantines the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    nowValue += TTL + 1 // lapse without heartbeating
+    await expect(handle.update((s) => ({ ...s, data: { x: 2 } }), token)).rejects.toThrow(/lapsed/)
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a quarantined turn performs no further work — even an unfenced update rejects', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    // Lose the lease.
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow(/quarantined/)
+    // Any subsequent write — fenced or not — is refused.
+    await expect(handle.update((s) => ({ ...s, data: { y: 1 } }))).rejects.toThrow(/quarantined/)
+  })
+
+  test('a lease-lost session is excluded from the active set (activate rejects until cleared)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow()
+    expect(handle.state).toBe('quarantined')
+
+    // Removed from live + recorded in quarantine ⇒ re-activation rejects.
+    await expect(sup.activate(key, 'U')).rejects.toThrow()
+
+    // Operator clears the quarantine ⇒ activation succeeds again with a fresh lease.
+    sup.clearQuarantine(key)
+    const reactivated = await sup.activate(key, 'U')
+    expect(reactivated.state).toBe('active')
+    expect(reactivated.lease).not.toBeNull()
+  })
+
+  test('the idle reaper leaves a quarantined session alone', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow()
+    // Advancing well past any idle threshold must not let the reaper touch it.
+    nowValue += 10 * 60 * 60 * 1000
+    await expect(sup.reapIdle()).resolves.toBeUndefined()
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a healthy fenced write (live token, fresh lease) does NOT quarantine', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ok: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect(handle.state).toBe('active')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
 // ---------------------------------------------------------------------------
 
