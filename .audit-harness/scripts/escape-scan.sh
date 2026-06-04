@@ -19,13 +19,31 @@
 #   bash escape-scan.sh path/to/change.patch
 #   bash escape-scan.sh --staged          # git diff --cached
 #   bash escape-scan.sh --range HEAD~1..HEAD
+#   bash escape-scan.sh --staged --json   # machine-readable JSON to stdout
+#
+# JSON mode:
+#   stdout = single JSON object suitable for piping to `audit-harness emit-evidence`
+#   stderr = unchanged human-readable [SEVERITY] notes (preserves backward-compat)
+#   exit codes unchanged
 
 set -euo pipefail
 
 DIFF_SRC=""
 VERIFY_HASH=1
+JSON_OUT=0
 ROOT="${ROOT:-$(pwd)}"
 HASH_SCRIPT="$(dirname "$0")/harness-hash.sh"
+
+# First-pass arg parse: peel --json off the tail (any position) so primary
+# arg parsing below is unchanged.
+_filtered_args=()
+for arg in "$@"; do
+  case "$arg" in
+    --json) JSON_OUT=1 ;;
+    *) _filtered_args+=("$arg") ;;
+  esac
+done
+set -- "${_filtered_args[@]+"${_filtered_args[@]}"}"
 
 if [[ "$#" -eq 0 ]]; then
   echo "escape-scan: pass a diff source (- for stdin, --staged, --range, or a patch file)" >&2
@@ -34,11 +52,20 @@ fi
 
 case "$1" in
   -) DIFF_SRC="/dev/stdin" ;;
-  --staged) DIFF_SRC=$(mktemp); git diff --cached > "$DIFF_SRC" ;;
-  --range) DIFF_SRC=$(mktemp); git diff "$2" > "$DIFF_SRC"; shift ;;
+  --staged)
+    DIFF_SRC=$(mktemp)
+    trap 'rm -f "$DIFF_SRC"' EXIT
+    git diff --cached > "$DIFF_SRC"
+    ;;
+  --range)
+    DIFF_SRC=$(mktemp)
+    trap 'rm -f "$DIFF_SRC"' EXIT
+    git diff "$2" > "$DIFF_SRC"
+    shift
+    ;;
   --no-hash) VERIFY_HASH=0; shift; DIFF_SRC="$1" ;;
   --help|-h)
-    sed -n '2,22p' "$0"; exit 0 ;;
+    sed -n '2,26p' "$0"; exit 0 ;;
   *) DIFF_SRC="$1" ;;
 esac
 
@@ -159,7 +186,34 @@ if echo "$added_lines" | grep -Eq 'toBeDefined\(\)|\.is not None'; then
 fi
 
 # --- Summary & exit ---
-echo "escape-scan: REFUSE=$REFUSE CHALLENGE=$CHALLENGE FLAG=$FLAG"
+if [[ "$JSON_OUT" -eq 1 ]]; then
+  # Result mapping (per intent-eval-lab evidence-bundle SPEC § 5 R6):
+  #   any REFUSE → FAIL
+  #   any CHALLENGE (no REFUSE) → FAIL  (exit 1 = blocking, requires human)
+  #   only FLAG → ADVISORY (exit 0 — informational)
+  #   none → PASS
+  result="PASS"
+  if [[ "$REFUSE" -gt 0 || "$CHALLENGE" -gt 0 ]]; then
+    result="FAIL"
+  elif [[ "$FLAG" -gt 0 ]]; then
+    result="ADVISORY"
+  fi
+  input_hash=$(sha256sum "$DIFF_SRC" | awk '{print "sha256:"$1}')
+  policy_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  if [[ -f "$TESTING_MD" ]]; then
+    policy_hash=$(sha256sum "$TESTING_MD" | awk '{print "sha256:"$1}')
+  fi
+  printf '{"gate_id":"audit-harness:%s:escape-scan","result":"%s","input_hash":"%s","policy_hash":"%s","metadata":{"refuse":%d,"challenge":%d,"flag":%d,"coverage_line_floor":%d,"coverage_branch_floor":%d,"mutation_floor":%d}' \
+    "${AUDIT_HARNESS_SIDE:-ci}" "$result" "$input_hash" "$policy_hash" "$REFUSE" "$CHALLENGE" "$FLAG" \
+    "$COVERAGE_LINE_FLOOR" "$COVERAGE_BRANCH_FLOOR" "$MUTATION_FLOOR"
+  if [[ "$result" == "ADVISORY" ]]; then
+    printf ',"advisory_severity":"info"'
+  fi
+  printf '}\n'
+  echo "escape-scan: REFUSE=$REFUSE CHALLENGE=$CHALLENGE FLAG=$FLAG" >&2
+else
+  echo "escape-scan: REFUSE=$REFUSE CHALLENGE=$CHALLENGE FLAG=$FLAG"
+fi
 if [[ "$REFUSE" -gt 0 ]]; then
   echo "escape-scan: pipeline halted (REFUSE)" >&2
   exit 2
