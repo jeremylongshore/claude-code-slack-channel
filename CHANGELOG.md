@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-turn fencing lease + heartbeat on the session supervisor** (`ccsc-o7x.1.1`, first of the crash-safety epic `ccsc-o7x`). Every active `SessionHandle` now holds a `Lease` (monotonic `token` + `owner` + `heartbeatAt`) acquired right after it goes active. New pure helpers in `supervisor.ts` — `isLeaseStale`, `heartbeatLease`, `resolveLeaseTtlMs` (`SLACK_SESSION_LEASE_TTL_MS`, default 30s) — plus `handle.heartbeat(token)` (renews iff the token is the current owner's) and an additive optional `fenceToken` arg on `handle.update(fn, fenceToken?)`: a fenced write is rejected, without calling `fn` or persisting, when no live lease is held, the token has been superseded by a newer owner, or the lease's heartbeat has lapsed past the TTL — so a resurrected old owner can't clobber a turn a new owner has taken over. The token comes from a process-monotonic counter; crash-durable monotonicity across a restart is `ccsc-o7x.1.2` (the recovery sweep) and routing a lapsed lease into the quarantine terminal is `ccsc-o7x.1.3`. Purely additive — the on-disk session file stays the source of truth, unfenced `update(fn)` is unchanged, and `supervisor.ts` is outside AGP's vendored kernel (zero re-vendor impact). 19 unit tests (the pure helpers + supervisor integration: lease recorded on activation, monotonic tokens across owners, heartbeat renewal vs superseded-token no-op, and fenced-write rejection on superseded token / lapsed heartbeat / renewed-heartbeat recovery / unfenced backward-compat). `supervisor.ts` stays at 100% line + function coverage.
+
 ## [0.11.0] - 2026-06-03
 
 ### Added
