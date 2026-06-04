@@ -163,6 +163,29 @@ export type SessionSchemaVersion = 1
  *  This type is the *file* shape; the in-memory SessionHandle (32-B.1,
  *  supervisor.ts) wraps it with mutex and lifecycle metadata.
  */
+/** Persisted marker that a turn was in flight when the session file was last
+ *  written (ccsc-o7x.1.2). Written by the supervisor at turn start, cleared at
+ *  turn end. If the process crashes mid-turn the marker survives on disk, and
+ *  the boot-time recovery sweep (`recoverOnStartup`) reads it to decide whether
+ *  the turn can be requeued (its owner is provably dead — heartbeat lapsed) or
+ *  must be orphaned into quarantine (heartbeat still fresh — a second live owner
+ *  cannot be ruled out; fail closed). The supervisor's fencing lease
+ *  (`Lease` in supervisor.ts) is the in-memory counterpart; this is its durable
+ *  footprint. */
+export interface InFlightTurn {
+  /** Lease owner that started the turn (the supervisor process). */
+  owner: string
+  /** Lease token at turn start. The sweep seeds its monotonic token counter
+   *  above any persisted token so a restarted process never re-issues one a
+   *  crashed owner already held (crash-durable monotonicity). */
+  token: number
+  /** Epoch-ms the turn began. */
+  startedAt: number
+  /** Epoch-ms of the most recent persisted heartbeat for the turn. The sweep
+   *  classifies on this: lapsed past the lease TTL ⇒ resumable. */
+  heartbeatAt: number
+}
+
 export interface Session {
   /** Schema version of this session file. */
   v: SessionSchemaVersion
@@ -184,6 +207,10 @@ export interface Session {
    *  history, policy approvals, conversation scratchpad) are wired in.
    *  32-A tests treat this field as an arbitrary object. */
   data: Record<string, unknown>
+  /** Optional crash-recovery marker (ccsc-o7x.1.2). Present only while a turn
+   *  is in flight; absent on a cleanly-idle session. Additive + optional, so
+   *  pre-existing session files (which never carry it) load unchanged. */
+  inFlightTurn?: InFlightTurn
 }
 
 /** Zod schema mirroring the `Session` interface.
@@ -209,6 +236,18 @@ export const SessionSchema = z
     lastActiveAt: z.number(),
     ownerId: z.string(),
     data: z.record(z.unknown()),
+    // ccsc-o7x.1.2 — optional crash-recovery marker. Optional so existing
+    // session files (written before this field existed) still validate under
+    // the outer `.strict()`.
+    inFlightTurn: z
+      .object({
+        owner: z.string(),
+        token: z.number(),
+        startedAt: z.number(),
+        heartbeatAt: z.number(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
 

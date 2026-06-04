@@ -42,6 +42,7 @@ import {
   gate,
   generateCode,
   generateCorrelationId,
+  type InFlightTurn,
   isDuplicateEvent,
   isSlackFileUrl,
   loadSession,
@@ -70,6 +71,7 @@ import {
   validateSendableRoots,
 } from './lib.ts'
 import {
+  classifyRecovery,
   createSessionSupervisor,
   DEFAULT_LEASE_TTL_MS,
   heartbeatLease,
@@ -5438,6 +5440,265 @@ describe('createSessionSupervisor fencing lease (ccsc-o7x.1.1)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Crash-recovery sweep (ccsc-o7x.1.2)
+// ---------------------------------------------------------------------------
+
+describe('classifyRecovery (ccsc-o7x.1.2)', () => {
+  const turn = (heartbeatAt: number): InFlightTurn => ({
+    owner: 'O',
+    token: 1,
+    startedAt: heartbeatAt,
+    heartbeatAt,
+  })
+
+  test('resumable when the heartbeat has lapsed past the TTL', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 1001, 1000)).toBe('resumable')
+  })
+  test('orphaned when the heartbeat is still fresh (within TTL)', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 500, 1000)).toBe('orphaned')
+  })
+  test('orphaned at exactly the TTL boundary (strict >, mirrors isLeaseStale)', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 1000, 1000)).toBe('orphaned')
+  })
+})
+
+describe('createSessionSupervisor recovery sweep (ccsc-o7x.1.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  let journalEvents: Array<{ kind: string }>
+  const TTL = 1000
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-recovery-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+    journalEvents = []
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-NEW',
+      journal: {
+        writeEvent: async (e: { kind: string }) => {
+          journalEvents.push(e)
+          return {}
+        },
+      } as unknown as import('./journal.ts').JournalWriter,
+    })
+  }
+
+  async function seed(key: SessionKey, inFlightTurn?: InFlightTurn): Promise<void> {
+    const s: Session = {
+      v: 1,
+      key,
+      createdAt: nowValue - 1_000_000,
+      lastActiveAt: nowValue - 1_000_000,
+      ownerId: 'U',
+      data: {},
+      ...(inFlightTurn ? { inFlightTurn } : {}),
+    }
+    await saveSession(sessionPath(tmpRoot, key), s)
+  }
+
+  test('clean state dir → zero report, no recovery journal events', async () => {
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report).toEqual({ scanned: 0, requeued: [], orphaned: [] })
+    expect(journalEvents.filter((e) => e.kind.startsWith('session.recovery'))).toHaveLength(0)
+  })
+
+  test('a clean session (no marker) is scanned but neither requeued nor orphaned', async () => {
+    const key = { channel: 'C_REC', thread: 'clean' }
+    await seed(key)
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.scanned).toBe(1)
+    expect(report.requeued).toHaveLength(0)
+    expect(report.orphaned).toHaveLength(0)
+  })
+
+  test('a stale in-flight marker is requeued — marker cleared on disk + journaled', async () => {
+    const key = { channel: 'C_REC', thread: 'stale' }
+    await seed(key, { owner: 'OLD', token: 3, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) })
+    const sup = makeSupervisor()
+
+    const report = await sup.recoverOnStartup()
+    expect(report.requeued).toEqual([key])
+    expect(report.orphaned).toHaveLength(0)
+
+    // Marker cleared on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    // Journaled exactly one requeued event.
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.requeued')).toHaveLength(1)
+
+    // A requeued session re-activates cleanly.
+    await expect(sup.activate(key, 'U')).resolves.toBeDefined()
+  })
+
+  test('a fresh in-flight marker is orphaned — quarantined + journaled, activate rejects', async () => {
+    const key = { channel: 'C_REC', thread: 'fresh' }
+    await seed(key, { owner: 'OLD', token: 4, startedAt: 0, heartbeatAt: nowValue - 100 })
+    const sup = makeSupervisor()
+
+    const report = await sup.recoverOnStartup()
+    expect(report.orphaned).toEqual([key])
+    expect(report.requeued).toHaveLength(0)
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.orphaned')).toHaveLength(1)
+
+    // Orphaned → quarantined → activate now rejects.
+    await expect(sup.activate(key, 'U')).rejects.toThrow()
+  })
+
+  test('seeds the lease-token counter above the highest persisted token', async () => {
+    const key = { channel: 'C_REC', thread: 'tok' }
+    await seed(key, { owner: 'OLD', token: 50, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) })
+    const sup = makeSupervisor()
+    await sup.recoverOnStartup() // seeds nextLeaseToken to 50
+
+    // A fresh activation on a different key must mint a token strictly above 50,
+    // so a restarted process never re-issues a crashed owner's token.
+    const handle = await sup.activate({ channel: 'C_REC', thread: 'newkey' }, 'U')
+    expect(handle.lease!.token).toBeGreaterThan(50)
+  })
+
+  test('a file that loads-strict-rejects is orphaned (unreadable branch)', async () => {
+    // listSessions summarises it (createdAt/lastActiveAt/ownerId valid), but
+    // loadSession's strict schema rejects the malformed inFlightTurn.owner.
+    const key = { channel: 'C_REC', thread: 'bad' }
+    const p = sessionPath(tmpRoot, key)
+    mkdirSync(join(tmpRoot, 'sessions', 'C_REC'), { recursive: true })
+    writeFileSync(
+      p,
+      JSON.stringify({
+        v: 1,
+        key,
+        createdAt: nowValue,
+        lastActiveAt: nowValue,
+        ownerId: 'U',
+        data: {},
+        inFlightTurn: { owner: 12345, token: 1, startedAt: 0, heartbeatAt: 0 },
+      }),
+    )
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.orphaned).toEqual([key])
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.orphaned')).toHaveLength(1)
+  })
+
+  test('classifies multiple sessions independently in one sweep', async () => {
+    await seed({ channel: 'C_M', thread: 'a' }) // clean
+    await seed(
+      { channel: 'C_M', thread: 'b' },
+      { owner: 'O', token: 1, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) },
+    ) // stale → requeue
+    await seed(
+      { channel: 'C_M', thread: 'c' },
+      { owner: 'O', token: 2, startedAt: 0, heartbeatAt: nowValue - 10 },
+    ) // fresh → orphan
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.scanned).toBe(3)
+    expect(report.requeued).toHaveLength(1)
+    expect(report.orphaned).toHaveLength(1)
+  })
+})
+
+describe('SessionHandle.recordTurnStart / recordTurnEnd (ccsc-o7x.1.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_TURN', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-turn-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('recordTurnStart persists an in-flight marker (owner+token+startedAt+heartbeatAt)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toEqual({
+      owner: 'OWNER-1',
+      token,
+      startedAt: nowValue,
+      heartbeatAt: nowValue,
+    })
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn?.token).toBe(token)
+  })
+
+  test('recordTurnStart rejects when the token is not the current lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.recordTurnStart(handle.lease!.token + 999)).rejects.toThrow(
+      /does not match the current lease/,
+    )
+    expect(handle.session.inFlightTurn).toBeUndefined()
+  })
+
+  test('recordTurnEnd clears the marker', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTurnEnd()
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+  })
+
+  test('round-trip: recordTurnStart → crash → fresh supervisor sweep requeues the lapsed turn', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTurnStart(handle.lease!.token)
+
+    // Simulate a crash: drop the supervisor, advance the clock past the TTL,
+    // and bring up a fresh supervisor against the same state dir.
+    nowValue += 5000
+    const recovered = createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-2',
+    })
+    const report = await recovered.recoverOnStartup()
+    expect(report.requeued).toEqual([key])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
 // ---------------------------------------------------------------------------
 
@@ -6076,10 +6337,11 @@ describe('JournalEvent', () => {
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
     // 5 admin.* kinds (ccsc-3w0) + system.stream_finalize (ccsc-ele) +
-    // 4 admin.mute/unmute kinds (ccsc-gjm: admin.mute, admin.mute.denied,
-    // admin.unmute, admin.unmute.denied). If this number drifts, update
-    // the doc count in journal.ts's header comment too.
-    expect(kinds).toHaveLength(34)
+    // 4 admin.mute/unmute kinds (ccsc-gjm) + 2 session.recovery.* kinds
+    // (ccsc-o7x.1.2: session.recovery.requeued, session.recovery.orphaned).
+    // If this number drifts, update the doc count in journal.ts's header
+    // comment too.
+    expect(kinds).toHaveLength(36)
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -6095,6 +6357,8 @@ describe('JournalEvent', () => {
     expect(kinds).toContain('admin.mute.denied')
     expect(kinds).toContain('admin.unmute')
     expect(kinds).toContain('admin.unmute.denied')
+    expect(kinds).toContain('session.recovery.requeued')
+    expect(kinds).toContain('session.recovery.orphaned')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -9435,6 +9699,7 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
       deactivate: async () => {},
       clearQuarantine: () => {},
       reapIdle: async () => {},
+      recoverOnStartup: async () => ({ scanned: 0, requeued: [], orphaned: [] }),
       shutdown: () => {
         shutdownCalled = true
         return new Promise<void>((res) => {

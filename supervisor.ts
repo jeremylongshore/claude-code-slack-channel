@@ -37,8 +37,8 @@
  */
 
 import type { JournalWriter } from './journal'
-import type { Session, SessionKey } from './lib'
-import { loadSession, saveSession, sessionPath } from './lib'
+import type { InFlightTurn, Session, SessionKey } from './lib'
+import { listSessions, loadSession, saveSession, sessionPath } from './lib'
 
 // ---------------------------------------------------------------------------
 // Lifecycle state
@@ -125,6 +125,33 @@ export function heartbeatLease(lease: Lease, now: number): Lease {
   return { token: lease.token, owner: lease.owner, heartbeatAt: now }
 }
 
+/** A boot-time recovery decision for one persisted in-flight turn (ccsc-o7x.1.2). */
+export type RecoveryDecision = 'resumable' | 'orphaned'
+
+/** Classify a persisted in-flight turn during the startup sweep. A turn whose
+ *  heartbeat has lapsed past `ttlMs` as of `now` is `resumable`: its owner is
+ *  provably dead (the same lapse test the in-memory lease uses — see
+ *  `isLeaseStale`), so a new owner can safely take over and the marker is
+ *  cleared. A turn whose heartbeat is still fresh is `orphaned`: a second
+ *  *live* owner sharing the state dir cannot be ruled out, so the session is
+ *  quarantined rather than resumed — fail closed. Pure; mirrors `isLeaseStale`'s
+ *  strict `>` boundary. */
+export function classifyRecovery(turn: InFlightTurn, now: number, ttlMs: number): RecoveryDecision {
+  return now - turn.heartbeatAt > ttlMs ? 'resumable' : 'orphaned'
+}
+
+/** Outcome of one `recoverOnStartup()` sweep (ccsc-o7x.1.2). */
+export interface RecoveryReport {
+  /** Number of session files scanned. */
+  scanned: number
+  /** Keys whose lapsed in-flight turn was requeued — marker cleared, session
+   *  left clean and re-activatable by the next inbound message. */
+  requeued: SessionKey[]
+  /** Keys orphaned into quarantine — in-flight turn not provably abandoned, or
+   *  the file could not be read during the sweep. */
+  orphaned: SessionKey[]
+}
+
 // ---------------------------------------------------------------------------
 // SessionHandle — in-memory wrapper around one Session file
 // ---------------------------------------------------------------------------
@@ -165,6 +192,17 @@ export interface SessionHandle {
    *  was superseded by a newer owner or never acquired, meaning the caller has
    *  been fenced and should stop writing. (ccsc-o7x.1.1) */
   heartbeat(token: number): boolean
+
+  /** Persist an in-flight-turn marker to the session file so a crash mid-turn
+   *  leaves a recoverable trace for the boot-time sweep (ccsc-o7x.1.2). Fenced
+   *  by `token`: rejects if it is not the current lease's. The write rides the
+   *  same atomic save path as `update()`. */
+  recordTurnStart(token: number): Promise<void>
+
+  /** Clear the in-flight-turn marker on clean turn completion (ccsc-o7x.1.2).
+   *  Fenced by the current lease when one is held; a no-op persist when the
+   *  marker is already absent. */
+  recordTurnEnd(): Promise<void>
 
   /** Serialise an update through the per-session mutex, persist it via
    *  the atomic writer (`saveSession()`), and refresh `this.session`.
@@ -315,6 +353,32 @@ export interface SessionSupervisor {
    *  unit so the server can decide tick frequency, or a test can call
    *  it directly. */
   reapIdle(): Promise<void>
+
+  /** Boot-time crash-recovery sweep (ccsc-o7x.1.2). Reads every persisted
+   *  session file; for each carrying an in-flight-turn marker, classifies it
+   *  (`classifyRecovery`) and acts:
+   *
+   *    - **resumable** (marker heartbeat lapsed past the lease TTL — owner
+   *      provably dead): clear the marker, persist the clean session so the
+   *      next inbound event re-activates it normally, and journal
+   *      `session.recovery.requeued`.
+   *    - **orphaned** (marker still fresh, or file unreadable): record the key
+   *      in the quarantine map so `activate()` rejects until a human clears it,
+   *      and journal `session.recovery.orphaned`. Fail closed — a second live
+   *      owner on the same state dir cannot be ruled out.
+   *
+   *  Also seeds the supervisor's monotonic lease-token counter above every
+   *  persisted token, so a restarted process never re-issues a token a crashed
+   *  owner already held (crash-durable monotonicity — the durable half of the
+   *  ccsc-o7x.1.1 fence).
+   *
+   *  Contract:
+   *    - Idempotent on a clean state dir (no markers) — a no-op that returns a
+   *      zero report.
+   *    - Intended to run ONCE at boot, before the socket opens, while no handle
+   *      is live. Errors on a single file do not stop the sweep.
+   *    - Returns a `RecoveryReport` for the caller / tests. */
+  recoverOnStartup(): Promise<RecoveryReport>
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +494,12 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
   // across a process restart is ccsc-o7x.1.2's concern.
   let nextLeaseToken = 0
   const mintLeaseToken = (): number => ++nextLeaseToken
+  // Lift the counter so the next mint is strictly above `token` (ccsc-o7x.1.2).
+  // Called by the recovery sweep for every persisted token so a restarted
+  // process never re-issues a token a crashed owner already held.
+  const seedLeaseToken = (token: number): void => {
+    if (token > nextLeaseToken) nextLeaseToken = token
+  }
 
   /** Awaitable journal write for session lifecycle transitions. Never throws —
    *  a broken journal MUST NOT take down the session lifecycle path. Errors are
@@ -775,6 +845,117 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
         }
       }
     },
+
+    async recoverOnStartup(): Promise<RecoveryReport> {
+      const report: RecoveryReport = { scanned: 0, requeued: [], orphaned: [] }
+      const now = clock()
+
+      let summaries: ReturnType<typeof listSessions>
+      try {
+        summaries = listSessions(stateRoot)
+      } catch (err) {
+        // A missing/empty sessions dir is normal on first boot (listSessions
+        // returns []). A real read error is logged; the sweep is best-effort
+        // and must never block boot.
+        log('session.recovery_scan_error', { error: errorMessage(err) })
+        return report
+      }
+
+      for (const summary of summaries) {
+        const key: SessionKey = { channel: summary.channel, thread: summary.thread }
+        const id = keyId(key)
+        const path = sessionPath(stateRoot, key)
+        report.scanned++
+
+        let session: Session
+        try {
+          session = await loadSession(stateRoot, path)
+        } catch (err) {
+          // Unreadable / corrupt during the sweep ⇒ orphan into quarantine.
+          quarantined.set(id, err instanceof Error ? err : new Error(String(err)))
+          report.orphaned.push(key)
+          log('session.recovery', {
+            channel: key.channel,
+            thread: key.thread,
+            decision: 'orphaned',
+            reason: `unreadable: ${errorMessage(err)}`,
+          })
+          await journalWrite({
+            kind: 'session.recovery.orphaned',
+            outcome: 'n/a',
+            actor: 'system',
+            sessionKey: key,
+          })
+          continue
+        }
+
+        const turn = session.inFlightTurn
+        if (turn === undefined) continue // clean session — nothing was in flight
+
+        // Crash-durable monotonicity (ccsc-o7x.1.2): lift the token counter
+        // above the persisted token regardless of the decision below, so the
+        // next minted token can never collide with a crashed owner's.
+        seedLeaseToken(turn.token)
+
+        if (classifyRecovery(turn, now, leaseTtlMs) === 'resumable') {
+          const { inFlightTurn: _cleared, ...clean } = session
+          try {
+            await saveSession(path, clean as Session)
+          } catch (err) {
+            // Could not clear the marker ⇒ fall back to quarantine so we never
+            // leave a half-recovered session behind.
+            quarantined.set(id, err instanceof Error ? err : new Error(String(err)))
+            report.orphaned.push(key)
+            log('session.recovery', {
+              channel: key.channel,
+              thread: key.thread,
+              decision: 'orphaned',
+              reason: `requeue-write-failed: ${errorMessage(err)}`,
+            })
+            await journalWrite({
+              kind: 'session.recovery.orphaned',
+              outcome: 'n/a',
+              actor: 'system',
+              sessionKey: key,
+            })
+            continue
+          }
+          report.requeued.push(key)
+          log('session.recovery', {
+            channel: key.channel,
+            thread: key.thread,
+            decision: 'requeued',
+            staleMs: now - turn.heartbeatAt,
+          })
+          await journalWrite({
+            kind: 'session.recovery.requeued',
+            outcome: 'n/a',
+            actor: 'system',
+            sessionKey: key,
+          })
+        } else {
+          quarantined.set(
+            id,
+            new Error('recovery: in-flight turn not provably abandoned (heartbeat still fresh)'),
+          )
+          report.orphaned.push(key)
+          log('session.recovery', {
+            channel: key.channel,
+            thread: key.thread,
+            decision: 'orphaned',
+            reason: 'heartbeat-fresh',
+          })
+          await journalWrite({
+            kind: 'session.recovery.orphaned',
+            outcome: 'n/a',
+            actor: 'system',
+            sessionKey: key,
+          })
+        }
+      }
+
+      return report
+    },
   }
 }
 
@@ -898,6 +1079,33 @@ class ConcreteHandle implements SessionHandle {
     if (lease === null || lease.token !== token) return false
     this._lease = heartbeatLease(lease, this.clock())
     return true
+  }
+
+  /** Persist an in-flight-turn marker so a crash mid-turn leaves a recoverable
+   *  trace for `recoverOnStartup` (ccsc-o7x.1.2). Fenced by `token` (must be the
+   *  current lease's) and persisted via the same atomic `update()` path. */
+  recordTurnStart(token: number): Promise<void> {
+    const lease = this._lease
+    if (lease === null || lease.token !== token) {
+      return Promise.reject(
+        new Error(`recordTurnStart: token does not match the current lease (presented ${token})`),
+      )
+    }
+    const now = this.clock()
+    const marker: InFlightTurn = { owner: lease.owner, token, startedAt: now, heartbeatAt: now }
+    return this.update((prev) => ({ ...prev, inFlightTurn: marker }), token)
+  }
+
+  /** Clear the in-flight-turn marker on clean turn completion (ccsc-o7x.1.2).
+   *  Fenced by the current lease token when one is held. A no-op persist when
+   *  the marker is already absent. */
+  recordTurnEnd(): Promise<void> {
+    const token = this._lease?.token
+    return this.update((prev) => {
+      if (prev.inFlightTurn === undefined) return prev
+      const { inFlightTurn: _cleared, ...rest } = prev
+      return rest as Session
+    }, token)
   }
 
   /** Transition from `activating` → `active`. Called by the supervisor
