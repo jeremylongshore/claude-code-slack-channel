@@ -69,7 +69,14 @@ import {
   shouldPostAuditReceipt,
   validateSendableRoots,
 } from './lib.ts'
-import { createSessionSupervisor } from './supervisor.ts'
+import {
+  createSessionSupervisor,
+  DEFAULT_LEASE_TTL_MS,
+  heartbeatLease,
+  isLeaseStale,
+  type Lease,
+  resolveLeaseTtlMs,
+} from './supervisor.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -5254,6 +5261,179 @@ describe('createSessionSupervisor.activate', () => {
     const handle = await sup.activate(key, 'U_OWNER')
     // update() is now wired (ccsc-9d9); an identity fn must resolve cleanly.
     await expect(handle.update((s) => s)).resolves.toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — pure helpers
+// ---------------------------------------------------------------------------
+
+describe('lease helpers (ccsc-o7x.1.1)', () => {
+  const lease: Lease = { token: 7, owner: 'owner-A', heartbeatAt: 1_000_000 }
+
+  describe('resolveLeaseTtlMs', () => {
+    test('defaults when unset or empty', () => {
+      expect(resolveLeaseTtlMs({})).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '' })).toBe(DEFAULT_LEASE_TTL_MS)
+    })
+    test('defaults on non-numeric / non-positive / non-finite', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'abc' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '0' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '-5' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'Infinity' })).toBe(
+        DEFAULT_LEASE_TTL_MS,
+      )
+    })
+    test('parses and floors a valid value', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '5000' })).toBe(5000)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '1500.9' })).toBe(1500)
+    })
+  })
+
+  describe('isLeaseStale', () => {
+    test('not stale within the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 500, 1000)).toBe(false)
+    })
+    test('not stale at exactly the TTL boundary (strict >)', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1000, 1000)).toBe(false)
+    })
+    test('stale one ms past the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1001, 1000)).toBe(true)
+    })
+  })
+
+  describe('heartbeatLease', () => {
+    test('advances heartbeatAt, preserves token + owner, does not mutate input', () => {
+      const renewed = heartbeatLease(lease, 2_000_000)
+      expect(renewed).toEqual({ token: 7, owner: 'owner-A', heartbeatAt: 2_000_000 })
+      expect(lease.heartbeatAt).toBe(1_000_000) // input untouched
+      expect(renewed).not.toBe(lease)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — supervisor integration
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor fencing lease (ccsc-o7x.1.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const keyA = { channel: 'C_LEASE', thread: 'TA' }
+  const keyB = { channel: 'C_LEASE', thread: 'TB' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-lease-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('activation records a lease (token + owner + heartbeat-at)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U_OWNER')
+    expect(handle.lease).not.toBeNull()
+    expect(handle.lease?.owner).toBe('OWNER-1')
+    expect(handle.lease?.heartbeatAt).toBe(nowValue)
+    expect(typeof handle.lease?.token).toBe('number')
+  })
+
+  test('tokens are monotonic across owners', async () => {
+    const sup = makeSupervisor()
+    const a = await sup.activate(keyA, 'U')
+    const b = await sup.activate(keyB, 'U')
+    expect(b.lease!.token).toBeGreaterThan(a.lease!.token)
+  })
+
+  test('heartbeat renews the lease when the token matches', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(token)).toBe(true)
+    expect(handle.lease!.heartbeatAt).toBe(t0 + 500)
+    expect(handle.lease!.token).toBe(token) // token unchanged by heartbeat
+  })
+
+  test('heartbeat with a superseded token does not renew', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(handle.lease!.token + 999)).toBe(false)
+    expect(handle.lease!.heartbeatAt).toBe(t0) // unchanged
+  })
+
+  test('fenced write succeeds with the live token on a fresh lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(1)
+  })
+
+  test('fenced write is rejected when the token has been superseded', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const before = handle.session
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 2 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/fenced/)
+    expect(handle.session).toBe(before) // nothing persisted
+  })
+
+  test('fenced write is rejected when the lease heartbeat has lapsed', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const before = handle.session
+
+    nowValue += TTL + 1 // lapse the lease without heartbeating
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 3 } }), token),
+    ).rejects.toThrow(/lapsed/)
+    expect(handle.session).toBe(before)
+  })
+
+  test('a renewed heartbeat un-lapses the lease so the fenced write succeeds', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+
+    nowValue += TTL + 1 // would be stale...
+    expect(handle.heartbeat(token)).toBe(true) // ...but we renew at the new now
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 4 } }), token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(4)
+  })
+
+  test('an unfenced update still works regardless of lease (backward compatible)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    nowValue += TTL + 1 // lease is stale, but no fenceToken passed
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 5 } })),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(5)
   })
 })
 

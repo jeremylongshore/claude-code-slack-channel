@@ -68,6 +68,64 @@ import { loadSession, saveSession, sessionPath } from './lib'
 export type SessionState = 'activating' | 'active' | 'quiescing' | 'deactivating' | 'quarantined'
 
 // ---------------------------------------------------------------------------
+// Fencing lease — crash-safe turn ownership (ccsc-o7x.1.1)
+// ---------------------------------------------------------------------------
+
+/** A fencing lease over an active session's turn. Exactly one owner holds a
+ *  live lease at a time; the monotonic `token` fences writes so a resurrected
+ *  old owner — one whose process hung past the heartbeat window, was presumed
+ *  dead, and whose turn a new owner took over — cannot clobber the new owner's
+ *  work, because its stale token no longer matches the current lease.
+ *
+ *  In-memory for ccsc-o7x.1.1: the lease lives on the active handle and the
+ *  token comes from a process-monotonic counter. Crash-durable ownership across
+ *  a process restart (so a restarted process mints a token strictly greater
+ *  than any pre-crash token) is ccsc-o7x.1.2's job; routing a lapsed lease into
+ *  the quarantine terminal is ccsc-o7x.1.3's. The on-disk session file stays
+ *  the source of truth (session-state-machine.md invariant 5) — the lease
+ *  fences writes, it does not replace the file. */
+export interface Lease {
+  /** Monotonic ownership token. Strictly increases on every acquisition, so a
+   *  newer owner always holds a higher token than any prior owner of the key. */
+  readonly token: number
+  /** Identifier of the owner that acquired this lease (the supervisor process).
+   *  Recorded for the recovery sweep's forensics (ccsc-o7x.1.2); fencing keys
+   *  on `token`, not `owner`. */
+  readonly owner: string
+  /** Epoch-ms of the most recent heartbeat. A lease whose heartbeat has not
+   *  been renewed within the TTL is *stale* — the signal its owner died. */
+  readonly heartbeatAt: number
+}
+
+/** Default lease heartbeat-lapse window: 30s. An active turn renews its lease
+ *  well within this; a gap longer than this means the owner stopped heart-
+ *  beating (crash, hang, or kill). Tunable via `SLACK_SESSION_LEASE_TTL_MS`. */
+export const DEFAULT_LEASE_TTL_MS = 30_000
+
+/** Parse `SLACK_SESSION_LEASE_TTL_MS` from an env record. Falls back to
+ *  `DEFAULT_LEASE_TTL_MS` when unset, empty, non-numeric, non-positive, or
+ *  non-finite. Pure relative to `env` (same shape as `resolveIdleMs`). */
+export function resolveLeaseTtlMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.SLACK_SESSION_LEASE_TTL_MS
+  if (raw === undefined || raw === '') return DEFAULT_LEASE_TTL_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_LEASE_TTL_MS
+  return Math.floor(parsed)
+}
+
+/** True when `lease`'s heartbeat has lapsed past `ttlMs` as of `now`. Pure.
+ *  Strict `>` so a heartbeat exactly `ttlMs` old is still live. */
+export function isLeaseStale(lease: Lease, now: number, ttlMs: number): boolean {
+  return now - lease.heartbeatAt > ttlMs
+}
+
+/** Return a copy of `lease` with its heartbeat advanced to `now`. Pure — the
+ *  input is never mutated; `token` and `owner` carry forward unchanged. */
+export function heartbeatLease(lease: Lease, now: number): Lease {
+  return { token: lease.token, owner: lease.owner, heartbeatAt: now }
+}
+
+// ---------------------------------------------------------------------------
 // SessionHandle — in-memory wrapper around one Session file
 // ---------------------------------------------------------------------------
 
@@ -97,6 +155,17 @@ export interface SessionHandle {
    *  mutate it in place. Produce the next version inside `update()`. */
   readonly session: Session
 
+  /** The fencing lease currently held over this session's active turn, or
+   *  `null` before activation completes. Readers must not mutate it; renew it
+   *  via `heartbeat()`. (ccsc-o7x.1.1) */
+  readonly lease: Lease | null
+
+  /** Renew the active turn's lease heartbeat. Returns `true` if `token` matches
+   *  the current lease — the heartbeat is advanced to now; `false` if the lease
+   *  was superseded by a newer owner or never acquired, meaning the caller has
+   *  been fenced and should stop writing. (ccsc-o7x.1.1) */
+  heartbeat(token: number): boolean
+
   /** Serialise an update through the per-session mutex, persist it via
    *  the atomic writer (`saveSession()`), and refresh `this.session`.
    *
@@ -110,8 +179,14 @@ export interface SessionHandle {
    *      the returned promise rejects. In-memory `session` reverts to
    *      the pre-update value; no consumer ever sees the failed draft.
    *    - While `state !== 'active'` the promise rejects without
-   *      calling `fn`. */
-  update(fn: (prev: Session) => Session): Promise<void>
+   *      calling `fn`.
+   *    - When `fenceToken` is supplied the write is *fenced*: it is rejected
+   *      (without calling `fn` or persisting) if no live lease is held, if the
+   *      token has been superseded by a newer owner, or if the lease's
+   *      heartbeat has lapsed past the TTL. Omit `fenceToken` for an unfenced
+   *      write (current default for callers that do not yet hold a lease).
+   *      (ccsc-o7x.1.1) */
+  update(fn: (prev: Session) => Session, fenceToken?: number): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +349,16 @@ export interface SupervisorOptions {
    *  `SLACK_SESSION_IDLE_MS` env var documented in
    *  session-state-machine.md §119. */
   idleMs?: number
+  /** Lease heartbeat-lapse window in milliseconds (ccsc-o7x.1.1). A fenced
+   *  write whose lease has not been renewed within this window is rejected.
+   *  Default: `DEFAULT_LEASE_TTL_MS` (30s). Tests pass a small value to drive
+   *  lapse detection deterministically alongside the injected `clock`. */
+  leaseTtlMs?: number
+  /** Identifier recorded as the `owner` of every lease this supervisor
+   *  acquires (ccsc-o7x.1.1). Defaults to a per-process id. Fencing keys on the
+   *  monotonic token, not the owner; this is forensic metadata for the recovery
+   *  sweep (ccsc-o7x.1.2). */
+  ownerId?: string
   /** Optional audit journal writer. When provided, the supervisor emits
    *  `session.activate`, `session.quiesce`, and `session.deactivate` events
    *  at the corresponding state transitions. Journal write failures are
@@ -334,7 +419,17 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
   const log = opts.log ?? defaultLog
   const clock = opts.clock ?? Date.now
   const idleMs = opts.idleMs ?? DEFAULT_IDLE_MS
+  const leaseTtlMs = opts.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS
+  const ownerId =
+    opts.ownerId ?? `slack-supervisor-${typeof process !== 'undefined' ? process.pid : 0}`
   const { stateRoot, journal } = opts
+
+  // Process-monotonic lease token source (ccsc-o7x.1.1). Every acquisition gets
+  // a strictly higher token than any prior one across all keys, so a superseded
+  // owner is always fenced out by token comparison. Crash-durable monotonicity
+  // across a process restart is ccsc-o7x.1.2's concern.
+  let nextLeaseToken = 0
+  const mintLeaseToken = (): number => ++nextLeaseToken
 
   /** Awaitable journal write for session lifecycle transitions. Never throws —
    *  a broken journal MUST NOT take down the session lifecycle path. Errors are
@@ -430,7 +525,7 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
       await saveSession(path, session)
     }
 
-    const handle = new ConcreteHandle(key, session, path)
+    const handle = new ConcreteHandle(key, session, path, clock, leaseTtlMs)
     // Wire the quarantine callback so update()'s failure arm can record
     // the error in the supervisor's quarantined map AND remove the handle
     // from live. Without this the supervisor's two maps would be out of
@@ -447,6 +542,10 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
       })
     }
     handle.markActive()
+    // Acquire the initial fencing lease for this active turn-owner (ccsc-o7x.1.1).
+    // Every active handle holds a lease; a future re-activation by a new owner
+    // mints a higher token, fencing the prior owner's late writes.
+    handle.acquireLease(ownerId, mintLeaseToken())
     live.set(id, handle)
 
     log('session.activate', {
@@ -746,14 +845,59 @@ class ConcreteHandle implements SessionHandle {
    *  construction; never null after `markActive()`. */
   onQuarantine: ((err: Error) => void) | null = null
 
-  constructor(key: SessionKey, session: Session, path: string) {
+  /** The fencing lease over this handle's active turn (ccsc-o7x.1.1). Null
+   *  until the supervisor calls `acquireLease()` right after `markActive()`.
+   *  Renewed in place by `heartbeat()`; read via the public `lease` getter. */
+  private _lease: Lease | null = null
+
+  /** Wall-clock source (epoch-ms), injected by the supervisor for deterministic
+   *  lease heartbeat/lapse tests. */
+  private readonly clock: () => number
+
+  /** Lease heartbeat-lapse window (ms). A fenced write whose lease is older
+   *  than this is rejected. */
+  private readonly leaseTtlMs: number
+
+  constructor(
+    key: SessionKey,
+    session: Session,
+    path: string,
+    clock: () => number,
+    leaseTtlMs: number,
+  ) {
     this.key = key
     this.session = session
     this.path = path
+    this.clock = clock
+    this.leaseTtlMs = leaseTtlMs
   }
 
   get state(): SessionState {
     return this._state
+  }
+
+  get lease(): Lease | null {
+    return this._lease
+  }
+
+  /** Acquire a fresh fencing lease for `owner` with the supervisor-minted
+   *  monotonic `token`, heartbeat-stamped at the current clock. Supersedes any
+   *  prior lease on this handle (a higher token fences the old owner out).
+   *  Called by the supervisor immediately after `markActive()`. (ccsc-o7x.1.1) */
+  acquireLease(owner: string, token: number): Lease {
+    const lease: Lease = { token, owner, heartbeatAt: this.clock() }
+    this._lease = lease
+    return lease
+  }
+
+  /** Renew the lease heartbeat if `token` is the current owner's. Returns
+   *  `false` (no renewal) when no lease is held or the token has been
+   *  superseded — the caller has been fenced. (ccsc-o7x.1.1) */
+  heartbeat(token: number): boolean {
+    const lease = this._lease
+    if (lease === null || lease.token !== token) return false
+    this._lease = heartbeatLease(lease, this.clock())
+    return true
   }
 
   /** Transition from `activating` → `active`. Called by the supervisor
@@ -884,7 +1028,7 @@ class ConcreteHandle implements SessionHandle {
    *  Implementation mirrors the `deactivate()` save path: both use
    *  `saveSession()` (tmp + chmod + rename from lib.ts) and both
    *  transition to `quarantined` on save failure. */
-  update(fn: (prev: Session) => Session): Promise<void> {
+  update(fn: (prev: Session) => Session, fenceToken?: number): Promise<void> {
     // Capture state at enqueue time for the early-exit checks below.
     // We re-check after acquiring the mutex because state can change
     // while waiting in the queue (a concurrent quiesce, for example).
@@ -924,6 +1068,26 @@ class ConcreteHandle implements SessionHandle {
       if (this._state !== 'active') {
         reject(new Error(`SessionHandle.update: handle is not active (state: ${this._state})`))
         return
+      }
+
+      // Fenced write (ccsc-o7x.1.1): evaluate the lease at write time, inside
+      // the mutex, because a newer owner could have superseded the token (or it
+      // could have lapsed) while this write waited in the queue. `fn` is not
+      // called and nothing is persisted on a fenced rejection.
+      if (fenceToken !== undefined) {
+        const lease = this._lease
+        if (lease === null || lease.token !== fenceToken) {
+          reject(
+            new Error(
+              `SessionHandle.update: write fenced — no live lease or token superseded (presented ${fenceToken})`,
+            ),
+          )
+          return
+        }
+        if (isLeaseStale(lease, this.clock(), this.leaseTtlMs)) {
+          reject(new Error(`SessionHandle.update: write fenced — lease heartbeat lapsed`))
+          return
+        }
       }
 
       const prev = this.session
