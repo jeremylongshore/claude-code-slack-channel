@@ -6,13 +6,34 @@ lands; this doc captures the conventions so your PR doesn't bounce off them.
 ## Before you start
 
 - Read [`README.md`](README.md) to understand what this repo is and how to install it.
+- **Read [`ROADMAP.md`](ROADMAP.md) — especially the [Non-Goals](ROADMAP.md#non-goals)
+  section — *before* writing any code.** CCSC has a deliberately narrow charter.
+  Some otherwise-good work (e.g. multi-process / multi-session orchestration) is
+  out of scope here by design and belongs in the companion
+  [agent-governance-plane](https://github.com/jeremylongshore/agent-governance-plane).
+  A PR that implements a non-goal will be closed with a pointer back to the
+  roadmap — that's not a judgment of the work, just of the fit.
 - Read [`AGENTS.md`](AGENTS.md) if you're using an AI assistant — it has the
   load-bearing context every agent needs (module layout, architecture
   invariants, what NOT to do).
-- For non-trivial changes, **open a GitHub issue first** describing the
-  problem you're trying to solve. Solo author with a busy schedule —
-  surprise PRs often go un-merged. A 5-line issue saves a 500-line PR
+
+### Open an issue before a substantial PR
+
+This is keyed on **scope, not on who you are** — it applies to everyone:
+
+- **Small fixes** (a typo, a one-line bug, a doc clarification) — just open the PR.
+- **Anything larger** — **open a GitHub issue first** describing the problem and
+  your proposed approach, and confirm it's on-roadmap, *before* you invest in
+  code. Solo author with a busy schedule: a 5-line issue saves a 500-line PR
   from being closed unread.
+- **Large or architectural PRs opened with no prior discussion may be closed**
+  unmerged, regardless of quality. This isn't gatekeeping — it's the only way a
+  solo maintainer can keep the project pointed in one direction. A first
+  contribution is best made *small* (one focused fix), not as a sweeping change.
+- **Complete the PR template.** A PR with an empty description, or with the
+  **Security impact** section left blank when it touches anything security-
+  sensitive, will be asked to fill it in before any review happens. "Tests pass"
+  is not a description.
 
 ## Dev environment
 
