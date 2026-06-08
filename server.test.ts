@@ -79,7 +79,12 @@ import {
   shouldPostAuditReceipt,
   validateSendableRoots,
 } from './lib.ts'
-import { createDeliverySendDeps } from './slack-delivery.ts'
+import {
+  createDeliverySendDeps,
+  DurableUnavailableError,
+  deliverReplyDurably,
+  type ReplyPoster,
+} from './slack-delivery.ts'
 import {
   classifyRecovery,
   createSessionSupervisor,
@@ -6672,6 +6677,135 @@ describe('outbox poller × Slack adapter end-to-end (ccsc-o7x.3)', () => {
     expect(fake.posted).toHaveLength(0)
     const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
     expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable single-message reply delivery — deliverReplyDurably (ccsc-o7x.3 pt2)
+// ---------------------------------------------------------------------------
+
+describe('deliverReplyDurably (ccsc-o7x.3 pt2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_DUR', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-durable-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  /** Pre-create the session file so deliverReplyDurably's owner-less activate
+   *  resolves it from disk (mirrors a session the inbound message created). */
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  function makePoster(behavior: 'ok' | Error, ts = 'ts-1') {
+    const calls: Array<{ id: string; key: string; text: string }> = []
+    const poster: ReplyPoster = async (obligation, idemKey) => {
+      calls.push({ id: obligation.id, key: idemKey, text: obligation.payload })
+      if (behavior !== 'ok') throw behavior
+      return ts
+    }
+    return { poster, calls }
+  }
+
+  const reply = { id: 'r-1', channel: 'C_DUR', thread: 'T1', text: 'hello' }
+
+  test('success: posts under the obligation key, marks delivered, returns the ts', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster('ok', 'ts-9')
+
+    const result = await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-9' })
+    // Posted exactly once, under the deterministic idempotency key.
+    expect(calls).toEqual([{ id: 'r-1', key: 'ccsc-reply:r-1', text: 'hello' }])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-1', state: 'delivered', attempts: 1 })
+    // Nothing left pending.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records the obligation BEFORE the send (crash-before-send safe)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    // A poster that asserts the obligation is already persisted as pending at
+    // the moment of the send — proving record happened first.
+    let pendingAtSendTime = -1
+    const poster: ReplyPoster = async () => {
+      const probe = makeSupervisor()
+      pendingAtSendTime = (await probe.pendingDeliveries()).length
+      return 'ts-1'
+    }
+    await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+    expect(pendingAtSendTime).toBe(1) // obligation was durable before the post returned
+  })
+
+  test('transient error: leaves the obligation pending, returns queued (poller will retry)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster(slackError('rate_limited'))
+
+    const result = await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+
+    expect(result).toEqual({ status: 'queued' })
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-1', state: 'pending', attempts: 1 })
+    // Still pending → the poller picks it up (attempts>0 → findDelivered dedups).
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1'])
+  })
+
+  test('non-retryable error: marks dead with the error recorded, then rethrows', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster(slackError('channel_not_found'))
+
+    await expect(deliverReplyDurably({ supervisor: sup, post: poster }, reply)).rejects.toThrow(
+      /channel_not_found/,
+    )
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 'r-1',
+      state: 'dead',
+      attempts: 1,
+      lastError: 'channel_not_found',
+    })
+    // Dead, not pending → the poller leaves it alone.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession() — the session file does not exist, and durable delivery
+    // activates without an owner, so activate rejects.
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster('ok')
+
+    await expect(
+      deliverReplyDurably({ supervisor: sup, post: poster }, reply),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
+    expect(calls).toHaveLength(0) // never attempted a send
   })
 })
 
