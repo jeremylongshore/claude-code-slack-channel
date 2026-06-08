@@ -59,6 +59,7 @@ interface ReplyMessage {
  *  The idempotency *decision* lives in `makeIdempotentSend` (lib.ts); this only
  *  supplies the two Slack calls it composes. */
 export function createDeliverySendDeps(client: WebClient): IdempotentSendDeps {
+  const replyPoster = createReplyPoster(client)
   return {
     async findDelivered(channel: string, thread: string, key: string): Promise<string | null> {
       if (!thread) return null
@@ -79,19 +80,34 @@ export function createDeliverySendDeps(client: WebClient): IdempotentSendDeps {
       }
       return null
     },
+    // The poller discards the ts; the inline durable send wants it. Both share
+    // one metadata-stamping site (`createReplyPoster`) so the delivery key is
+    // written identically on every path.
     async post(obligation, key): Promise<void> {
-      await client.chat.postMessage({
-        channel: obligation.channel,
-        text: obligation.payload,
-        thread_ts: obligation.thread || undefined,
-        unfurl_links: false,
-        unfurl_media: false,
-        metadata: {
-          event_type: DELIVERY_METADATA_EVENT_TYPE,
-          event_payload: { idempotency_key: key },
-        },
-      })
+      await replyPoster(obligation, key)
     },
+  }
+}
+
+/** Post a reply with the idempotency key stamped into Slack message `metadata`,
+ *  returning the resulting `ts`. The single place the delivery metadata is
+ *  written — shared by the poller's `post` (which discards the ts) and the
+ *  inline durable send via `deliverReplyDurably` (which needs the ts for the
+ *  tool result). Bound to a `WebClient`. (ccsc-o7x.3) */
+export function createReplyPoster(client: WebClient): ReplyPoster {
+  return async (obligation, key) => {
+    const res = await client.chat.postMessage({
+      channel: obligation.channel,
+      text: obligation.payload,
+      thread_ts: obligation.thread || undefined,
+      unfurl_links: false,
+      unfurl_media: false,
+      metadata: {
+        event_type: DELIVERY_METADATA_EVENT_TYPE,
+        event_payload: { idempotency_key: key },
+      },
+    })
+    return (res.ts as string) || undefined
   }
 }
 

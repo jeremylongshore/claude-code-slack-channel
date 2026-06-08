@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -91,7 +92,12 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
-import { createDeliverySendDeps } from './slack-delivery.ts'
+import {
+  createDeliverySendDeps,
+  createReplyPoster,
+  DurableUnavailableError,
+  deliverReplyDurably,
+} from './slack-delivery.ts'
 import { streamReply } from './stream-reply.ts'
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1153,49 @@ async function executeReplyStreamingPath(opts: {
   }
 }
 
+/** ccsc-o7x.3 — durable single-message reply path. Records a durable obligation
+ *  before the send and lets the background poller redeliver on a transient
+ *  failure or a crash (ADR-002 addendum, Option A). The caller (`executeReply`)
+ *  has already journaled `gate.outbound.allow` and gated this to the single-
+ *  message case (no stream/files, fits one chunk, has a thread). Throws
+ *  `DurableUnavailableError` (before any record/send) when the session can't go
+ *  durable — the caller then falls back to the direct send. A non-retryable
+ *  Slack error propagates (the obligation is marked dead inside
+ *  `deliverReplyDurably`). Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  text: string
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, text, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const result = await deliverReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web) },
+    { id: randomUUID(), channel: chatId, thread: threadTs, text },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent 1 message to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Queued for delivery to ${chatId} (transient Slack error; the delivery poller will retry until it lands)`,
+      },
+    ],
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
@@ -1183,7 +1232,8 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     return executeReplyStreamingPath({ chatId, threadTs, text, files, limit, ctx })
   }
 
-  // Non-streaming path — existing behavior unchanged.
+  // Non-streaming path. The gate.outbound.allow is journaled once here and
+  // shared by both the durable and the direct sub-paths below.
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -1191,6 +1241,29 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
     input: { channel: chatId, thread_ts: threadTs },
   })
+
+  // ccsc-o7x.3 — durable single-message path (ADR-002 addendum, Option A). Only
+  // the shape where one obligation = one Slack message: no stream, no files,
+  // fits one chunk, has a thread, and the supervisor is up. Records the reply as
+  // a durable obligation so a transient Slack failure or a crash is retried by
+  // the delivery poller instead of lost. Falls back to the direct send below if
+  // the session can't go durable (DurableUnavailableError). Chunked / file /
+  // streaming replies are deliberately NOT routed here (ccsc-o7x.4/.5/.6).
+  if (
+    !stream &&
+    (!files || files.length === 0) &&
+    threadTs !== undefined &&
+    supervisor !== null &&
+    text.length <= limit
+  ) {
+    try {
+      return await executeReplyDurablePath({ chatId, threadTs, text, ctx })
+    } catch (durableErr) {
+      if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
+      // Session couldn't go durable — fall through to the best-effort direct
+      // send (the allow event above already stands).
+    }
+  }
 
   const chunks = chunkText(text, limit, mode)
 
