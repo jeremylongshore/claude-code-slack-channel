@@ -81,6 +81,7 @@ import {
 } from './lib.ts'
 import {
   createDeliverySendDeps,
+  createReplyPoster,
   DurableUnavailableError,
   deliverReplyDurably,
   type ReplyPoster,
@@ -6600,6 +6601,21 @@ describe('createDeliverySendDeps — Slack adapter (ccsc-o7x.3)', () => {
       await createDeliverySendDeps(fake.client).findDelivered('C1', '', 'ccsc-reply:d-1'),
     ).toBeNull()
     expect(fake.repliesCalls).toHaveLength(0)
+  })
+
+  test('createReplyPoster stamps the key into metadata and returns the resulting ts', async () => {
+    const fake = makeFakeSlackClient()
+    const ts = await createReplyPoster(fake.client)(ob, 'ccsc-reply:d-1')
+    expect(ts).toBe('posted-1')
+    expect(fake.posted[0]).toMatchObject({
+      channel: 'C1',
+      text: 'hello',
+      thread_ts: 'T1',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
   })
 })
 
