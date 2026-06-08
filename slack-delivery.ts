@@ -23,7 +23,15 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import { DELIVERY_METADATA_EVENT_TYPE, type IdempotentSendDeps } from './lib.ts'
+import {
+  classifyDeliveryError,
+  DELIVERY_METADATA_EVENT_TYPE,
+  type DeliveryObligation,
+  deliveryIdempotencyKey,
+  extractSlackErrorCode,
+  type IdempotentSendDeps,
+} from './lib.ts'
+import type { SessionHandle, SessionSupervisor } from './supervisor.ts'
 
 /** Shape of a `conversations.replies` message we care about — just the `ts` and
  *  the message `metadata` (returned when the request sets
@@ -84,5 +92,146 @@ export function createDeliverySendDeps(client: WebClient): IdempotentSendDeps {
         },
       })
     },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Durable single-message reply delivery (ccsc-o7x.3 pt2 — ADR-002 addendum)
+// ---------------------------------------------------------------------------
+
+/** Raised when durable delivery cannot even begin — the session can't be
+ *  activated, or it holds no lease — *before* any obligation is recorded or any
+ *  send attempted. The caller catches this and falls back to a best-effort
+ *  direct send; nothing was persisted, so there is no obligation to redeliver. */
+export class DurableUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DurableUnavailableError'
+  }
+}
+
+/** One logical reply to deliver durably. `id` is the caller-supplied stable
+ *  unique key (a fresh UUID per reply call) — it becomes the obligation id and
+ *  thus the idempotency key, so a poller redelivery of THIS obligation dedups
+ *  exactly. */
+export interface DurableReply {
+  id: string
+  channel: string
+  thread: string
+  text: string
+}
+
+export type DurableDeliveryResult =
+  | { status: 'delivered'; ts: string | undefined }
+  | { status: 'queued' }
+
+/** Post one reply, stamping the idempotency key into Slack message metadata,
+ *  and return the resulting `ts` (the inline attempt wants it for the tool
+ *  result). Distinct from `IdempotentSendDeps.post` (which returns `void` for
+ *  the poller). The production impl wraps `web.chat.postMessage`. */
+export type ReplyPoster = (
+  obligation: DeliveryObligation,
+  idempotencyKey: string,
+) => Promise<string | undefined>
+
+/** Durable single-message reply delivery (ADR-002 addendum, Option A). Records
+ *  a `pending` obligation BEFORE the send — so a crash before/at the send leaves
+ *  a recoverable record the boot-drain redelivers — then attempts exactly ONE
+ *  inline send and resolves:
+ *
+ *    - **success**        → mark `delivered`, return the Slack `ts`;
+ *    - **transient error**→ bump `attempts`, leave `pending`, return `queued`
+ *      (the poller redelivers idempotently — the caller must NOT retry, or it
+ *      would double-post);
+ *    - **non-retryable**  → mark `dead` (error recorded) and rethrow the Slack
+ *      error so the caller surfaces the real failure to the agent.
+ *
+ *  Throws `DurableUnavailableError` *before recording* if the session can't be
+ *  activated or holds no lease — the caller falls back to a direct send.
+ *
+ *  Marking the obligation state is best-effort: if the fenced mark write fails
+ *  (lease lost mid-flight), the obligation simply stays as the prior process saw
+ *  it and the poller reconciles from disk (a delivered-but-unmarked message is
+ *  deduped by `findDelivered`, a still-pending one is redelivered). So a mark
+ *  failure never fails the reply. (ccsc-o7x.3) */
+export async function deliverReplyDurably(
+  deps: { supervisor: SessionSupervisor; post: ReplyPoster },
+  reply: DurableReply,
+): Promise<DurableDeliveryResult> {
+  let handle: SessionHandle
+  try {
+    handle = await deps.supervisor.activate({ channel: reply.channel, thread: reply.thread })
+  } catch (err) {
+    throw new DurableUnavailableError(
+      `cannot activate session: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+  const lease = handle.lease
+  if (lease === null) throw new DurableUnavailableError('session holds no lease')
+  const token = lease.token
+
+  // Record the durable obligation BEFORE the send (crash-before-send safe).
+  await handle.recordTerminalDelivery(token, {
+    id: reply.id,
+    channel: reply.channel,
+    thread: reply.thread,
+    payload: reply.text,
+  })
+  const obligation: DeliveryObligation = {
+    id: reply.id,
+    channel: reply.channel,
+    thread: reply.thread,
+    payload: reply.text,
+    attempts: 0,
+    state: 'pending',
+    createdAt: 0,
+  }
+  const idemKey = deliveryIdempotencyKey(obligation)
+
+  try {
+    const ts = await deps.post(obligation, idemKey)
+    await markObligation(handle, token, reply.id, { state: 'delivered', attempts: 1 })
+    return { status: 'delivered', ts }
+  } catch (err) {
+    const code = extractSlackErrorCode(err)
+    const lastError = code ?? (err instanceof Error ? err.message : String(err))
+    if (classifyDeliveryError(code) === 'non-retryable') {
+      await markObligation(handle, token, reply.id, { state: 'dead', attempts: 1, lastError })
+      throw err
+    }
+    // Transient: leave pending (attempts bumped so the poller dedups) + queued.
+    await markObligation(handle, token, reply.id, { state: 'pending', attempts: 1, lastError })
+    return { status: 'queued' }
+  }
+}
+
+/** Best-effort fenced patch of one obligation's state. Never throws: a fenced /
+ *  save failure leaves the obligation as-is for the poller to reconcile (see
+ *  `deliverReplyDurably`). */
+async function markObligation(
+  handle: SessionHandle,
+  token: number,
+  id: string,
+  patch: { state: DeliveryObligation['state']; attempts: number; lastError?: string },
+): Promise<void> {
+  try {
+    await handle.update(
+      (prev) => ({
+        ...prev,
+        outbox: (prev.outbox ?? []).map((o) =>
+          o.id === id
+            ? {
+                ...o,
+                state: patch.state,
+                attempts: patch.attempts,
+                ...(patch.lastError !== undefined ? { lastError: patch.lastError } : {}),
+              }
+            : o,
+        ),
+      }),
+      token,
+    )
+  } catch {
+    // Swallow — the poller reconciles obligation state from disk.
   }
 }

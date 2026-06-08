@@ -204,6 +204,67 @@ Name no peer brand in any committed file.
   the peer's repository; the contribution strategy in AT-DECR 013 is a separate,
   gated track.
 
+## Addendum (2026-06-07): the transactional outbox in CCSC's synchronous reply tool (ccsc-o7x.3)
+
+Pattern 3 (transactional-outbox reliable delivery) was specced from a runtime
+that **owns the agent loop** and emits a final reply at turn-end. CCSC is
+inverted: **Claude is the host that spawns the bridge over MCP stdio, and a
+reply is a synchronous `reply` tool call** (`executeReply` → `chat.postMessage`
+→ returns the `ts`). There is no bridge-visible "turn terminal." Wiring the
+outbox therefore required a contract decision, recorded here because the reply
+path is a security boundary (the outbound gate) and CCSC's discipline is
+design-before-code for boundary changes.
+
+**Decision — "safety-net behind the reply tool" (Option A).** The `reply` tool
+records a durable `DeliveryObligation` *before* the send and the background
+poller (`ccsc-o7x.2.2`) is the retry net. Concretely, for the case where the
+obligation model maps exactly:
+
+- **Scope: a single-message text reply** — `stream` off, no file uploads, text
+  within one chunk, and a thread to post into. This is the overwhelming common
+  case and the only shape where one obligation = one Slack message, so the
+  idempotency key (`ccsc-o7x.2.3`) dedups *exactly*.
+- **Flow:** activate the `(channel, thread)` session → `recordTerminalDelivery`
+  (a `pending` obligation, fenced by the lease) → attempt an inline send → on
+  **success** mark `delivered` and return the `ts` (happy path **unchanged**);
+  on a **transient** Slack error leave it `pending` and return *accepted/queued*
+  (so Claude does **not** retry-and-double-post — the poller redelivers
+  idempotently); on a **non-retryable** error mark `dead` and throw.
+- **Crash-before-send is covered** because the obligation is durable before the
+  `chat.postMessage` — the boot-time drain (`ccsc-o7x.3` pt 1) redelivers it.
+
+**Why not the rich paths (yet).** Chunked replies, file uploads, and streaming
+(`chat.update`) don't fit a single-payload obligation: chunking is N messages,
+files are separate uploads, a stream can't be idempotently replayed. Forcing
+them through the outbox would either degrade fidelity on redelivery or risk
+partial double-sends. So **they keep today's best-effort behavior and do not
+enqueue an obligation** — which means the poller never touches them, so there is
+**zero double-send risk** anywhere. Their durability is deferred to follow-up
+beads (filed against this addendum), each of which needs its own design step
+(e.g. per-chunk keying, an upload-dedup token, a stream-finalize obligation).
+
+**Turn-marker primitives are intentionally not wired.** `recordTurnStart` /
+`recordTurnEnd` / `recoverOnStartup` model a turn loop CCSC doesn't have; wiring
+them would be speculative no-op code. They remain valid library code (and AGP,
+which *does* own a turn loop, can use them via the vendored kernel). The
+substrate-vs-plane rule holds: the idempotency *logic* lives in `lib.ts`
+(vendored), the Slack I/O glue in `slack-delivery.ts` (CCSC-local).
+
+**Consequence:** the epic's "loss-proof reply" guarantee is delivered for the
+common reply shape with exact-once semantics; the rich shapes degrade to
+*best-effort, as before* (no regression) with a documented path to full
+coverage. This is a deliberate scope cut, not an oversight — recorded so a
+future reader knows the rich-path gap is tracked, not missed.
+
+**Build-out status.** The durable-delivery building block —
+`deliverReplyDurably` (record → inline send → mark `delivered` / `queued` /
+rethrow), with `DurableUnavailableError` for the fall-back-to-direct-send case —
+ships in `slack-delivery.ts` and is unit-tested against a real supervisor + a
+faked poster. Wiring it into `executeReply`'s single-message branch is the final
+step of `ccsc-o7x.3`. The deferred rich-path durability is tracked by
+`ccsc-o7x.4` (chunked), `ccsc-o7x.5` (file uploads), and `ccsc-o7x.6`
+(streaming).
+
 ## References
 
 - The `ccsc-*` peer-audit hardening backlog (Epics 1–5), filed alongside this ADR;
