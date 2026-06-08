@@ -79,6 +79,7 @@ import {
   shouldPostAuditReceipt,
   validateSendableRoots,
 } from './lib.ts'
+import { createDeliverySendDeps } from './slack-delivery.ts'
 import {
   classifyRecovery,
   createSessionSupervisor,
@@ -6486,6 +6487,189 @@ describe('idempotent delivery through the poller (ccsc-o7x.2.3 × 2.2)', () => {
     expect(fake.postCalls()).toBe(1) // posted exactly once despite the retry
     expect(fake.store).toHaveLength(1)
 
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Slack delivery adapter — createDeliverySendDeps (ccsc-o7x.3)
+// ---------------------------------------------------------------------------
+
+/** A coherent fake Slack: `chat.postMessage` appends the message (with its
+ *  metadata) to a thread store that `conversations.replies` then returns — so a
+ *  post is visible to a later findDelivered, exactly like the real API. */
+function makeFakeSlackClient(seed: Array<{ ts: string; eventType?: string; key?: string }> = []) {
+  const store: Array<{
+    ts: string
+    metadata?: { event_type?: string; event_payload?: Record<string, unknown> }
+  }> = seed.map((s) => ({
+    ts: s.ts,
+    metadata: s.eventType
+      ? { event_type: s.eventType, event_payload: { idempotency_key: s.key } }
+      : undefined,
+  }))
+  const posted: Array<Record<string, unknown>> = []
+  const repliesCalls: Array<Record<string, unknown>> = []
+  const client = {
+    conversations: {
+      replies: async (args: Record<string, unknown>) => {
+        repliesCalls.push(args)
+        return { messages: store }
+      },
+    },
+    chat: {
+      postMessage: async (args: Record<string, unknown>) => {
+        posted.push(args)
+        const ts = `posted-${posted.length}`
+        store.push({
+          ts,
+          metadata: args.metadata as
+            | { event_type?: string; event_payload?: Record<string, unknown> }
+            | undefined,
+        })
+        return { ts }
+      },
+    },
+  }
+  return {
+    client: client as unknown as Parameters<typeof createDeliverySendDeps>[0],
+    posted,
+    repliesCalls,
+  }
+}
+
+describe('createDeliverySendDeps — Slack adapter (ccsc-o7x.3)', () => {
+  const ob: DeliveryObligation = {
+    id: 'd-1',
+    channel: 'C1',
+    thread: 'T1',
+    payload: 'hello',
+    attempts: 0,
+    state: 'pending',
+    createdAt: 1,
+  }
+
+  test('post stamps the idempotency key into Slack message metadata', async () => {
+    const fake = makeFakeSlackClient()
+    await createDeliverySendDeps(fake.client).post(ob, 'ccsc-reply:d-1')
+    expect(fake.posted).toHaveLength(1)
+    expect(fake.posted[0]).toMatchObject({
+      channel: 'C1',
+      text: 'hello',
+      thread_ts: 'T1',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+  })
+
+  test('findDelivered returns the ts when a prior post carries the matching key', async () => {
+    const fake = makeFakeSlackClient([
+      { ts: '111.222', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:d-1' },
+    ])
+    const deps = createDeliverySendDeps(fake.client)
+    expect(await deps.findDelivered('C1', 'T1', 'ccsc-reply:d-1')).toBe('111.222')
+    // Looked up the thread with metadata included.
+    expect(fake.repliesCalls[0]).toMatchObject({
+      channel: 'C1',
+      ts: 'T1',
+      include_all_metadata: true,
+    })
+  })
+
+  test('findDelivered returns null when no message carries the key (wrong key or no metadata)', async () => {
+    const fake = makeFakeSlackClient([
+      { ts: 'x', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:OTHER' },
+      { ts: 'y' }, // a plain message, no delivery metadata
+    ])
+    expect(
+      await createDeliverySendDeps(fake.client).findDelivered('C1', 'T1', 'ccsc-reply:d-1'),
+    ).toBeNull()
+  })
+
+  test('findDelivered short-circuits to null without an API call when the thread is empty', async () => {
+    const fake = makeFakeSlackClient()
+    expect(
+      await createDeliverySendDeps(fake.client).findDelivered('C1', '', 'ccsc-reply:d-1'),
+    ).toBeNull()
+    expect(fake.repliesCalls).toHaveLength(0)
+  })
+})
+
+describe('outbox poller × Slack adapter end-to-end (ccsc-o7x.3)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_E2E', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-e2e-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('drainOutbox via the real adapter posts once and marks the obligation delivered', async () => {
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'hello',
+    })
+
+    const fake = makeFakeSlackClient()
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(createDeliverySendDeps(fake.client)))
+
+    expect(report.delivered).toEqual(['d-1'])
+    expect(fake.posted).toHaveLength(1)
+    expect(fake.posted[0]).toMatchObject({
+      text: 'hello',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+
+  test('ack-loss recovery: a pending obligation whose post already landed is deduped, not re-posted', async () => {
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'hello',
+    })
+    // Simulate the ack-loss window: the message DID land in the thread under its
+    // key, but the obligation is still pending (the marking write was lost).
+    const fake = makeFakeSlackClient([
+      { ts: '999.000', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:d-1' },
+    ])
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(createDeliverySendDeps(fake.client)))
+
+    // Delivered (resolved) but NOT re-posted — exactly-once visible delivery.
+    expect(report.delivered).toEqual(['d-1'])
+    expect(fake.posted).toHaveLength(0)
     const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
     expect(reloaded.outbox?.[0]?.state).toBe('delivered')
   })

@@ -52,6 +52,7 @@ import {
   deliveredThreadKey as libDeliveredThreadKey,
   gate as libGate,
   listSessions as libListSessions,
+  makeIdempotentSend,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -90,6 +91,7 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
+import { createDeliverySendDeps } from './slack-delivery.ts'
 import { streamReply } from './stream-reply.ts'
 
 // ---------------------------------------------------------------------------
@@ -582,6 +584,12 @@ let supervisor: SessionSupervisor | null = null
 /** Interval handle for the idle reaper tick. Stored so it can be cleared
  *  before supervisor.shutdown() during graceful exit. */
 let reaperTimer: ReturnType<typeof setInterval> | null = null
+
+/** Interval handle for the outbox delivery poller tick (ccsc-o7x.3). Drains
+ *  pending reply-delivery obligations (replies a crash or a transient Slack
+ *  failure left undelivered) with idempotent retry. Stored so it can be cleared
+ *  before supervisor.shutdown() during graceful exit, exactly like reaperTimer. */
+let deliveryTimer: ReturnType<typeof setInterval> | null = null
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -3098,6 +3106,15 @@ async function shutdown(reason: string, code = 0): Promise<void> {
     reaperTimer = null
   }
 
+  // Stop the outbox delivery poller too, for the same reason (ccsc-o7x.3): a
+  // drainOutbox tick must not race the supervisor's quiesce-all pass. Any
+  // obligations still pending are durable on disk and the next process boot
+  // drains them.
+  if (deliveryTimer !== null) {
+    clearInterval(deliveryTimer)
+    deliveryTimer = null
+  }
+
   // Drain in-flight session writes before exiting. This ensures that any
   // handle.update() in progress completes its atomic save rather than
   // leaving a half-written tmp file. Failures are non-fatal — better to
@@ -3313,6 +3330,35 @@ async function main(): Promise<void> {
   // Don't hold the event loop open on the reaper tick alone — the socket and
   // MCP transport already keep the process alive while active.
   if (typeof reaperTimer.unref === 'function') reaperTimer.unref()
+
+  // Outbox delivery poller (ccsc-o7x.3): drain pending reply-delivery
+  // obligations — replies a crash or a transient Slack failure left
+  // undelivered — with idempotent retry / dead-letter. The boot-time drain
+  // recovers obligations the previous process left pending (crash recovery for
+  // replies); the interval is the steady-state retry. Mirrors reaperTimer:
+  // unref'd, and cleared on shutdown before the supervisor drain. The send is
+  // idempotent (lib.ts `makeIdempotentSend` over the Slack adapter), so a
+  // redelivery after a lost ack never double-posts.
+  const idempotentSend = makeIdempotentSend(createDeliverySendDeps(web))
+  const drainOutboxOnce = (): void => {
+    void supervisor!
+      .drainOutbox(idempotentSend)
+      .then((report) => {
+        if (report.deadLettered.length > 0) {
+          console.error('[slack] outbox: dead-lettered obligations', report.deadLettered)
+        }
+      })
+      .catch((err) => {
+        console.error('[slack] outbox drain failed:', err instanceof Error ? err.message : err)
+      })
+  }
+  const deliveryPollMs = (() => {
+    const raw = Number(process.env.SLACK_DELIVERY_POLL_MS)
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 15_000
+  })()
+  drainOutboxOnce() // boot-time recovery of crash-pending obligations
+  deliveryTimer = setInterval(drainOutboxOnce, deliveryPollMs)
+  if (typeof deliveryTimer.unref === 'function') deliveryTimer.unref()
 
   // Resolve bot identity (user ID, bot ID, app ID) for mention detection
   // and self-echo filtering across payload variants and multi-workspace setups
