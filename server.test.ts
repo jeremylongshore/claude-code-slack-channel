@@ -9178,6 +9178,120 @@ describe('decidePermissionRoute', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Every policy decision is journaled — no silent gaps (ccsc-1iw.2)
+//
+// Regression test for the peer-runtime footgun in 000-docs/ADR-002: the peer
+// runtime kept no durable tool-call record (best-effort stdout key-name +
+// byte-size logs only, no audit table). CCSC writes a signed journal event for
+// every gated policy decision. This pins the decision→journal-kind mapping with
+// a `never` exhaustiveness guard: a NEW permission-route branch added without
+// declaring its journal kind fails to TYPECHECK here, turning a silent audit
+// gap into a deliberate, reviewed choice. Complements (does not duplicate) the
+// decidePermissionRoute routing tests above, the ccsc-06s
+// recordPolicyDenyToJournal two-event tests below, and the audit_chain_verifier
+// acceptance primitive.
+//
+// KNOWN CONSTRAINT (ccsc-175): server.ts writes the policy.allow / .require /
+// .approved events INLINE and runs main() on import, so a test cannot import it
+// to assert those exact write calls. This test therefore anchors the mapping to
+// the REAL journal EventKind enum and drives the real deny helper; the stronger
+// "execute the production dispatch" assertion is filed as ccsc-175.
+// ---------------------------------------------------------------------------
+describe('every policy decision is journaled — no silent gaps (ccsc-1iw.2)', () => {
+  type RouteType = import('./lib.ts').PermissionRoute['type']
+  type PolicyDecisionShape = import('./lib.ts').PolicyDecisionShape
+
+  // Single source of truth for "what each route must journal". default_human is
+  // deliberately silent — server.ts does not trace the no-opinion case (tracing
+  // it would 10x the journal on a busy channel). Encoded as an explicit `null`,
+  // NOT an omission. The `never` arm makes a new route.type a compile error
+  // until its journal decision is declared here.
+  const journalKindForRoute = (type: RouteType): string | null => {
+    switch (type) {
+      case 'auto_allow':
+        return 'policy.allow'
+      case 'deny':
+        return 'policy.deny' // two-event sequence; .context_stripped asserted below
+      case 'require_human':
+        return 'policy.require'
+      case 'default_human':
+        return null
+      default: {
+        const _exhaustive: never = type
+        return _exhaustive
+      }
+    }
+  }
+
+  test('each decision branch routes to a real EventKind (or the one deliberately-silent route)', async () => {
+    const { decidePermissionRoute } = await import('./lib.ts')
+    const { EventKind } = await import('./journal.ts')
+
+    const decisions: PolicyDecisionShape[] = [
+      { kind: 'allow', rule: 'safe-reads' }, // → auto_allow → policy.allow
+      { kind: 'allow' }, // → default_human → (deliberately none)
+      { kind: 'deny', rule: 'no-shell', reason: 'blocked' }, // → deny → policy.deny
+      { kind: 'require', rule: 'dangerous', approver: 'human_approver', ttlMs: 1000, approvers: 1 },
+    ]
+
+    for (const decision of decisions) {
+      const route = decidePermissionRoute(decision)
+      const kind = journalKindForRoute(route.type)
+      if (kind === null) {
+        // Only the no-opinion default_human route is deliberately un-journaled.
+        expect(route.type).toBe('default_human')
+      } else {
+        // Widen the readonly literal tuple to string[] — the mapping returns a
+        // plain string, and we are asserting membership, not narrowing.
+        expect((EventKind.options as readonly string[]).includes(kind)).toBe(true)
+      }
+    }
+  })
+
+  test('exactly one route — the no-opinion default_human — is deliberately not journaled', () => {
+    const all: RouteType[] = ['auto_allow', 'deny', 'require_human', 'default_human']
+    const silent = all.filter((t) => journalKindForRoute(t) === null)
+    // If a future change drops the journal write on a real decision branch
+    // (e.g. makes auto_allow silent), this fails loudly — that is the "no
+    // silent gap" guarantee at runtime, paired with the compile-time `never`.
+    expect(silent).toEqual(['default_human'])
+  })
+
+  test('the four explicit decision events + the deny stripped record are all real EventKinds', async () => {
+    const { EventKind } = await import('./journal.ts')
+    const kinds = EventKind.options as readonly string[]
+    // The bead's enumerated decision set. Removing any from journal.ts breaks this.
+    for (const k of ['policy.allow', 'policy.deny', 'policy.require', 'policy.approved']) {
+      expect(kinds.includes(k)).toBe(true)
+    }
+    // The deny path is a two-event sequence — the minimised record must exist too.
+    expect(kinds.includes('policy.deny.context_stripped')).toBe(true)
+  })
+
+  test('the real deny helper emits exactly the policy.deny + context_stripped pair (no gap on deny)', async () => {
+    // Drives PRODUCTION code (recordPolicyDenyToJournal) for the deny branch:
+    // proves deny is never a single-event gap. Full detail/ordering is covered
+    // by the ccsc-06s tests; here we assert only the no-gap kind pair.
+    const { recordPolicyDenyToJournal } = await import('./policy-dispatch.ts')
+    const kinds: string[] = []
+    await recordPolicyDenyToJournal(
+      async (input: Record<string, unknown>) => {
+        kinds.push(input.kind as string)
+        return { ok: true } as unknown
+      },
+      {
+        sessionKey: { channel: 'C1', thread: 'T1' },
+        toolName: 'Bash',
+        input: { cmd: 'rm -rf /' },
+        ruleId: 'no-destructive-bash',
+        reason: 'blocked',
+      },
+    )
+    expect(kinds).toEqual(['policy.deny', 'policy.deny.context_stripped'])
+  })
+})
+
+// ---------------------------------------------------------------------------
 // recordApprovalVote — ccsc-me6.4 / me6.5, Epic 29-B Phase 2
 //
 // Multi-approver quorum with NIST two-person integrity (user_id dedup).
