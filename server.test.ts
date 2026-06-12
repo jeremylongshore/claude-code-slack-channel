@@ -83,6 +83,7 @@ import {
   createDeliverySendDeps,
   createReplyPoster,
   DurableUnavailableError,
+  deliverChunkedReplyDurably,
   deliverReplyDurably,
   type ReplyPoster,
 } from './slack-delivery.ts'
@@ -6008,6 +6009,47 @@ describe('reply-delivery outbox (ccsc-o7x.2.1)', () => {
     expect(handle.session.outbox?.map((o) => o.id)).toEqual(['d-1', 'd-2'])
   })
 
+  // -- recordTerminalDeliveries — batch sibling for chunked replies (ccsc-o7x.4)
+
+  test('recordTerminalDeliveries appends all chunks in ONE atomic write, clearing the in-flight marker', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTerminalDeliveries(token, [
+      { id: 'r-1:0', channel: 'C_OBX', thread: 'T1', payload: 'a' },
+      { id: 'r-1:1', channel: 'C_OBX', thread: 'T1', payload: 'b' },
+      { id: 'r-1:2', channel: 'C_OBX', thread: 'T1', payload: 'c' },
+    ])
+
+    // One write: marker gone AND all three obligations present, in order.
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    expect(handle.session.outbox?.map((o) => [o.id, o.payload, o.state])).toEqual([
+      ['r-1:0', 'a', 'pending'],
+      ['r-1:1', 'b', 'pending'],
+      ['r-1:2', 'c', 'pending'],
+    ])
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    expect(reloaded.outbox?.map((o) => o.id)).toEqual(['r-1:0', 'r-1:1', 'r-1:2'])
+  })
+
+  test('recordTerminalDeliveries is fenced — a superseded token rejects and writes nothing (all-or-nothing)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.recordTerminalDeliveries(handle.lease!.token + 999, [
+        { id: 'r-1:0', channel: 'C_OBX', thread: 'T1', payload: 'a' },
+        { id: 'r-1:1', channel: 'C_OBX', thread: 'T1', payload: 'b' },
+      ]),
+    ).rejects.toThrow(/fenced|lease lost/)
+    // Not a single chunk leaked through.
+    expect(handle.session.outbox).toBeUndefined()
+  })
+
   test('pendingDeliveries returns pending obligations across sessions', async () => {
     const sup = makeSupervisor()
     const h1 = await sup.activate({ channel: 'C_OBX', thread: 'a' }, 'U')
@@ -6935,6 +6977,184 @@ describe('deliverReplyDurably (ccsc-o7x.3 pt2)', () => {
       deliverReplyDurably({ supervisor: sup, post: poster }, reply),
     ).rejects.toBeInstanceOf(DurableUnavailableError)
     expect(calls).toHaveLength(0) // never attempted a send
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable chunked (multi-message) reply delivery — deliverChunkedReplyDurably
+// (ccsc-o7x.4). One reply → N chunks → N obligations, each with id <id>:<i> and
+// its own idempotency key, recorded all-or-nothing before any send, posted in
+// order, stopping at the first transient gap so the poller redelivers the tail
+// in order.
+// ---------------------------------------------------------------------------
+
+describe('deliverChunkedReplyDurably (ccsc-o7x.4)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_CHUNK', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-chunked-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  /** Poster that records every call and optionally throws on a given chunk index
+   *  (0-based, in post order). Returns `ts-<idx>` for successful posts. */
+  function makePoster(opts: { failOn?: number; error?: Error } = {}) {
+    const calls: Array<{ id: string; key: string; text: string }> = []
+    const poster: ReplyPoster = async (obligation, idemKey) => {
+      const idx = calls.length
+      calls.push({ id: obligation.id, key: idemKey, text: obligation.payload })
+      if (opts.failOn === idx && opts.error) throw opts.error
+      return `ts-${idx}`
+    }
+    return { poster, calls }
+  }
+
+  const baseReply = { id: 'r-1', channel: 'C_CHUNK', thread: 'T1' }
+
+  test('success: posts every chunk in order, each under its own key, all delivered', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster()
+
+    const result = await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['a', 'b', 'c'] },
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-0', sent: 3 })
+    // Posted in order, each chunk under its own ccsc-reply:r-1:<i> key.
+    expect(calls).toEqual([
+      { id: 'r-1:0', key: 'ccsc-reply:r-1:0', text: 'a' },
+      { id: 'r-1:1', key: 'ccsc-reply:r-1:1', text: 'b' },
+      { id: 'r-1:2', key: 'ccsc-reply:r-1:2', text: 'c' },
+    ])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.map((o) => [o.id, o.state])).toEqual([
+      ['r-1:0', 'delivered'],
+      ['r-1:1', 'delivered'],
+      ['r-1:2', 'delivered'],
+    ])
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records ALL chunks BEFORE the first send (crash-before-send safe, all-or-nothing)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    let pendingAtFirstSend = -1
+    const poster: ReplyPoster = async () => {
+      if (pendingAtFirstSend < 0) {
+        const probe = makeSupervisor()
+        pendingAtFirstSend = (await probe.pendingDeliveries()).length
+      }
+      return 'ts'
+    }
+    await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['a', 'b', 'c'] },
+    )
+    // All 3 obligations were durable on disk before the first post returned.
+    expect(pendingAtFirstSend).toBe(3)
+  })
+
+  test('transient error mid-stream: stops, leaves the failing chunk + tail pending, returns queued', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster({ failOn: 1, error: slackError('rate_limited') })
+
+    const result = await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['a', 'b', 'c'] },
+    )
+
+    expect(result).toEqual({ status: 'queued', delivered: 1, pending: 2 })
+    // Chunk 'c' (index 2) was NOT posted inline — order is preserved by stopping.
+    expect(calls.map((c) => c.text)).toEqual(['a', 'b'])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.map((o) => [o.id, o.state])).toEqual([
+      ['r-1:0', 'delivered'],
+      ['r-1:1', 'pending'],
+      ['r-1:2', 'pending'],
+    ])
+    // The poller redelivers chunks 1 and 2, in order.
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1:1', 'r-1:2'])
+  })
+
+  test('non-retryable error mid-stream: marks the chunk dead and rethrows (prefix already landed)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster({ failOn: 1, error: slackError('channel_not_found') })
+
+    await expect(
+      deliverChunkedReplyDurably(
+        { supervisor: sup, post: poster },
+        { ...baseReply, chunks: ['a', 'b', 'c'] },
+      ),
+    ).rejects.toThrow(/channel_not_found/)
+
+    expect(calls.map((c) => c.text)).toEqual(['a', 'b']) // stopped at the failing chunk
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.map((o) => [o.id, o.state])).toEqual([
+      ['r-1:0', 'delivered'],
+      ['r-1:1', 'dead'],
+      ['r-1:2', 'pending'],
+    ])
+    expect(reloaded.outbox?.[1]?.lastError).toBe('channel_not_found')
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession → the owner-less activate rejects before any record/send.
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster()
+
+    await expect(
+      deliverChunkedReplyDurably(
+        { supervisor: sup, post: poster },
+        { ...baseReply, chunks: ['a', 'b'] },
+      ),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
+    expect(calls).toHaveLength(0)
+    // Nothing was recorded.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('degenerate single-chunk reply still delivers (N=1)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster()
+
+    const result = await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['only'] },
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-0', sent: 1 })
+    expect(calls).toEqual([{ id: 'r-1:0', key: 'ccsc-reply:r-1:0', text: 'only' }])
   })
 })
 
