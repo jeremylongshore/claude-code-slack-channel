@@ -456,19 +456,15 @@ function processApprovalVote(
   entry.policy = vote.state
   if (vote.kind === 'approved') {
     grantPolicyApproval(vote.state, now)
-    journalWrite({
-      kind: 'policy.approved',
-      outcome: 'allow',
-      actor: 'human_approver',
-      sessionKey: vote.state.sessionKey,
-      toolName: entry.tool_name,
-      input: {
-        tool: entry.tool_name,
+    journalWrite(
+      buildPolicyApprovedEvent({
+        sessionKey: vote.state.sessionKey,
+        toolName: entry.tool_name,
+        ruleId: vote.state.ruleId,
         approversNeeded: vote.state.approversNeeded,
         approvers: Array.from(vote.state.approvedBy),
-      },
-      ruleId: vote.state.ruleId,
-    })
+      }),
+    )
     return { kind: 'approved', state: vote.state }
   }
   return { kind: 'pending', state: vote.state }
@@ -636,15 +632,23 @@ function journalWrite(
 // resolve. Mirrors the acp-adapter.ts pattern (PR #173).
 import {
   buildDenyNotificationParams,
+  buildPolicyAllowEvent,
+  buildPolicyApprovedEvent,
+  buildPolicyRequireEvent,
   type DenyNotificationParams,
   type PolicyDenyDetail,
+  permissionRouteJournalEvents,
   recordPolicyDenyToJournal,
 } from './policy-dispatch.ts'
 
 export {
   buildDenyNotificationParams,
+  buildPolicyAllowEvent,
+  buildPolicyApprovedEvent,
+  buildPolicyRequireEvent,
   type DenyNotificationParams,
   type PolicyDenyDetail,
+  permissionRouteJournalEvents,
   recordPolicyDenyToJournal,
 }
 
@@ -2194,16 +2198,17 @@ mcp.setNotificationHandler(
         lastActiveThread,
         params.tool_name,
       )
-      journalWrite({
-        kind: 'policy.allow',
-        outcome: 'allow',
-        actor: 'claude_process',
+      // Build + write via the exhaustive route→events contract so the
+      // no-gaps invariant (ccsc-1iw.2) binds this production path, not a
+      // test-local map (ccsc-175). auto_allow → exactly [policy.allow].
+      for (const ev of permissionRouteJournalEvents(route, {
         sessionKey: policySessionKey,
         toolName: params.tool_name,
         input: policyInput,
-        ruleId: route.ruleId,
         correlationId,
-      })
+      })) {
+        journalWrite(ev)
+      }
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
         params: { request_id: params.request_id, behavior: 'allow' },
@@ -2286,15 +2291,17 @@ mcp.setNotificationHandler(
     // for the no-opinion case — see release-plan R2).
     let pendingPolicy: PendingPolicyApproval | undefined
     if (route.type === 'require_human' && decision.kind === 'require') {
-      journalWrite({
-        kind: 'policy.require',
-        outcome: 'require',
-        actor: 'claude_process',
+      // Same exhaustive contract as auto_allow above (ccsc-175):
+      // require_human → exactly [policy.require], approversNeeded merged
+      // into the trace input by the builder.
+      for (const ev of permissionRouteJournalEvents(route, {
         sessionKey: policySessionKey,
         toolName: params.tool_name,
-        input: { ...policyInput, approversNeeded: decision.approvers },
-        ruleId: route.ruleId,
-      })
+        input: policyInput,
+        approversNeeded: decision.approvers,
+      })) {
+        journalWrite(ev)
+      }
       pendingPolicy = {
         ruleId: decision.rule,
         ttlMs: decision.ttlMs,
