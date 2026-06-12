@@ -9411,69 +9411,57 @@ describe('decidePermissionRoute', () => {
 // recordPolicyDenyToJournal two-event tests below, and the audit_chain_verifier
 // acceptance primitive.
 //
-// KNOWN CONSTRAINT (ccsc-175): server.ts writes the policy.allow / .require /
-// .approved events INLINE and runs main() on import, so a test cannot import it
-// to assert those exact write calls. This test therefore anchors the mapping to
-// the REAL journal EventKind enum and drives the real deny helper; the stronger
-// "execute the production dispatch" assertion is filed as ccsc-175.
+// CONSTRAINT RESOLVED (ccsc-175, PR for bz-ccsc-175): server.ts now builds the
+// policy.allow / .require / .approved events via the importable, side-effect-free
+// builders in policy-dispatch.ts, and dispatches the route→events mapping through
+// the exhaustive `permissionRouteJournalEvents` (a `never`-guard that fails to
+// COMPILE on a new un-journaled route). This block now anchors to that PRODUCTION
+// contract — `permissionRouteJournalKinds` — instead of a test-local switch, so
+// the no-gaps guarantee binds the code server.ts actually runs. The dedicated
+// ccsc-175 block below drives each builder + the deny-path consistency.
 // ---------------------------------------------------------------------------
 describe('every policy decision is journaled — no silent gaps (ccsc-1iw.2)', () => {
   type RouteType = import('./lib.ts').PermissionRoute['type']
   type PolicyDecisionShape = import('./lib.ts').PolicyDecisionShape
 
-  // Single source of truth for "what each route must journal". default_human is
-  // deliberately silent — server.ts does not trace the no-opinion case (tracing
-  // it would 10x the journal on a busy channel). Encoded as an explicit `null`,
-  // NOT an omission. The `never` arm makes a new route.type a compile error
-  // until its journal decision is declared here.
-  const journalKindForRoute = (type: RouteType): string | null => {
-    switch (type) {
-      case 'auto_allow':
-        return 'policy.allow'
-      case 'deny':
-        return 'policy.deny' // two-event sequence; .context_stripped asserted below
-      case 'require_human':
-        return 'policy.require'
-      case 'default_human':
-        return null
-      default: {
-        const _exhaustive: never = type
-        return _exhaustive
-      }
-    }
-  }
-
   test('each decision branch routes to a real EventKind (or the one deliberately-silent route)', async () => {
     const { decidePermissionRoute } = await import('./lib.ts')
     const { EventKind } = await import('./journal.ts')
+    // PRODUCTION contract (ccsc-175): the same function server.ts calls to
+    // decide what to journal for a route. No test-local re-implementation.
+    const { permissionRouteJournalKinds } = await import('./policy-dispatch.ts')
 
     const decisions: PolicyDecisionShape[] = [
       { kind: 'allow', rule: 'safe-reads' }, // → auto_allow → policy.allow
       { kind: 'allow' }, // → default_human → (deliberately none)
-      { kind: 'deny', rule: 'no-shell', reason: 'blocked' }, // → deny → policy.deny
+      { kind: 'deny', rule: 'no-shell', reason: 'blocked' }, // → deny → policy.deny[+stripped]
       { kind: 'require', rule: 'dangerous', approver: 'human_approver', ttlMs: 1000, approvers: 1 },
     ]
 
+    const eventKinds = EventKind.options as readonly string[]
     for (const decision of decisions) {
       const route = decidePermissionRoute(decision)
-      const kind = journalKindForRoute(route.type)
-      if (kind === null) {
+      const kinds = permissionRouteJournalKinds(route.type)
+      if (kinds.length === 0) {
         // Only the no-opinion default_human route is deliberately un-journaled.
         expect(route.type).toBe('default_human')
       } else {
-        // Widen the readonly literal tuple to string[] — the mapping returns a
-        // plain string, and we are asserting membership, not narrowing.
-        expect((EventKind.options as readonly string[]).includes(kind)).toBe(true)
+        // Every kind the production contract emits must be a real EventKind.
+        for (const kind of kinds) {
+          expect(eventKinds.includes(kind)).toBe(true)
+        }
       }
     }
   })
 
-  test('exactly one route — the no-opinion default_human — is deliberately not journaled', () => {
+  test('exactly one route — the no-opinion default_human — is deliberately not journaled', async () => {
+    const { permissionRouteJournalKinds } = await import('./policy-dispatch.ts')
     const all: RouteType[] = ['auto_allow', 'deny', 'require_human', 'default_human']
-    const silent = all.filter((t) => journalKindForRoute(t) === null)
+    const silent = all.filter((t) => permissionRouteJournalKinds(t).length === 0)
     // If a future change drops the journal write on a real decision branch
     // (e.g. makes auto_allow silent), this fails loudly — that is the "no
-    // silent gap" guarantee at runtime, paired with the compile-time `never`.
+    // silent gap" guarantee at runtime, paired with the compile-time `never`
+    // inside permissionRouteJournalEvents.
     expect(silent).toEqual(['default_human'])
   })
 
@@ -9508,6 +9496,202 @@ describe('every policy decision is journaled — no silent gaps (ccsc-1iw.2)', (
       },
     )
     expect(kinds).toEqual(['policy.deny', 'policy.deny.context_stripped'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Permission-route journal builders bind production code (ccsc-175)
+//
+// Before ccsc-175, server.ts wrote policy.allow / .require / .approved as inline
+// object literals at the dispatch site, and ran main() (plus top-level Slack
+// client construction) on import — so a test could not import the module to
+// drive those exact writes. ccsc-1iw.2's no-gaps guarantee therefore bound a
+// test-local route→kind switch, not production code.
+//
+// ccsc-175 extracts the event source into policy-dispatch.ts (side-effect-free,
+// importable): three pure builders + the exhaustive `permissionRouteJournalEvents`
+// dispatcher (a `never`-guard). server.ts now CALLS these, so the tests below
+// drive the REAL production event source and assert the exact EventKind written
+// for each decision branch — the assertion ccsc-1iw.2 could not make directly.
+// The deny pair stays on recordPolicyDenyToJournal (awaited + resilient before
+// the MCP deny notification, ccsc-06s); the final test pins the dispatcher's deny
+// arm to that helper so the two execution paths cannot drift.
+// ---------------------------------------------------------------------------
+describe('permission-route journal builders bind production code (ccsc-175)', () => {
+  test('buildPolicyAllowEvent emits a policy.allow with the auto-approve detail', async () => {
+    const { buildPolicyAllowEvent } = await import('./policy-dispatch.ts')
+    const ev = buildPolicyAllowEvent({
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Read',
+      input: { tool: 'Read', channel: 'C1', thread_ts: 'T1' },
+      ruleId: 'safe-reads',
+      correlationId: 'corr-123',
+    })
+    expect(ev.kind).toBe('policy.allow')
+    expect(ev.outcome).toBe('allow')
+    expect(ev.actor).toBe('claude_process')
+    expect(ev.ruleId).toBe('safe-reads')
+    expect(ev.correlationId).toBe('corr-123')
+    expect(ev.toolName).toBe('Read')
+  })
+
+  test('buildPolicyAllowEvent omits correlationId when no receipt was posted', async () => {
+    const { buildPolicyAllowEvent } = await import('./policy-dispatch.ts')
+    const ev = buildPolicyAllowEvent({
+      toolName: 'Read',
+      input: {},
+      ruleId: 'safe-reads',
+    })
+    expect(ev.kind).toBe('policy.allow')
+    expect(ev.correlationId).toBeUndefined()
+  })
+
+  test('buildPolicyRequireEvent emits a policy.require and merges approversNeeded into input', async () => {
+    const { buildPolicyRequireEvent } = await import('./policy-dispatch.ts')
+    const ev = buildPolicyRequireEvent({
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      input: { tool: 'Bash', channel: 'C1', thread_ts: 'T1' },
+      ruleId: 'dangerous',
+      approversNeeded: 2,
+    })
+    expect(ev.kind).toBe('policy.require')
+    expect(ev.outcome).toBe('require')
+    expect(ev.actor).toBe('claude_process')
+    expect(ev.ruleId).toBe('dangerous')
+    // The quorum size is recorded in the trace input, not a top-level field.
+    expect((ev.input as Record<string, unknown>).approversNeeded).toBe(2)
+    expect((ev.input as Record<string, unknown>).tool).toBe('Bash')
+  })
+
+  test('buildPolicyApprovedEvent emits a policy.approved attributed to human_approver', async () => {
+    const { buildPolicyApprovedEvent } = await import('./policy-dispatch.ts')
+    const approvers = ['U1', 'U2']
+    const ev = buildPolicyApprovedEvent({
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      ruleId: 'dangerous',
+      approversNeeded: 2,
+      approvers,
+    })
+    expect(ev.kind).toBe('policy.approved')
+    expect(ev.outcome).toBe('allow')
+    expect(ev.actor).toBe('human_approver')
+    expect(ev.ruleId).toBe('dangerous')
+    const input = ev.input as Record<string, unknown>
+    expect(input.approversNeeded).toBe(2)
+    expect(input.approvers).toEqual(['U1', 'U2'])
+    // The builder copies the approver list — mutating the source must not leak.
+    approvers.push('U3')
+    expect((ev.input as Record<string, unknown>).approvers).toEqual(['U1', 'U2'])
+  })
+
+  test('permissionRouteJournalEvents maps every route to its exact ordered EventKinds', async () => {
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    type PermissionRoute = import('./lib.ts').PermissionRoute
+    const ctx = {
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      input: { tool: 'Bash', channel: 'C1', thread_ts: 'T1' },
+      correlationId: 'corr-9',
+      approversNeeded: 3,
+      reason: 'blocked',
+    }
+    const cases: { route: PermissionRoute; kinds: string[] }[] = [
+      { route: { type: 'auto_allow', ruleId: 'r' }, kinds: ['policy.allow'] },
+      {
+        route: { type: 'deny', ruleId: 'r', reason: 'blocked' },
+        kinds: ['policy.deny', 'policy.deny.context_stripped'],
+      },
+      { route: { type: 'require_human', ruleId: 'r' }, kinds: ['policy.require'] },
+      { route: { type: 'default_human' }, kinds: [] },
+    ]
+    for (const { route, kinds } of cases) {
+      const events = permissionRouteJournalEvents(route, ctx)
+      expect(events.map((e) => e.kind as string)).toEqual(kinds)
+    }
+  })
+
+  test('auto_allow events carry the route ruleId and the ctx correlationId', async () => {
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    const [ev] = permissionRouteJournalEvents(
+      { type: 'auto_allow', ruleId: 'safe-reads' },
+      {
+        sessionKey: { channel: 'C1', thread: 'T1' },
+        toolName: 'Read',
+        input: { tool: 'Read' },
+        correlationId: 'corr-7',
+      },
+    )
+    expect(ev.kind).toBe('policy.allow')
+    expect(ev.ruleId).toBe('safe-reads')
+    expect(ev.correlationId).toBe('corr-7')
+  })
+
+  test('every decidePermissionRoute outcome maps to real EventKinds (no-gaps, driven through production)', async () => {
+    const { decidePermissionRoute } = await import('./lib.ts')
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    const { EventKind } = await import('./journal.ts')
+    type PolicyDecisionShape = import('./lib.ts').PolicyDecisionShape
+    const eventKinds = EventKind.options as readonly string[]
+    const ctx = { toolName: 'Bash', input: {}, approversNeeded: 1, reason: 'x' }
+
+    const decisions: PolicyDecisionShape[] = [
+      { kind: 'allow', rule: 'safe-reads' },
+      { kind: 'allow' },
+      { kind: 'deny', rule: 'no-shell', reason: 'blocked' },
+      { kind: 'require', rule: 'dangerous', approver: 'human_approver', ttlMs: 1000, approvers: 1 },
+    ]
+    for (const decision of decisions) {
+      const route = decidePermissionRoute(decision)
+      for (const ev of permissionRouteJournalEvents(route, ctx)) {
+        expect(eventKinds.includes(ev.kind)).toBe(true)
+      }
+    }
+  })
+
+  test('the dispatcher deny arm matches what recordPolicyDenyToJournal actually writes', async () => {
+    // Pins the two deny execution paths together: server.ts routes deny through
+    // recordPolicyDenyToJournal (awaited + resilient), while the exhaustive
+    // dispatcher declares the same pair for contract completeness. If either
+    // drifts, this fails.
+    const { permissionRouteJournalEvents, recordPolicyDenyToJournal } = await import(
+      './policy-dispatch.ts'
+    )
+    const ctx = {
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      input: { tool: 'Bash', channel: 'C1', thread_ts: 'T1' },
+      reason: 'blocked',
+    }
+    const dispatched = permissionRouteJournalEvents(
+      { type: 'deny', ruleId: 'no-shell', reason: 'blocked' },
+      ctx,
+    )
+
+    const written: Record<string, unknown>[] = []
+    await recordPolicyDenyToJournal(
+      async (input: Record<string, unknown>) => {
+        written.push(input)
+        return { ok: true } as unknown
+      },
+      {
+        sessionKey: ctx.sessionKey,
+        toolName: ctx.toolName,
+        input: ctx.input,
+        ruleId: 'no-shell',
+        reason: 'blocked',
+      },
+    )
+
+    // Same ordered kinds.
+    expect(dispatched.map((e) => e.kind as string)).toEqual(written.map((e) => e.kind as string))
+    // The forensic policy.deny event carries identical ruleId + reason on both paths.
+    expect(dispatched[0].ruleId).toBe(written[0].ruleId as string | undefined)
+    expect(dispatched[0].reason).toBe(written[0].reason as string | undefined)
+    // The stripped second event omits ruleId/reason on both paths.
+    expect(dispatched[1].ruleId).toBeUndefined()
+    expect(written[1].ruleId).toBeUndefined()
   })
 })
 
