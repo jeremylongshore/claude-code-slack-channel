@@ -221,6 +221,113 @@ export async function deliverReplyDurably(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Durable chunked (multi-message) reply delivery (ccsc-o7x.4)
+// ---------------------------------------------------------------------------
+
+/** One logical reply that spans multiple Slack messages. `chunks` is the
+ *  pre-split payload (the caller runs `chunkText`); each chunk becomes its own
+ *  obligation with id `<id>:<i>`, so it carries a distinct idempotency key and a
+ *  crash mid-way redelivers only the chunks that did not land. `chunks` must be
+ *  non-empty; a single-element array is valid, but the single-message
+ *  `deliverReplyDurably` is the lighter path for that case. */
+export interface DurableChunkedReply {
+  id: string
+  channel: string
+  thread: string
+  chunks: string[]
+}
+
+export type DurableChunkedDeliveryResult =
+  | { status: 'delivered'; ts: string | undefined; sent: number }
+  | { status: 'queued'; delivered: number; pending: number }
+
+/** Durable multi-message reply delivery (ccsc-o7x.4) — the chunked sibling of
+ *  `deliverReplyDurably`. One reply → N chunks → N obligations, each with id
+ *  `<reply.id>:<i>` (a distinct idempotency key per chunk).
+ *
+ *  Records ALL N obligations in ONE atomic write BEFORE any send
+ *  (`recordTerminalDeliveries`) — so a crash before/at any send leaves a
+ *  recoverable, all-or-nothing record the boot-drain redelivers. Then posts the
+ *  chunks IN ORDER, each under its own idempotency key:
+ *
+ *    - every chunk posts            → all `delivered`, return the FIRST chunk's
+ *      `ts`;
+ *    - a transient error on chunk i → mark i `pending` and STOP (do NOT post
+ *      i+1…): the poller redelivers i…N-1 in order, so chunks never land out of
+ *      order. Return `queued` (the caller must NOT retry — that would double-post
+ *      the already-sent prefix);
+ *    - a non-retryable error on chunk i → mark i `dead` and rethrow so the agent
+ *      sees the real failure. Chunks 0…i-1 already landed (a partial reply — the
+ *      honest outcome); i+1…N stay pending and the poller attempts/dead-letters
+ *      them (a channel-wide non-retryable error dead-letters them the same way).
+ *
+ *  Throws `DurableUnavailableError` BEFORE recording if the session can't be
+ *  activated or holds no lease — the caller falls back to a direct send.
+ *
+ *  Order guarantee: per-chunk obligations append in order and the poller drains a
+ *  session's outbox in array order (`pendingDeliveries` + `drainOutbox`); the
+ *  inline path posts in order and stops at the first transient gap. So a chunk
+ *  never lands ahead of an earlier one — inline or via the poller. (ccsc-o7x.4) */
+export async function deliverChunkedReplyDurably(
+  deps: { supervisor: SessionSupervisor; post: ReplyPoster },
+  reply: DurableChunkedReply,
+): Promise<DurableChunkedDeliveryResult> {
+  let handle: SessionHandle
+  try {
+    handle = await deps.supervisor.activate({ channel: reply.channel, thread: reply.thread })
+  } catch (err) {
+    throw new DurableUnavailableError(
+      `cannot activate session: ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+  const lease = handle.lease
+  if (lease === null) throw new DurableUnavailableError('session holds no lease')
+  const token = lease.token
+
+  // One obligation per chunk; the id folds in the chunk index so each carries a
+  // distinct idempotency key (`ccsc-reply:<reply.id>:<i>`).
+  const records = reply.chunks.map((payload, i) => ({
+    id: `${reply.id}:${i}`,
+    channel: reply.channel,
+    thread: reply.thread,
+    payload,
+  }))
+
+  // Record ALL N before ANY send (crash-before-send safe, all-or-nothing).
+  await handle.recordTerminalDeliveries(token, records)
+
+  let firstTs: string | undefined
+  let delivered = 0
+  for (const record of records) {
+    const obligation: DeliveryObligation = { ...record, attempts: 0, state: 'pending', createdAt: 0 }
+    const idemKey = deliveryIdempotencyKey(obligation)
+    try {
+      const ts = await deps.post(obligation, idemKey)
+      if (delivered === 0) firstTs = ts
+      await markObligation(handle, token, obligation.id, { state: 'delivered', attempts: 1 })
+      delivered++
+    } catch (err) {
+      const code = extractSlackErrorCode(err)
+      const lastError = code ?? (err instanceof Error ? err.message : String(err))
+      if (classifyDeliveryError(code) === 'non-retryable') {
+        await markObligation(handle, token, obligation.id, { state: 'dead', attempts: 1, lastError })
+        throw err
+      }
+      // Transient: leave this chunk (and every later one) pending and STOP — the
+      // poller redelivers the tail in order. Posting later chunks inline now
+      // would land them ahead of this one once it retries.
+      await markObligation(handle, token, obligation.id, {
+        state: 'pending',
+        attempts: 1,
+        lastError,
+      })
+      return { status: 'queued', delivered, pending: records.length - delivered }
+    }
+  }
+  return { status: 'delivered', ts: firstTs, sent: delivered }
+}
+
 /** Best-effort fenced patch of one obligation's state. Never throws: a fenced /
  *  save failure leaves the obligation as-is for the poller to reconcile (see
  *  `deliverReplyDurably`). */

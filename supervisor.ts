@@ -255,6 +255,20 @@ export interface SessionHandle {
     reply: { id: string; channel: string; thread: string; payload: string },
   ): Promise<void>
 
+  /** Batch sibling of `recordTerminalDelivery` for a chunked reply (ccsc-o7x.4):
+   *  one logical reply that spans N Slack messages. Appends ALL `replies` as
+   *  fresh `pending` obligations AND clears the in-flight-turn marker in ONE
+   *  atomic save — all-or-nothing, so a crash mid-record can never leave a
+   *  partially-recorded chunked reply (some chunks owed, the rest silently lost).
+   *  Each caller-supplied `id` must be unique (the chunk index is folded in by
+   *  the caller, e.g. `<replyId>:<i>`) so each chunk gets its own idempotency
+   *  key. Order is preserved: the obligations append in `replies` order, and the
+   *  poller drains a session's outbox in array order. Fenced by `token`. */
+  recordTerminalDeliveries(
+    token: number,
+    replies: readonly { id: string; channel: string; thread: string; payload: string }[],
+  ): Promise<void>
+
   /** Serialise an update through the per-session mutex, persist it via
    *  the atomic writer (`saveSession()`), and refresh `this.session`.
    *
@@ -1415,6 +1429,32 @@ class ConcreteHandle implements SessionHandle {
     return this.update((prev) => {
       const { inFlightTurn: _cleared, ...rest } = prev
       return { ...rest, outbox: [...(prev.outbox ?? []), obligation] }
+    }, token)
+  }
+
+  recordTerminalDeliveries(
+    token: number,
+    replies: readonly { id: string; channel: string; thread: string; payload: string }[],
+  ): Promise<void> {
+    const now = this.clock()
+    const obligations: DeliveryObligation[] = replies.map((reply) => ({
+      id: reply.id,
+      channel: reply.channel,
+      thread: reply.thread,
+      payload: reply.payload,
+      attempts: 0,
+      state: 'pending',
+      createdAt: now,
+    }))
+    // One atomic save appends ALL obligations AND clears the in-flight marker:
+    // a chunked reply's "turn done, N replies owed" is a single durable fact.
+    // All-or-nothing — a crash during this write leaves either zero or all N
+    // obligations, never a partial set (which would deliver some chunks and
+    // silently drop the rest). Fenced by the lease token. The obligations append
+    // in `replies` order so the poller drains them into the thread in order.
+    return this.update((prev) => {
+      const { inFlightTurn: _cleared, ...rest } = prev
+      return { ...rest, outbox: [...(prev.outbox ?? []), ...obligations] }
     }, token)
   }
 
