@@ -96,6 +96,7 @@ import {
   createDeliverySendDeps,
   createReplyPoster,
   DurableUnavailableError,
+  deliverChunkedReplyDurably,
   deliverReplyDurably,
 } from './slack-delivery.ts'
 import { streamReply } from './stream-reply.ts'
@@ -1196,6 +1197,50 @@ async function executeReplyDurablePath(opts: {
   }
 }
 
+/** ccsc-o7x.4 — durable path for a chunked (multi-message) reply: the N>1 sibling
+ *  of `executeReplyDurablePath`. Records all chunk obligations up front and
+ *  delivers them in order via `deliverChunkedReplyDurably`; a transient failure
+ *  mid-stream queues the tail for the poller (which redelivers in order) rather
+ *  than losing it. Throws `DurableUnavailableError` (before any record/send) when
+ *  the session can't go durable — the caller falls back to the direct chunk loop.
+ *  Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyChunkedDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  chunks: string[]
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, chunks, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const result = await deliverChunkedReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web) },
+    { id: randomUUID(), channel: chatId, thread: threadTs, chunks },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent ${result.sent} message(s) to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  // Queued: a prefix delivered; the rest is owed to the poller (redelivered in
+  // order). The caller must NOT retry — that would double-post the sent prefix.
+  const total = result.delivered + result.pending
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent ${result.delivered} of ${total} message(s) to ${chatId}; ${result.pending} queued for delivery (transient Slack error; the poller retries the rest in order)`,
+      },
+    ],
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
@@ -1242,30 +1287,27 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     input: { channel: chatId, thread_ts: threadTs },
   })
 
-  // ccsc-o7x.3 — durable single-message path (ADR-002 addendum, Option A). Only
-  // the shape where one obligation = one Slack message: no stream, no files,
-  // fits one chunk, has a thread, and the supervisor is up. Records the reply as
-  // a durable obligation so a transient Slack failure or a crash is retried by
-  // the delivery poller instead of lost. Falls back to the direct send below if
-  // the session can't go durable (DurableUnavailableError). Chunked / file /
-  // streaming replies are deliberately NOT routed here (ccsc-o7x.4/.5/.6).
-  if (
-    !stream &&
-    (!files || files.length === 0) &&
-    threadTs !== undefined &&
-    supervisor !== null &&
-    text.length <= limit
-  ) {
+  // ccsc-o7x.3/.4 — durable reply path (ADR-002 addendum, Option A). Applies to
+  // any non-streaming, file-free reply in a thread while the supervisor is up:
+  // the reply is recorded as durable obligation(s) so a transient Slack failure
+  // or a crash is retried by the delivery poller instead of lost. One chunk → the
+  // single-message path (ccsc-o7x.3); N chunks → the chunked path (ccsc-o7x.4),
+  // one obligation per chunk delivered in order. Falls back to the best-effort
+  // direct send below if the session can't go durable (DurableUnavailableError).
+  // File / streaming replies are still NOT routed here (ccsc-o7x.5/.6).
+  const chunks = chunkText(text, limit, mode)
+
+  if (!stream && (!files || files.length === 0) && threadTs !== undefined && supervisor !== null) {
     try {
-      return await executeReplyDurablePath({ chatId, threadTs, text, ctx })
+      return chunks.length <= 1
+        ? await executeReplyDurablePath({ chatId, threadTs, text, ctx })
+        : await executeReplyChunkedDurablePath({ chatId, threadTs, chunks, ctx })
     } catch (durableErr) {
       if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
       // Session couldn't go durable — fall through to the best-effort direct
       // send (the allow event above already stands).
     }
   }
-
-  const chunks = chunkText(text, limit, mode)
 
   let lastTs = ''
   for (const chunk of chunks) {
