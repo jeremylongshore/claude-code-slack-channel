@@ -9292,6 +9292,101 @@ describe('every policy decision is journaled — no silent gaps (ccsc-1iw.2)', (
 })
 
 // ---------------------------------------------------------------------------
+// Fail-closed access defaults — no fail-open footguns (ccsc-1iw.3)
+//
+// Regression test for the peer-runtime footgun in 000-docs/ADR-002: the peer
+// shipped fail-OPEN defaults (cross-thread reads default-ON; the sandbox
+// launched the agent with --dangerously-skip-permissions). CCSC's posture is
+// the inverse — every access decision DENIES / DROPS / THROWS when its config is
+// absent. THREAT-MODEL.md names this the fail-closed posture.
+//
+// This is the CONSOLIDATED audit checklist the ccsc-1iw.3 acceptance asks for:
+// one row per access default, each asserting the fail-closed DIRECTION, so a
+// future change that flips any default to fail-open is caught here by name.
+// Each surface's detailed behavior is tested in its own block above/below; this
+// block is the roll-up an auditor reads top-to-bottom.
+//
+// AUDIT RESULT (2026-06-12): every enumerated default is ALREADY fail-closed —
+// no flip required. ccsc-1iw.3 ships as a pin, not a fix.
+// ---------------------------------------------------------------------------
+describe('fail-closed access defaults — no fail-open footguns (ccsc-1iw.3)', () => {
+  const sessionKey = { channel: 'C1', thread: 'T1' }
+  const now = 1_700_000_000_000
+
+  // #1 Inbound — a regular channel with NO ChannelPolicy is not implicitly trusted.
+  test('default #1: a channel message with no ChannelPolicy is dropped', async () => {
+    const result = await gate(
+      { user: 'U_RANDO', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  // #2 Inbound — peer bots are opt-IN (allowBotIds), never opt-out. No list ⇒ drop.
+  test('default #2: a peer-bot message with no allowBotIds is dropped', async () => {
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  // #3 Inbound DM — allowFrom defaults to [] (hardened); a stranger DM is dropped.
+  test('default #3: a DM from a user not in allowFrom is dropped', async () => {
+    const result = await gate(
+      { user: 'U_RANDO', channel: 'D1', channel_type: 'im', text: 'hi' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  // #4 Policy — an unmatched MUTATING tool denies by omission (deny-by-default set).
+  test('default #4: an unmatched mutating tool (upload_file) denies by omission', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const decision = evaluate(
+      { tool: 'upload_file', input: {}, sessionKey, actor: 'claude_process' },
+      [],
+      now,
+    )
+    expect(decision.kind).toBe('deny')
+  })
+
+  // #5 Policy — an unmatched READ tool NEVER auto-allows; it routes to a human.
+  test('default #5: an unmatched read tool never auto-allows (routes to human approval)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const { decidePermissionRoute } = await import('./lib.ts')
+    const decision = evaluate(
+      { tool: 'Read', input: {}, sessionKey, actor: 'claude_process' },
+      [],
+      now,
+    )
+    const route = decidePermissionRoute(decision)
+    // The no-rule allow must fall to Block Kit human approval, not auto_allow.
+    expect(route.type).toBe('default_human')
+    expect(route.type).not.toBe('auto_allow')
+  })
+
+  // #6 Outbound — replies go only to delivered/allowlisted channels. Unknown ⇒ throw.
+  test('default #6: outbound to an undelivered, non-allowlisted channel is refused', () => {
+    expect(() =>
+      assertOutboundAllowed('C_UNKNOWN', undefined, makeAccess(), new Set<string>()),
+    ).toThrow(/not in the allowlist or delivered/)
+  })
+
+  // #7 File send — input-validation fail-closed: empty path and ".." are rejected.
+  test('default #7: the file-send guard rejects an empty path and a ".." path', () => {
+    expect(() => assertSendable('', '/tmp/inbox')).toThrow(/empty or not a string/)
+    expect(() => assertSendable('/tmp/inbox/../escape', '/tmp/inbox')).toThrow(/"\.\." component/)
+  })
+
+  // #8 Manifest publish — allowlist-gated; a non-allowlisted user is refused.
+  test('default #8: manifest publish is refused for a non-allowlisted user', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    expect(() => assertPublishAllowed('U_RANDO', makeAccess())).toThrow(/not in access\.allowFrom/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // recordApprovalVote — ccsc-me6.4 / me6.5, Epic 29-B Phase 2
 //
 // Multi-approver quorum with NIST two-person integrity (user_id dedup).
