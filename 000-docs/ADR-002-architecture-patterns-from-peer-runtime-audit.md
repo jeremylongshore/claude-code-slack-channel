@@ -265,6 +265,46 @@ step of `ccsc-o7x.3`. The deferred rich-path durability is tracked by
 `ccsc-o7x.4` (chunked), `ccsc-o7x.5` (file uploads), and `ccsc-o7x.6`
 (streaming).
 
+## Addendum (2026-06-12): chunked (multi-message) replies made durable (ccsc-o7x.4)
+
+The first of the deferred rich paths is now durable. A reply longer than the
+chunk limit is split into N Slack messages; the `ccsc-o7x.3` addendum deferred it
+because "chunking is N messages [and] forcing it through the outbox would …
+risk partial double-sends."
+
+**Decision — one obligation per chunk.** The single-payload `DeliveryObligation`
+*does* fit chunking once you model **each chunk as its own obligation** with id
+`<reply.id>:<i>`. Each chunk then carries a distinct idempotency key
+(`ccsc-reply:<reply.id>:<i>`), so a redelivery dedups *per chunk* — a crash after
+posting chunks 0–2 of 5 redelivers only 3–4, never re-posting 0–2.
+
+- **Record all N before any send, atomically.** `recordTerminalDeliveries`
+  (the batch sibling of `recordTerminalDelivery`) appends all N `pending`
+  obligations AND clears the in-flight marker in **one** fenced write —
+  all-or-nothing, so a crash mid-record never leaves a partially-recorded reply
+  (some chunks owed, the rest silently dropped).
+- **Post in order; stop at the first transient gap.** `deliverChunkedReplyDurably`
+  posts chunks in order. On a **transient** error at chunk *i* it marks *i*
+  `pending` and **stops** (does not post *i+1…*), returning *queued* — the poller
+  redelivers *i…N-1* in order, so a chunk never lands ahead of an earlier one.
+  On a **non-retryable** error it marks *i* `dead` and rethrows (chunks 0…*i*-1
+  already landed — the honest partial-reply outcome).
+- **The poller is untouched.** Because each chunk is just a normal
+  `DeliveryObligation` with a unique key, `pendingDeliveries` (array order) +
+  `drainOutbox` (sequential) already preserve order and dedup per chunk — zero
+  poller changes. `lib.ts` (the AGP-vendored kernel) is likewise unchanged.
+
+**Ordering guarantee (inline and via the poller).** Obligations append in chunk
+order; the inline path posts in order and stops at the first transient gap; the
+poller drains a session's outbox in array order. So a chunk never lands ahead of
+an earlier one on either path.
+
+**Scope still deferred:** file uploads (`ccsc-o7x.5`) and streaming
+(`ccsc-o7x.6`). Files are separate uploads (need an upload-dedup token); a stream
+can't be idempotently replayed (needs a stream-finalize obligation). Until then
+those two keep best-effort behavior and do not enqueue — zero double-send risk,
+same as before.
+
 ## References
 
 - The `ccsc-*` peer-audit hardening backlog (Epics 1–5), filed alongside this ADR;
