@@ -5285,6 +5285,119 @@ describe('createSessionSupervisor.activate', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Cross-(channel, thread) session-state isolation (ccsc-1iw.1)
+//
+// Regression test for the peer-runtime footgun catalogued in
+// 000-docs/ADR-002 ("cross-thread reads default-ON"): the peer runtime shipped
+// a SANDBOX_CROSS_THREAD_READS=1 default that let one session read another's
+// state. CCSC's inversion is *structural* — the supervisor keys every read by
+// the inbound (channel, thread), and sessionPath() nests state under a
+// per-channel directory whose components are validated, so no key for one
+// thread can address another's file. THREAT-MODEL.md line 165 names the exact
+// threat ("cross-thread state injection" on sessions/*) and the exact
+// mitigation ("realpath-guarded sessionPath()"). These tests pin that
+// guarantee at the supervisor layer — the surface the running server actually
+// uses — and fail loudly if it ever regresses.
+//
+// SCOPE: the in-band adversary — the (channel, thread) *values* that ride in on
+// a Slack event (the prompt-injection vector). A same-UID local attacker who
+// can write the 0o700 single-writer state dir (e.g. plant a within-root symlink
+// sessions/A/X.json -> sessions/B/Y.json) is OUT OF SCOPE per THREAT-MODEL.md
+// T5 ("State-file tampering … Out of scope — this is a UID-trust boundary") and
+// R1 ("Same-UID host compromise. Out of scope"). So these tests deliberately do
+// NOT assert a guarantee against within-root symlinks: that path is unreachable
+// by the in-scope adversary, and asserting it would mis-state the threat model.
+// ---------------------------------------------------------------------------
+describe('cross-(channel,thread) session isolation (ccsc-1iw.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'session-isolation-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => 1_700_000_000_000,
+    })
+  }
+
+  test('two sessions in different channels keep disjoint state (in-memory and on disk)', async () => {
+    const sup = makeSupervisor()
+    const a = await sup.activate({ channel: 'C_AAA', thread: 'T1' }, 'U_A')
+    const b = await sup.activate({ channel: 'C_BBB', thread: 'T1' }, 'U_B')
+
+    // Each session writes a distinct secret into ITS OWN data via the
+    // supervisor's serialised update() path.
+    await a.update((s) => ({ ...s, data: { ...s.data, secret: 'alpha' } }))
+    await b.update((s) => ({ ...s, data: { ...s.data, secret: 'bravo' } }))
+
+    // No bleed in the live handles…
+    expect(a.session.data.secret).toBe('alpha')
+    expect(b.session.data.secret).toBe('bravo')
+    expect(a.session.ownerId).toBe('U_A')
+    expect(b.session.ownerId).toBe('U_B')
+
+    // …nor on disk: each per-channel file holds only its own secret.
+    const onDiskA = JSON.parse(
+      readFileSync(sessionPath(tmpRoot, { channel: 'C_AAA', thread: 'T1' }), 'utf8'),
+    ) as Session
+    const onDiskB = JSON.parse(
+      readFileSync(sessionPath(tmpRoot, { channel: 'C_BBB', thread: 'T1' }), 'utf8'),
+    ) as Session
+    expect(onDiskA.data.secret).toBe('alpha')
+    expect(onDiskA.data).not.toHaveProperty('bravo')
+    expect(onDiskB.data.secret).toBe('bravo')
+  })
+
+  test('the same thread id in two channels resolves to two distinct sessions', async () => {
+    // A Slack thread ts is only unique within a channel; the same ts can occur
+    // in two channels. Channel scoping (sessionPath nests by channel; keyId
+    // uses a NUL separator) must keep them apart — never one shared file.
+    const sup = makeSupervisor()
+    const a = await sup.activate({ channel: 'C_AAA', thread: 'T_SHARED' }, 'U_A')
+    const b = await sup.activate({ channel: 'C_BBB', thread: 'T_SHARED' }, 'U_B')
+
+    expect(a).not.toBe(b)
+    await a.update((s) => ({ ...s, data: { ...s.data, mark: 'only-a' } }))
+    // b is a different session — A's write is invisible to it.
+    expect(b.session.data.mark).toBeUndefined()
+  })
+
+  test('an inbound thread value that embeds traversal toward another session is rejected before any read', async () => {
+    const sup = makeSupervisor()
+    // Seed a victim session the attacker would like to read.
+    const victim = await sup.activate({ channel: 'C_VICTIM', thread: 'TV' }, 'U_VICTIM')
+    await victim.update((s) => ({ ...s, data: { ...s.data, secret: 'victim-only' } }))
+
+    // The attacker controls the inbound thread value and tries to climb out of
+    // their own channel into the victim's file: '../C_VICTIM/TV'. Component
+    // validation in sessionPath() rejects the '/' (and '..') before any disk
+    // read happens, so activate() throws and no victim state is ever returned.
+    await expect(
+      sup.activate({ channel: 'C_ATTACKER', thread: '../C_VICTIM/TV' }, 'U_ATTACKER'),
+    ).rejects.toThrow(/invalid thread component/)
+
+    // Same defense via a crafted channel component.
+    await expect(
+      sup.activate({ channel: '../C_VICTIM', thread: 'TV' }, 'U_ATTACKER'),
+    ).rejects.toThrow(/invalid channel component/)
+
+    // The victim file is untouched and still readable only via its own key.
+    const onDisk = JSON.parse(
+      readFileSync(sessionPath(tmpRoot, { channel: 'C_VICTIM', thread: 'TV' }), 'utf8'),
+    ) as Session
+    expect(onDisk.data.secret).toBe('victim-only')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Fencing lease (ccsc-o7x.1.1) — pure helpers
 // ---------------------------------------------------------------------------
 
