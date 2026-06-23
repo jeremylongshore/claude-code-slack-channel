@@ -1847,8 +1847,44 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   return handleChannelEvent(ev, opts)
 }
 
+/** True when `botUserId` is mentioned in a way that should ENGAGE the bot
+ *  (ccsc-apj.4). Prefers Slack's structured `blocks`: a real mention is a
+ *  `user` element whose `user_id` is the bot, sitting in a normal
+ *  rich-text section/list — NOT inside a code block
+ *  (`rich_text_preformatted`) or a blockquote (`rich_text_quote`), where a
+ *  `<@bot>` is being quoted/displayed, not addressed. When `blocks` are
+ *  present they are authoritative (no substring fallback) so a mention
+ *  buried in a code block cannot falsely engage on a requireMention
+ *  channel. When `blocks` are absent (minimal events), fall back to the
+ *  legacy raw-text substring check. */
+function richTextMentionsBot(blocks: unknown, botUserId: string): boolean {
+  // Recursive walk over the rich-text tree. A `user` node addressing the bot
+  // counts UNLESS it sits inside a code block (`rich_text_preformatted`) or a
+  // blockquote (`rich_text_quote`) — those subtrees are pruned so a quoted
+  // `<@bot>` cannot engage. Handles arbitrary nesting (sections, lists).
+  const walk = (node: unknown): boolean => {
+    if (Array.isArray(node)) {
+      for (const n of node) if (walk(n)) return true
+      return false
+    }
+    if (!node || typeof node !== 'object') return false
+    const o = node as Record<string, unknown>
+    if (o.type === 'user' && o.user_id === botUserId) return true
+    if (o.type === 'rich_text_preformatted' || o.type === 'rich_text_quote') return false
+    return walk(o.elements)
+  }
+  return walk(blocks)
+}
+
 function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
   if (!botUserId) return false
+  // Structured path: when Slack supplies `blocks`, trust them — a mention is
+  // only "real" outside code/quote containers, and we do NOT fall back to the
+  // substring check (which would re-match a `<@bot>` quoted inside a code block).
+  if (Array.isArray(event.blocks)) {
+    return richTextMentionsBot(event.blocks, botUserId)
+  }
+  // Fallback: no blocks → legacy raw-text substring check.
   const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
 }

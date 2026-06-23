@@ -471,6 +471,118 @@ describe('gate', () => {
     expect(result.action).toBe('deliver')
   })
 
+  // -- isMentioned via Slack blocks (ccsc-apj.4) --
+  // A <@bot> quoted inside a code block or blockquote must NOT engage a
+  // requireMention channel; a real mention in a normal section/list must.
+
+  test('engages on a real mention in a rich_text section via blocks (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: 'hey <@U_BOT> help',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [
+              {
+                type: 'rich_text_section',
+                elements: [
+                  { type: 'text', text: 'hey ' },
+                  { type: 'user', user_id: 'U_BOT' },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('does NOT engage on a <@bot> inside a code block (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        // raw text still contains <@U_BOT> — proving the substring check would have falsely matched
+        text: 'see `<@U_BOT>`',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [
+              { type: 'rich_text_preformatted', elements: [{ type: 'user', user_id: 'U_BOT' }] },
+            ],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('drop')
+    expect(result.dropReason).toBe('channel.require_mention')
+  })
+
+  test('does NOT engage on a <@bot> inside a blockquote (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: '> <@U_BOT> said hi',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [{ type: 'rich_text_quote', elements: [{ type: 'user', user_id: 'U_BOT' }] }],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('engages on a mention nested inside a rich_text_list (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: '- <@U_BOT>',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [
+              {
+                type: 'rich_text_list',
+                elements: [
+                  { type: 'rich_text_section', elements: [{ type: 'user', user_id: 'U_BOT' }] },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('falls back to substring mention when no blocks are present (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      { user: 'U1', channel: 'C_M', channel_type: 'channel', text: 'hey <@U_BOT>' },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
   // -- dropReason on every drop branch (ccsc-apj.2) --
   // Each inbound drop now carries a structured reason so the journal
   // (gate.inbound.drop, server.ts) explains why Claude stayed silent.
