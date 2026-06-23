@@ -471,6 +471,136 @@ describe('gate', () => {
     expect(result.action).toBe('deliver')
   })
 
+  // -- dropReason on every drop branch (ccsc-apj.2) --
+  // Each inbound drop now carries a structured reason so the journal
+  // (gate.inbound.drop, server.ts) explains why Claude stayed silent.
+
+  test('self-echo drop carries dropReason self.echo (ccsc-apj.2)', async () => {
+    const result = await gate(
+      { bot_id: 'B_BOT', user: 'U_BOT', channel: 'C1', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+    expect(result.dropReason).toBe('self.echo')
+  })
+
+  test('non-allowlisted bot drop carries dropReason bot.not_allowlisted (ccsc-apj.2)', async () => {
+    const access = makeAccess({ channels: { C1: { requireMention: false, allowFrom: [] } } })
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hi' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('bot.not_allowlisted')
+  })
+
+  test('permission-relay bot drop carries dropReason bot.permission_relay (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER'] } },
+    })
+    const result = await gate(
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'yes abcde',
+      },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('bot.permission_relay')
+  })
+
+  test('filtered subtype drop carries dropReason subtype.filtered (ccsc-apj.2)', async () => {
+    const result = await gate(
+      { subtype: 'message_changed', user: 'U1', channel_type: 'channel', channel: 'C1' },
+      makeOpts(),
+    )
+    expect(result.dropReason).toBe('subtype.filtered')
+  })
+
+  test('no-user drop carries dropReason event.no_user (ccsc-apj.2)', async () => {
+    const result = await gate({ channel_type: 'channel', channel: 'C1' }, makeOpts())
+    expect(result.dropReason).toBe('event.no_user')
+  })
+
+  test('closed-DM drop carries dropReason dm.policy_closed (ccsc-apj.2)', async () => {
+    const access = makeAccess({ dmPolicy: 'disabled' })
+    const result = await gate(
+      { user: 'U_X', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('dm.policy_closed')
+  })
+
+  test('pairing-cap drop carries dropReason dm.pairing_cap (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      dmPolicy: 'pairing',
+      pending: {
+        ABC123: {
+          senderId: 'U_M',
+          chatId: 'D1',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + PAIRING_EXPIRY_MS,
+          replies: MAX_PAIRING_REPLIES,
+        },
+      },
+    })
+    const result = await gate(
+      { user: 'U_M', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('dm.pairing_cap')
+  })
+
+  test('pending-full drop carries dropReason dm.pending_full (ccsc-apj.2)', async () => {
+    const pending: Access['pending'] = {}
+    for (let i = 0; i < MAX_PENDING; i++) {
+      pending[`CODE${i}`] = {
+        senderId: `U_P${i}`,
+        chatId: 'D1',
+        createdAt: Date.now(),
+        expiresAt: Date.now() + PAIRING_EXPIRY_MS,
+        replies: 1,
+      }
+    }
+    const access = makeAccess({ dmPolicy: 'pairing', pending })
+    const result = await gate(
+      { user: 'U_OVF', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('dm.pending_full')
+  })
+
+  test('non-opted channel drop carries dropReason channel.not_opted (ccsc-apj.2)', async () => {
+    const result = await gate(
+      { user: 'U1', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.dropReason).toBe('channel.not_opted')
+  })
+
+  test('channel allowFrom miss drop carries dropReason channel.allowfrom_miss (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      channels: { C_R: { requireMention: false, allowFrom: ['U_VIP'] } },
+    })
+    const result = await gate(
+      { user: 'U_NO', channel: 'C_R', channel_type: 'channel' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('channel.allowfrom_miss')
+  })
+
+  test('requireMention no-mention drop carries dropReason channel.require_mention (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      channels: { C_M: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      { user: 'U1', channel: 'C_M', channel_type: 'channel', text: 'hi' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('channel.require_mention')
+  })
+
   // -- allowBotIds (cross-bot coordination) --
 
   test('drops bot message when channel has no allowBotIds (default-safe)', async () => {

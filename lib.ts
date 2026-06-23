@@ -109,14 +109,28 @@ export interface Access {
 
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
-/** Structured reason for a drop. Optional — only set by drop paths
- *  that benefit from operator-visible distinguishing. Self-echo and
- *  generic policy-miss drops omit it; rate-limit drops (ccsc-gyt)
- *  surface as `'rate.cross_bot_loop'` so an operator can grep the
- *  journal for runaway-loop incidents. */
+/** Structured reason for a drop. As of ccsc-apj.2 EVERY inbound gate
+ *  drop carries one, so an operator reading the journal can always tell
+ *  *why* Claude stayed silent (gate.inbound.drop records it — server.ts).
+ *  Grouped by the stage that produced the drop. */
 export type GateDropReason =
-  | 'rate.cross_bot_loop' // ccsc-gyt — peer-bot exceeded per-(channel, bot_id) sliding window
-  | 'admin.muted' // ccsc-gjm (future) — operator muted this peer bot in this channel
+  // -- bot-event stage (handleBotEvent) --
+  | 'self.echo' // dropped our own message (bot_id / app_id / botUserId match)
+  | 'bot.not_allowlisted' // peer bot not in the channel's allowBotIds
+  | 'admin.muted' // ccsc-gjm — operator muted this peer bot in this channel
+  | 'rate.cross_bot_loop' // ccsc-gyt — peer bot exceeded per-(channel, bot_id) sliding window
+  | 'bot.permission_relay' // peer-bot message looked like a permission-approval relay
+  // -- top-level stage (gate) --
+  | 'subtype.filtered' // non-message subtype (message_changed, message_deleted, …) — see ccsc-apj.3
+  | 'event.no_user' // event carried no user id
+  // -- DM stage (handleDmEvent) --
+  | 'dm.policy_closed' // dmPolicy is 'allowlist'/'disabled' and sender not allowlisted
+  | 'dm.pairing_cap' // sender hit MAX_PAIRING_REPLIES for their pending code
+  | 'dm.pending_full' // MAX_PENDING pairing codes outstanding
+  // -- channel stage (handleChannelEvent) --
+  | 'channel.not_opted' // channel not opted in (no ChannelPolicy)
+  | 'channel.allowfrom_miss' // sender not in the channel's allowFrom
+  | 'channel.require_mention' // requireMention channel, no mention, thread not engaged (ccsc-apj.1)
 
 export interface GateResult {
   action: GateAction
@@ -1669,7 +1683,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
     (opts.selfBotId && ev.bot_id === opts.selfBotId) ||
     (opts.selfAppId && botProfile.app_id === opts.selfAppId) ||
     (ev.user && ev.user === opts.botUserId)
-  if (isSelfEcho) return { action: 'drop' }
+  if (isSelfEcho) return { action: 'drop', dropReason: 'self.echo' }
 
   // Per-channel opt-in: only deliver if the channel explicitly lists this
   // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
@@ -1677,7 +1691,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   const policy = opts.access.channels[channel]
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'bot.not_allowlisted' }
   }
 
   // ccsc-gjm — operator-initiated mute. Check the mute store BEFORE
@@ -1720,7 +1734,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   // peer bots from approving tool calls, but this gate-level check prevents
   // regression if that guard is ever loosened.
   const text = ((ev.text as string) || '').trim()
-  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
+  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop', dropReason: 'bot.permission_relay' }
 
   // Fall through to normal access-control checks (subtype, allowFrom,
   // requireMention). The channel policy's allowFrom and requireMention
@@ -1740,7 +1754,7 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
     return { action: 'deliver', access }
   }
   if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'dm.policy_closed' }
   }
 
   // Pairing mode — check if there's already a pending code for this user
@@ -1751,13 +1765,13 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
         if (!staticMode) saveAccess(access)
         return { action: 'pair', code, isResend: true }
       }
-      return { action: 'drop' } // Hit reply cap
+      return { action: 'drop', dropReason: 'dm.pairing_cap' } // Hit reply cap
     }
   }
 
   // Cap total pending
   if (Object.keys(access.pending).length >= MAX_PENDING) {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'dm.pending_full' }
   }
 
   // Generate new pairing code
@@ -1781,10 +1795,10 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
   const { access, botUserId } = opts
   const channel = ev.channel as string
   const policy = access.channels[channel]
-  if (!policy) return { action: 'drop' }
+  if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
 
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
 
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
@@ -1803,7 +1817,7 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
         return { action: 'deliver', access }
       }
     }
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'channel.require_mention' }
   }
 
   return { action: 'deliver', access }
@@ -1819,10 +1833,12 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   }
 
   // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop' }
+  if (ev.subtype && ev.subtype !== 'file_share') {
+    return { action: 'drop', dropReason: 'subtype.filtered' }
+  }
 
   // 3. No user ID = drop
-  if (!ev.user) return { action: 'drop' }
+  if (!ev.user) return { action: 'drop', dropReason: 'event.no_user' }
 
   // 4. DM handling
   if (ev.channel_type === 'im') return handleDmEvent(ev, opts)
