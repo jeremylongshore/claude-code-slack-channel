@@ -363,6 +363,92 @@ describe('gate', () => {
     expect(result.action).toBe('deliver')
   })
 
+  // -- requireMention thread-stickiness (ccsc-apj.1) --
+  // "Mention once, then converse": a human who has engaged a thread by
+  // mentioning the bot can keep talking in that thread without re-mentioning.
+  // The engaged set is keyed by the SESSION thread (thread_ts ?? ts).
+
+  test('delivers un-mentioned human reply when the thread is already engaged (ccsc-apj.1)', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [] } },
+    })
+    const engagedThreads = new Set([deliveredThreadKey('C_MENTION', '1711.0001')])
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'and also do Y',
+        thread_ts: '1711.0001',
+        ts: '1711.0002',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('delivers un-mentioned human top-level follow-up keyed by session thread (ccsc-apj.1)', async () => {
+    // Opener was a top-level mention ts=T1 → engaged key uses thread_ts ?? ts = T1.
+    // The bot replied in thread T1; the human's follow-up arrives with thread_ts=T1.
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [] } },
+    })
+    const engagedThreads = new Set([deliveredThreadKey('C_MENTION', 'T1')])
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'thanks',
+        thread_ts: 'T1',
+        ts: 'T2',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('still drops un-mentioned human message when the thread is NOT yet engaged (ccsc-apj.1)', async () => {
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'hi',
+        thread_ts: 'T9',
+        ts: 'T9',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('does NOT make peer bots sticky — un-mentioned peer bot in an engaged thread is dropped (ccsc-apj.1)', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [], allowBotIds: ['U_PEER'] } },
+    })
+    const engagedThreads = new Set([deliveredThreadKey('C_MENTION', 'T1')])
+    const result = await gate(
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'still looping',
+        thread_ts: 'T1',
+        ts: 'T2',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
   test('drops channel messages when user not in channel allowFrom', async () => {
     const access = makeAccess({
       channels: { C_RESTRICTED: { requireMention: false, allowFrom: ['U_VIP'] } },

@@ -1635,6 +1635,21 @@ export interface GateOptions {
    *  tests can use a deterministic Date.now(). Defaults to wall
    *  clock. */
   now?: () => number
+  /** Session-thread keys — `deliveredThreadKey(channel, thread_ts ?? ts)` —
+   *  for threads that have already delivered an inbound message this
+   *  process, i.e. threads a HUMAN has "engaged" by mentioning the bot at
+   *  least once (ccsc-apj.1). On a `requireMention` channel, a human
+   *  message in an already-engaged thread is delivered WITHOUT a fresh
+   *  mention ("mention once, then converse"). Keyed by the SESSION thread
+   *  (`thread_ts ?? ts`), NOT the raw `thread_ts`, so a top-level mention
+   *  and its in-thread follow-ups resolve to the same slot — this is why it
+   *  is a distinct set from the outbound `deliveredThreads` (which is keyed
+   *  by raw `thread_ts` for the cross-thread leak guard). Peer bots
+   *  (`ev.bot_id`) are NEVER sticky — they must mention every message,
+   *  which keeps the loop/noise risk bounded (the peer-bot rate limiter is
+   *  the backstop). Absent (tests / no wiring) → no thread is engaged, so
+   *  `requireMention` behaves exactly as before. */
+  engagedThreads?: ReadonlySet<string>
 }
 
 /**
@@ -1773,6 +1788,21 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
   }
 
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
+    // ccsc-apj.1 — thread-sticky engagement. Once a HUMAN has engaged a
+    // thread by mentioning the bot, subsequent human messages in that same
+    // thread are delivered without a fresh mention ("mention once, then
+    // converse"). The engaged set is keyed by the SESSION thread
+    // (thread_ts ?? ts) so a top-level mention (ts=T1) and its in-thread
+    // follow-ups (thread_ts=T1) resolve to the same slot. Peer bots
+    // (ev.bot_id) are NEVER sticky — they must mention every message, so
+    // the loop/noise risk stays bounded (the peer-bot rate limiter is the
+    // backstop). A mention is still required to OPEN a thread.
+    if (!ev.bot_id && opts.engagedThreads !== undefined) {
+      const threadTs = (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined)
+      if (opts.engagedThreads.has(deliveredThreadKey(channel, threadTs))) {
+        return { action: 'deliver', access }
+      }
+    }
     return { action: 'drop' }
   }
 
