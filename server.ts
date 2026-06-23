@@ -556,6 +556,31 @@ function assertNoSecretValues(payload: string): void {
 // enforce thread-level isolation per session-state-machine.md §207.
 const deliveredThreads = new Set<string>()
 
+// ccsc-apj.1 — threads a HUMAN has "engaged" by mentioning the bot at
+// least once. Keyed by the SESSION thread `deliveredThreadKey(channel,
+// thread_ts ?? ts)` (NOT raw thread_ts like deliveredThreads above), so a
+// top-level mention (ts=T1) and its in-thread follow-ups (thread_ts=T1)
+// share one slot. gate() consults this to let a human keep talking in an
+// engaged thread without re-mentioning on a requireMention channel. Peer
+// bots are never added here as sticky — the inbound gate refuses to make
+// ev.bot_id messages sticky regardless. Session-lifetime cache.
+const engagedThreads = new Set<string>()
+// Bound the engaged-thread cache so it can't grow without limit over a long
+// process lifetime (CodeRabbit, PR #244). At capacity the oldest entry is
+// evicted; a human in an evicted thread simply re-mentions to re-engage.
+const MAX_ENGAGED_THREADS = 10_000
+
+/** Record a thread as engaged for mention-stickiness, bounding the cache.
+ *  Sets iterate in insertion order, so the first key is the oldest; evict it
+ *  when at capacity (only when adding a genuinely new key). */
+function recordEngagedThread(key: string): void {
+  if (engagedThreads.size >= MAX_ENGAGED_THREADS && !engagedThreads.has(key)) {
+    const oldest = engagedThreads.values().next().value
+    if (oldest !== undefined) engagedThreads.delete(oldest)
+  }
+  engagedThreads.add(key)
+}
+
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
 const seenEvents = new Map<string, number>()
@@ -673,6 +698,9 @@ async function gate(event: unknown): Promise<GateResult> {
     // bounded under sustained load.
     muteStore: adminMuteStore,
     peerBotRateLimitStore: peerBotRateLimitStore,
+    // ccsc-apj.1 — engaged-thread set so a human can keep talking in a
+    // thread they already mentioned the bot in, without re-mentioning.
+    engagedThreads,
   })
 }
 
@@ -2746,6 +2774,15 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   const channelId = ev.channel as string
   const incomingThreadTs = ev.thread_ts as string | undefined
   deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
+
+  // ccsc-apj.1 — mark this thread engaged for mention-stickiness, but ONLY
+  // for human deliveries. A human mentioning the bot opens the thread for
+  // mention-free human follow-ups; a peer bot must keep mentioning, so a
+  // bot-only thread never becomes sticky. Keyed by the session thread
+  // (thread_ts ?? ts) so a top-level mention and its in-thread replies match.
+  if (!ev.bot_id) {
+    recordEngagedThread(libDeliveredThreadKey(channelId, incomingThreadTs ?? (ev.ts as string)))
+  }
 
   journalWrite({
     kind: 'gate.inbound.deliver',

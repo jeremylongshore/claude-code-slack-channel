@@ -234,6 +234,17 @@ The three security-critical gates already live in `lib.ts`:
 - **File-exfil guard** (`assertSendable()`): blocks sending files from the state
   directory (`.env`, `access.json`, etc.).
 
+> **Edited messages do not engage (intentional — `ccsc-apj.3`).** `gate()` drops
+> every non-`message` subtype, including `message_changed`, *before* the inbound
+> checks. So editing a `<@bot>` mention into an already-posted message never
+> engages Claude on a `requireMention` channel, and editing new instructions
+> into a previously-delivered message never re-delivers it. This is deliberate:
+> Slack's `message_changed` payload does not carry the new text without an extra
+> fetch, and honoring edits would let an attacker mutate a benign delivered
+> message into an injection after the fact (a T1 surface — see THREAT-MODEL.md).
+> The cost — a typo fixed by editing won't reach Claude; the sender reposts to
+> engage — is accepted.
+
 Every new component above must call into — or be called by — an existing gate.
 New components never widen the trust boundary; they layer inside it.
 
