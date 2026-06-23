@@ -199,6 +199,14 @@ missed primitive is a bypass.
      not suspenders).
   5. **Policy evaluator** (Epic 29-A) denies tool calls that touch specified
      path prefixes without an approval turn.
+  6. **Edited-message drop** (`ccsc-apj.3`): `gate()` drops the
+     `message_changed` subtype before any inbound check, so an attacker cannot
+     edit an injection into a message that was already delivered, nor edit a
+     `<@bot>` into a quiet message to engage a `requireMention` channel after
+     the fact. Slack's `message_changed` payload omits the new text without an
+     extra fetch, and honoring edits would reopen the delivered-message surface
+     — so edits are ignored by design. Trade-off: a genuine fix-by-edit will not
+     reach Claude; the sender reposts to engage.
 
 - **Residual risk**: an attacker already on `allowFrom` can still prompt-inject
   Claude into non-filesystem actions (e.g., arbitrary search queries,
