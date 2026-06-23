@@ -565,6 +565,21 @@ const deliveredThreads = new Set<string>()
 // bots are never added here as sticky — the inbound gate refuses to make
 // ev.bot_id messages sticky regardless. Session-lifetime cache.
 const engagedThreads = new Set<string>()
+// Bound the engaged-thread cache so it can't grow without limit over a long
+// process lifetime (CodeRabbit, PR #244). At capacity the oldest entry is
+// evicted; a human in an evicted thread simply re-mentions to re-engage.
+const MAX_ENGAGED_THREADS = 10_000
+
+/** Record a thread as engaged for mention-stickiness, bounding the cache.
+ *  Sets iterate in insertion order, so the first key is the oldest; evict it
+ *  when at capacity (only when adding a genuinely new key). */
+function recordEngagedThread(key: string): void {
+  if (engagedThreads.size >= MAX_ENGAGED_THREADS && !engagedThreads.has(key)) {
+    const oldest = engagedThreads.values().next().value
+    if (oldest !== undefined) engagedThreads.delete(oldest)
+  }
+  engagedThreads.add(key)
+}
 
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
@@ -2766,7 +2781,7 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // bot-only thread never becomes sticky. Keyed by the session thread
   // (thread_ts ?? ts) so a top-level mention and its in-thread replies match.
   if (!ev.bot_id) {
-    engagedThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs ?? (ev.ts as string)))
+    recordEngagedThread(libDeliveredThreadKey(channelId, incomingThreadTs ?? (ev.ts as string)))
   }
 
   journalWrite({

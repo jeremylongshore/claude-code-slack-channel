@@ -1878,13 +1878,22 @@ function richTextMentionsBot(blocks: unknown, botUserId: string): boolean {
 
 function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
   if (!botUserId) return false
-  // Structured path: when Slack supplies `blocks`, trust them — a mention is
-  // only "real" outside code/quote containers, and we do NOT fall back to the
-  // substring check (which would re-match a `<@bot>` quoted inside a code block).
-  if (Array.isArray(event.blocks)) {
-    return richTextMentionsBot(event.blocks, botUserId)
+  // The structured path is authoritative ONLY when the message actually carries
+  // a `rich_text` block — that is where Slack encodes code/quote containers, so
+  // we can distinguish an addressed mention from a quoted one and must NOT fall
+  // back to substring (which would re-match a `<@bot>` inside a code block).
+  // Messages with only LAYOUT blocks (Block Kit `section`/`context`, common for
+  // bots/integrations posting via the API) carry no rich_text, so they fall
+  // through to the substring check — otherwise a real peer-bot mention would be
+  // missed and multi-agent coordination (`allowBotIds`) would break.
+  const blocks = event.blocks
+  if (
+    Array.isArray(blocks) &&
+    blocks.some((b) => (b as Record<string, unknown> | null)?.type === 'rich_text')
+  ) {
+    return richTextMentionsBot(blocks, botUserId)
   }
-  // Fallback: no blocks → legacy raw-text substring check.
+  // Fallback: no blocks, or layout-only blocks → legacy raw-text substring check.
   const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
 }

@@ -583,6 +583,23 @@ describe('gate', () => {
     expect(result.action).toBe('deliver')
   })
 
+  test('falls back to substring when blocks are layout-only with no rich_text (ccsc-apj.4)', async () => {
+    // Block Kit section/context blocks (typical of bots/integrations) carry no
+    // rich_text, so the structured path must not swallow a real mention.
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: 'hey <@U_BOT>',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'hey <@U_BOT>' } }],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
   // -- dropReason on every drop branch (ccsc-apj.2) --
   // Each inbound drop now carries a structured reason so the journal
   // (gate.inbound.drop, server.ts) explains why Claude stayed silent.
