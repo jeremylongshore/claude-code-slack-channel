@@ -1195,12 +1195,24 @@ async function resolveStreamObligation(
   result: StreamReplyResult,
 ): Promise<void> {
   if (durable === null) return
-  if (result.kind === 'completed') {
-    await durable.markDelivered()
-  } else if (result.kind === 'failed_mid_stream') {
-    await durable.markDead(`failed mid-stream: ${result.reason}`)
-  } else {
-    await durable.markDead(`stream rejected at start: ${result.reason}`)
+  switch (result.kind) {
+    case 'completed':
+      await durable.markDelivered()
+      return
+    case 'failed_mid_stream':
+      await durable.markDead(`failed mid-stream: ${result.reason}`)
+      return
+    case 'gate_rejected_at_start':
+      await durable.markDead(`stream rejected at start: ${result.reason}`)
+      return
+    default: {
+      // Exhaustiveness guard: a new StreamReplyResult variant must declare its
+      // obligation resolution here, failing to compile rather than silently
+      // dead-lettering with a misleading reason (matches the
+      // permissionRouteJournalEvents never-guard, ccsc-175).
+      const _exhaustive: never = result
+      return _exhaustive
+    }
   }
 }
 
