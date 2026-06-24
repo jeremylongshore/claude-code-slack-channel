@@ -70,6 +70,8 @@ Map of channel IDs to policies. Only channels listed here are monitored.
 - `allowFrom`: If non-empty, only these user IDs are delivered from this channel
 - `allowBotIds`: Opt-in list of bot user IDs allowed to deliver messages in this channel. Absent or empty (default) = all bot messages dropped. See "Multi-agent coordination" below.
 - `audit`: Audit-log projection mode for this channel. See "Audit projection (`audit`)" below. Absent or `'off'` (default) = no projection. Values: `'off'` | `'compact'` | `'full'`.
+- `perUserSessions`: If true, each distinct sender gets their **own** session within a shared thread — separate state file, supervisor handle, and `ownerId` — so two humans talking in one thread don't share bridge-session state (`ccsc-kl410`). Absent or false (default) = one shared session per (channel, thread). Isolates the bridge's per-thread book-keeping, not Claude's own conversation memory.
+- `channelCircuitBreaker`: Channel-wide peer-bot circuit breaker (`ccsc-0k7x2`) — trips when total bot velocity across **all** allowlisted bots is runaway-high, catching A→B→C→A rings the per-bot limit misses. Absent = default (40 msgs / 60s). `{ "count": 0, "windowMs": 0 }` disables.
 
 ### Interaction modes
 

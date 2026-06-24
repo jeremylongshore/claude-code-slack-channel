@@ -88,6 +88,12 @@ export interface ChannelPolicy {
    *  DEFAULT_CHANNEL_CIRCUIT_BREAKER (40 msgs in 60s). Set
    *  `{ count: 0, windowMs: 0 }` to DISABLE; default-on is intentional. */
   channelCircuitBreaker?: { count: number; windowMs: number }
+  /** Per-user session isolation (ccsc-kl410). When true, each distinct sender
+   *  in this channel gets their own session within a shared thread — separate
+   *  state file + supervisor handle + ownerId — so two humans in one thread do
+   *  not share context/ownership. Absent or false → one shared session per
+   *  (channel, thread) (the default; behavior unchanged). */
+  perUserSessions?: boolean
 }
 
 export interface PendingEntry {
@@ -171,6 +177,13 @@ export interface SessionKey {
   /** Slack thread_ts, e.g. `1711000000.000100`. For top-level messages the
    *  supervisor uses the message `ts` as the thread value. */
   thread: string
+  /** Optional Slack user_id for per-user session isolation (ccsc-kl410). When a
+   *  channel sets `perUserSessions`, each distinct sender gets their own
+   *  session WITHIN a shared thread — a distinct supervisor `keyId` and a
+   *  distinct on-disk file (`sessions/<channel>/<userId>/<thread>.json`) — so
+   *  two humans talking in one thread don't share session state / ownerId.
+   *  Absent → the legacy shared per-(channel, thread) session. */
+  userId?: string
 }
 
 /** Schema version for a persisted Session file. Bumped on incompatible
@@ -544,30 +557,39 @@ export function sessionPath(root: string, key: SessionKey): string {
   if (!isValidSessionComponent(key.thread)) {
     throw new Error(`sessionPath: invalid thread component: ${JSON.stringify(key.thread)}`)
   }
+  // ccsc-kl410 — per-user isolation adds a `userId` directory level. Validate
+  // it with the SAME component rule (no `.`/`..`, restricted charset) so it
+  // can never inject path traversal — the on-disk leaf becomes
+  // `sessions/<channel>/<userId>/<thread>.json`.
+  if (key.userId !== undefined && !isValidSessionComponent(key.userId)) {
+    throw new Error(`sessionPath: invalid userId component: ${JSON.stringify(key.userId)}`)
+  }
 
   // Canonicalize the state root. Throws ENOENT if the caller did not
   // pre-create it — matches server.ts bootstrap which mkdirs STATE_DIR
   // before any session activity.
   const resolvedRoot = realpathSync.native(resolve(root))
 
-  // Rule 3: create sessions/<channel>/ at 0o700. mkdirSync(recursive)
-  // is idempotent; the mode applies only to newly created dirs, which
-  // is the doc's "on first use" semantic.
+  // Rule 3: create the session leaf dir at 0o700 — `sessions/<channel>/`
+  // (shared) or `sessions/<channel>/<userId>/` (per-user). mkdirSync(recursive)
+  // is idempotent; the mode applies only to newly created dirs, which is the
+  // doc's "on first use" semantic.
   const channelDir = join(resolvedRoot, 'sessions', key.channel)
-  mkdirSync(channelDir, { recursive: true, mode: 0o700 })
+  const leafDir = key.userId !== undefined ? join(channelDir, key.userId) : channelDir
+  mkdirSync(leafDir, { recursive: true, mode: 0o700 })
 
-  // Rule 2: realpath the (now-extant) per-channel dir and assert the
-  // state root is still a prefix. Catches symlink-based escape.
-  const resolvedChannelDir = realpathSync.native(channelDir)
-  if (!isUnderRoot(resolvedChannelDir, resolvedRoot)) {
+  // Rule 2: realpath the (now-extant) leaf dir and assert the state root is
+  // still a prefix. Catches symlink-based escape via channel OR userId.
+  const resolvedLeafDir = realpathSync.native(leafDir)
+  if (!isUnderRoot(resolvedLeafDir, resolvedRoot)) {
     throw new Error(
-      `sessionPath: resolved channel dir escapes state root (channel=${JSON.stringify(
+      `sessionPath: resolved session dir escapes state root (channel=${JSON.stringify(
         key.channel,
-      )})`,
+      )}, userId=${JSON.stringify(key.userId)})`,
     )
   }
 
-  return join(resolvedChannelDir, `${key.thread}.json`)
+  return join(resolvedLeafDir, `${key.thread}.json`)
 }
 
 /** Atomic writer for session files.

@@ -22,8 +22,18 @@ interface SessionKey {
   channel: string     // Slack channel ID, e.g. "C0123456789" or "D0123456789" (DM)
   thread:  string     // thread_ts string, e.g. "1711000000.000100"
                       // For top-level (non-threaded) messages, thread === ts of the root message
+  userId?: string     // (ccsc-kl410) opt-in per-user isolation. When a channel sets
+                      // perUserSessions, the sender's Slack user_id is added so two
+                      // humans in one thread get separate sessions. Absent = the
+                      // legacy shared per-(channel, thread) session (the default).
 }
 ```
+
+When `userId` is present the on-disk file nests one level deeper —
+`sessions/<channel>/<userId>/<thread>.json` — and the supervisor's `keyId`
+appends the userId segment, so a per-user session can never collide with the
+shared key. The `userId` component passes the same `isValidSessionComponent`
+guard as `channel`/`thread` (no path traversal).
 
 Rationale for `thread` as part of the key:
 
@@ -307,9 +317,13 @@ Existing conversation history is preserved. No re-pairing required.
 - **Not a conversation memory system.** Sessions hold message history and
   per-thread book-keeping the MCP server needs to do its job. Long-term
   memory is Claude's responsibility, not the plugin's.
-- **Not multi-user.** `allowFrom` lists may grow, but there is still one
-  session per (channel, thread), regardless of how many humans post into
-  it.
+- **Not multi-user by default.** `allowFrom` lists may grow, but the default is
+  still one session per (channel, thread), regardless of how many humans post
+  into it. A channel may **opt in** to per-user isolation (`perUserSessions`,
+  ccsc-kl410): each sender then gets their own session (own state file,
+  supervisor handle, and `ownerId`) within the shared thread. This is bridge-
+  session isolation — separate per-thread book-keeping per user — not a change
+  to Claude's own conversation memory.
 
 ---
 

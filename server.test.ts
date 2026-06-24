@@ -2418,6 +2418,39 @@ describe('sessionPath', () => {
     expect(() => sessionPath(tmpRoot, key('', 'T1.0'))).toThrow(/invalid channel component/)
   })
 
+  // ── ccsc-kl410: per-user session isolation ─────────────────────────────
+
+  test('per-user key nests the file under a userId dir within the channel', () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U_ALICE' })
+    expect(p).toBe(join(tmpRoot, 'sessions', 'C_CHAN', 'U_ALICE', 'T1.0.json'))
+  })
+
+  test('two users in the same thread get distinct session files', () => {
+    const pA = sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U_ALICE' })
+    const pB = sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U_BOB' })
+    const shared = sessionPath(tmpRoot, key('C_CHAN', 'T1.0'))
+    expect(pA).not.toBe(pB)
+    expect(pA).not.toBe(shared)
+    expect(pB).not.toBe(shared)
+  })
+
+  test('undefined userId is the legacy shared path (unchanged)', () => {
+    const p = sessionPath(tmpRoot, key('C_CHAN', 'T1.0'))
+    expect(p).toBe(join(tmpRoot, 'sessions', 'C_CHAN', 'T1.0.json'))
+  })
+
+  test('rejects userId component that is exactly .. (path-injection guard)', () => {
+    expect(() => sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: '..' })).toThrow(
+      /invalid userId component/,
+    )
+  })
+
+  test('rejects userId component with /', () => {
+    expect(() =>
+      sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U/X' }),
+    ).toThrow(/invalid userId component/)
+  })
+
   test('rejects thread component that is exactly ..', () => {
     expect(() => sessionPath(tmpRoot, key('C_CHAN', '..'))).toThrow(/invalid thread component/)
   })
@@ -5714,6 +5747,55 @@ describe('cross-(channel,thread) session isolation (ccsc-1iw.1)', () => {
     await a.update((s) => ({ ...s, data: { ...s.data, mark: 'only-a' } }))
     // b is a different session — A's write is invisible to it.
     expect(b.session.data.mark).toBeUndefined()
+  })
+
+  test('per-user keys isolate two users in the same channel+thread (ccsc-kl410)', async () => {
+    // With perUserSessions, Alice and Bob share a Slack thread but get separate
+    // sessions — distinct keyId, distinct on-disk file, own ownerId.
+    const sup = makeSupervisor()
+    const alice = await sup.activate(
+      { channel: 'C_OPS', thread: 'T1', userId: 'U_ALICE' },
+      'U_ALICE',
+    )
+    const bob = await sup.activate({ channel: 'C_OPS', thread: 'T1', userId: 'U_BOB' }, 'U_BOB')
+
+    expect(alice).not.toBe(bob)
+    await alice.update((s) => ({ ...s, data: { ...s.data, secret: 'alice-only' } }))
+    await bob.update((s) => ({ ...s, data: { ...s.data, secret: 'bob-only' } }))
+
+    // No bleed in the live handles…
+    expect(alice.session.data.secret).toBe('alice-only')
+    expect(bob.session.data.secret).toBe('bob-only')
+    expect(alice.session.ownerId).toBe('U_ALICE')
+    expect(bob.session.ownerId).toBe('U_BOB')
+
+    // …nor on disk: each per-user file holds only its own secret.
+    const onDiskAlice = JSON.parse(
+      readFileSync(
+        sessionPath(tmpRoot, { channel: 'C_OPS', thread: 'T1', userId: 'U_ALICE' }),
+        'utf8',
+      ),
+    ) as Session
+    const onDiskBob = JSON.parse(
+      readFileSync(
+        sessionPath(tmpRoot, { channel: 'C_OPS', thread: 'T1', userId: 'U_BOB' }),
+        'utf8',
+      ),
+    ) as Session
+    expect(onDiskAlice.data.secret).toBe('alice-only')
+    expect(onDiskBob.data.secret).toBe('bob-only')
+  })
+
+  test('a per-user session does not collide with the shared (no-userId) session in one thread (ccsc-kl410)', async () => {
+    const sup = makeSupervisor()
+    const shared = await sup.activate({ channel: 'C_OPS', thread: 'T1' }, 'U_SHARED')
+    const peruser = await sup.activate(
+      { channel: 'C_OPS', thread: 'T1', userId: 'U_ALICE' },
+      'U_ALICE',
+    )
+    expect(shared).not.toBe(peruser)
+    await shared.update((s) => ({ ...s, data: { ...s.data, mark: 'shared' } }))
+    expect(peruser.session.data.mark).toBeUndefined()
   })
 
   test('an inbound thread value that embeds traversal toward another session is rejected before any read', async () => {

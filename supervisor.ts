@@ -654,10 +654,12 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
   const activating = new Map<string, Promise<SessionHandle>>()
 
   function keyId(k: SessionKey): string {
-    // `\0` is not a legal character in a Slack channel/ts string, so it
-    // is safe as a separator. Avoids the `"C1:T1" vs "C:1T1"` collision
-    // you would get with a single-colon join.
-    return `${k.channel}\0${k.thread}`
+    // `\0` is not a legal character in a Slack channel/ts/user string, so it
+    // is safe as a separator. Avoids the `"C1:T1" vs "C:1T1"` collision you
+    // would get with a single-colon join. The trailing userId segment (empty
+    // when absent) keeps a per-user key (ccsc-kl410) from ever colliding with
+    // the shared (channel, thread) key.
+    return `${k.channel}\0${k.thread}\0${k.userId ?? ''}`
   }
 
   async function doActivate(
