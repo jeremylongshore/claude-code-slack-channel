@@ -581,6 +581,31 @@ function recordEngagedThread(key: string): void {
   engagedThreads.add(key)
 }
 
+/** Build the SessionKey for an inbound event. When the channel opts into
+ *  per-user session isolation (ccsc-kl410), the sender's userId is added so two
+ *  humans in one thread get separate sessions; otherwise the legacy shared
+ *  (channel, thread) key. Default-safe: no flag → shared, behavior unchanged. */
+function inboundSessionKey(
+  channelId: string,
+  threadKey: string,
+  access: Access,
+  ev: Record<string, unknown>,
+): import('./lib.ts').SessionKey {
+  // Sender identity: the human user_id, or the bot's id for a peer bot. Validate
+  // it is a NON-EMPTY string before keying (ev fields are `unknown`); an
+  // empty/absent sender falls back to the shared session rather than building an
+  // invalid empty-userId key (Gemini, PR #248).
+  const senderId = (ev.user ?? ev.bot_id) as unknown
+  if (
+    access.channels[channelId]?.perUserSessions === true &&
+    typeof senderId === 'string' &&
+    senderId !== ''
+  ) {
+    return { channel: channelId, thread: threadKey, userId: senderId }
+  }
+  return { channel: channelId, thread: threadKey }
+}
+
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
 const seenEvents = new Map<string, number>()
@@ -2784,11 +2809,17 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     recordEngagedThread(libDeliveredThreadKey(channelId, incomingThreadTs ?? (ev.ts as string)))
   }
 
+  // ccsc-kl410 — per-user session isolation (helper keeps deliverEvent under the
+  // CRAP gate). Built once and used for both the journal record (so the chosen
+  // key shape is auditable) and the supervisor activation below.
+  const threadKey = incomingThreadTs ?? (ev.ts as string)
+  const sessionKey = inboundSessionKey(channelId, threadKey, access, ev)
+
   journalWrite({
     kind: 'gate.inbound.deliver',
     outcome: 'allow',
     actor: ev.bot_id ? 'peer_agent' : 'session_owner',
-    sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
+    sessionKey,
     input: {
       channel: channelId,
       user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
@@ -2806,11 +2837,7 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // and DROP — do not propagate so the event loop stays alive for
   // other sessions. Same policy for handle.update() failures.
   if (supervisor !== null) {
-    await activateAndTouch(
-      supervisor,
-      { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
-      ev.user as string | undefined,
-    )
+    await activateAndTouch(supervisor, sessionKey, ev.user as string | undefined)
   }
 
   // Track last active channel for permission relay
