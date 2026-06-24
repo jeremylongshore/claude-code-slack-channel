@@ -1,6 +1,11 @@
 {
   "strictness": 3,
   "commentTypes": ["logic", "syntax"],
+  "triggerOnUpdates": true,
+  "fixWithAI": true,
+  "ignorePatterns": "bun.lock\nnode_modules/\n.audit-harness/\n*.min.js",
+  "confidenceScoreSection": { "included": true },
+  "sequenceDiagramSection": { "included": true },
   "rules": [
     {
       "id": "frozen-design-docs",
