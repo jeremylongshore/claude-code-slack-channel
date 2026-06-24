@@ -79,7 +79,11 @@ import {
 } from './manifest.ts'
 import { createMuteStore } from './mute-store.ts'
 import { createMemoryNonceStore, mintNonce, verifyNonce } from './nonce-hitl.ts'
-import { createPeerBotRateLimitStore } from './peer-bot-rate-limit.ts'
+import {
+  createPeerBotRateLimitStore,
+  DEFAULT_CHANNEL_CIRCUIT_BREAKER,
+  DEFAULT_PEER_BOT_RATE_LIMIT,
+} from './peer-bot-rate-limit.ts'
 import {
   type ApprovalKey,
   approvalKey,
@@ -3201,6 +3205,14 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
       }
     },
     muteStore: adminMuteStore,
+    // ccsc-yl6k9 — effective rate-limit view for the read-only !rate-limit verb.
+    getChannelRateLimits: (chId: string) => {
+      const chPolicy = getAccess().channels[chId]
+      return {
+        peerBot: chPolicy?.peerBotRateLimit ?? DEFAULT_PEER_BOT_RATE_LIMIT,
+        channel: chPolicy?.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER,
+      }
+    },
   }
 
   try {
@@ -3209,6 +3221,19 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
       // No emoji reaction at challenge phase — the DM IS the visible
       // feedback that something happened. Reaction lands when the
       // operator redeems.
+    } else if (outcome.kind === 'status') {
+      // ccsc-yl6k9 — post the read-only status message back into the thread.
+      try {
+        await web.chat.postMessage({
+          channel: channelId,
+          thread_ts: threadTs,
+          text: outcome.message,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+      } catch (err) {
+        console.error('[slack] admin status post failed:', err)
+      }
     }
     return true
   } catch (err) {
@@ -3494,7 +3519,18 @@ async function main(): Promise<void> {
   reaperTimer = setInterval(() => {
     void supervisor!.reapIdle()
     const now = Date.now()
-    adminMuteStore.prune(now)
+    for (const expired of adminMuteStore.prune(now)) {
+      // ccsc-yl6k9 — notify the channel when a mute auto-expires so a bot
+      // un-muting is never a silent surprise. Best-effort; never blocks the reaper.
+      void web.chat
+        .postMessage({
+          channel: expired.channelId,
+          text: `:loud_sound: <@${expired.botId}> un-muted (mute expired).`,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+        .catch((err) => console.error('[slack] mute-expiry notice failed:', err))
+    }
     // The reaper's job is "drop entries that NO conceivable window
     // would still consider live" — NOT to match the default window.
     // Per Gemini high-priority fix on PR #187: a hardcoded 60s

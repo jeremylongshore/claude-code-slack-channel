@@ -14905,6 +14905,128 @@ describe('ccsc-3w0 — parseAdminCommand', () => {
     const { parseAdminCommand } = await import('./admin.ts')
     expect(parseAdminCommand('<@U_BOT> !clear', envelope)).toBeNull()
   })
+
+  test('parses !mute-status into AdminMuteStatusCommand (ccsc-yl6k9)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute-status', envelope)).toEqual({
+      kind: 'mute-status',
+      ...envelope,
+    })
+  })
+
+  test('parses !rate-limit into AdminRateLimitCommand (ccsc-yl6k9)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!rate-limit', envelope)).toEqual({ kind: 'rate-limit', ...envelope })
+  })
+
+  test('rejects !mute-status / !rate-limit with an argument (ccsc-yl6k9)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute-status foo', envelope)).toBeNull()
+    expect(parseAdminCommand('!rate-limit 5', envelope)).toBeNull()
+  })
+})
+
+describe('ccsc-yl6k9 — read-only admin verbs (mute-status / rate-limit)', () => {
+  const envelope = {
+    channelId: 'C_OPS',
+    requestedBy: 'U_ALICE',
+    threadTs: '1700000000.000100',
+    messageTs: '1700000000.000100',
+  }
+
+  function baseDeps(
+    overrides: Partial<import('./admin.ts').DispatchDeps> = {},
+  ): import('./admin.ts').DispatchDeps {
+    return {
+      isAllowed: () => true,
+      journalWrite: async () => undefined,
+      quiesceAndDeactivate: async () => {},
+      sendTmuxKeys: async () => {},
+      issueChallenge: async () => ({ nonce: 'x', expiresAt: 0 }),
+      verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+      postReaction: async () => {},
+      ...overrides,
+    }
+  }
+
+  test('!mute-status returns a status outcome listing active mutes', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_NOISY', 1_000_000 + 60_000, 'U_ALICE', 1_000_000)
+    const result = await dispatchAdminCommand(
+      { kind: 'mute-status', ...envelope },
+      baseDeps({ muteStore: store, now: () => 1_000_000 }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') {
+      expect(result.verb).toBe('mute-status')
+      expect(result.message).toContain('B_NOISY')
+    }
+  })
+
+  test('!mute-status reports no active mutes when the store is empty', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'mute-status', ...envelope },
+      baseDeps({ muteStore: createMuteStore(), now: () => 1_000_000 }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toMatch(/No active/i)
+  })
+
+  test('!rate-limit reports the effective per-bot + channel-breaker thresholds', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'rate-limit', ...envelope },
+      baseDeps({
+        getChannelRateLimits: () => ({
+          peerBot: { count: 10, windowMs: 60_000 },
+          channel: { count: 40, windowMs: 60_000 },
+        }),
+      }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') {
+      expect(result.message).toContain('10 msgs / 60s')
+      expect(result.message).toContain('40 msgs / 60s')
+    }
+  })
+
+  test('!rate-limit shows "disabled" when a limit is { count: 0 }', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'rate-limit', ...envelope },
+      baseDeps({
+        getChannelRateLimits: () => ({
+          peerBot: { count: 0, windowMs: 0 },
+          channel: { count: 40, windowMs: 60_000 },
+        }),
+      }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toContain('disabled')
+  })
+
+  test('read-only verbs are allowlist-gated — non-allowlisted user denied, not journaled', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const journal: unknown[] = []
+    const result = await dispatchAdminCommand(
+      { kind: 'mute-status', ...envelope },
+      baseDeps({
+        isAllowed: () => false,
+        journalWrite: async (i) => {
+          journal.push(i)
+          return undefined
+        },
+        muteStore: createMuteStore(),
+      }),
+    )
+    expect(result.kind).toBe('denied')
+    expect(journal.length).toBe(0) // reads are not journaled
+  })
 })
 
 describe('ccsc-3w0 — stripBotMention (Gemini #1 from original PR #157)', () => {
@@ -16334,7 +16456,9 @@ describe('ccsc-gjm — MuteStore', () => {
     store.mute('C1', 'B1', 1_000_100, 'U', 1_000_000)
     store.mute('C2', 'B2', 1_000_200, 'U', 1_000_000)
     store.mute('C3', 'B3', 9_999_999_999, 'U', 1_000_000)
-    expect(store.prune(1_500_000)).toBe(2)
+    // prune now returns the removed entries (ccsc-yl6k9) so the reaper can
+    // notify on auto-expiry; two of the three are past their TTL.
+    expect(store.prune(1_500_000).length).toBe(2)
     expect(store.size()).toBe(1)
   })
 
