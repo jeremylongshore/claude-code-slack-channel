@@ -1153,8 +1153,15 @@ async function executeReplyFileUploads(
 /** ccsc-o7x.6 — record a stream-finalize obligation (full text) if the session
  *  can go durable, else `null` (best-effort — stream without a net, the prior
  *  behavior). Module-level so `executeReplyStreamingPath` stays under CRAP-30.
- *  A `DurableUnavailableError` is swallowed (degrade to best-effort); any other
- *  error propagates. */
+ *
+ *  The obligation here is a crash safety-net that is SEPARATE from the send (the
+ *  send is the stream itself), unlike the text/chunked durable paths where the
+ *  obligation IS the send. So ANY failure to set it up — `DurableUnavailableError`
+ *  (no session/lease) OR a `recordTerminalDelivery` write failure (disk, fence) —
+ *  degrades to best-effort streaming rather than failing the reply. This keeps
+ *  o7x.6 durability strictly additive: it can never make streaming worse than the
+ *  pre-o7x.6 behavior. A non-`DurableUnavailableError` failure is logged to
+ *  stderr (it signals a real storage problem) but never propagated. */
 async function maybeBeginDurableStream(
   chatId: string,
   threadTs: string | undefined,
@@ -1167,7 +1174,11 @@ async function maybeBeginDurableStream(
       { id: randomUUID(), channel: chatId, thread: threadTs, text },
     )
   } catch (err) {
-    if (!(err instanceof DurableUnavailableError)) throw err
+    if (!(err instanceof DurableUnavailableError)) {
+      console.error('[slack] beginDurableStream failed; streaming best-effort', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
     return null
   }
 }
