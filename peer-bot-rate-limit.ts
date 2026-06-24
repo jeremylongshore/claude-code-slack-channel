@@ -101,6 +101,10 @@ export interface PeerBotRateLimitStore {
    *  channel alone, so it counts every allowlisted bot's traffic together —
    *  catching N-cycle (A→B→C→A) rings that stay under the per-bot cap. */
   checkChannel(channelId: string, now: number, config: RateLimitConfig): boolean
+  /** List the bot IDs that posted in `channelId` within `windowMs` of `now`
+   *  (ccsc-4e9bf) — a lightweight "agents online" view derived from the
+   *  per-(channel, bot) activity already tracked. Read-only, no mutation. */
+  activeBots(channelId: string, now: number, windowMs: number): string[]
   /** Sweep entries with all-expired timestamps. Called periodically
    *  by the reaper (similar to nonce-store pruneExpired). */
   prune(now: number, maxWindowMs: number): number
@@ -192,6 +196,16 @@ export function createPeerBotRateLimitStore(): PeerBotRateLimitStore {
     },
     checkChannel(channelId, now, config) {
       return slidingWindowAllow(channelBuckets, channelId, now, config)
+    },
+    activeBots(channelId, now, windowMs) {
+      const prefix = `${channelId}\0`
+      const cutoff = now - windowMs
+      const result: string[] = []
+      for (const [key, arr] of buckets) {
+        if (!key.startsWith(prefix)) continue
+        if (arr.some((ts) => ts > cutoff)) result.push(key.slice(prefix.length))
+      }
+      return result
     },
     prune(now, maxWindowMs) {
       return pruneBuckets(buckets, now, maxWindowMs) + pruneBuckets(channelBuckets, now, maxWindowMs)

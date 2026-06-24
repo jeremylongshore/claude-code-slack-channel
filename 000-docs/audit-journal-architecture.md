@@ -50,6 +50,7 @@ type EventKind =
   | 'session.quiesce'
   | 'session.deactivate'
   | 'session.quarantine'
+  | 'session.activate_rejected'  // ccsc-4e9bf — refused a new session at the maxConcurrentSessions cap
   | 'pairing.issued'
   | 'pairing.accepted'
   | 'pairing.expired'

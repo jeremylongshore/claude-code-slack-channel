@@ -8231,10 +8231,12 @@ describe('JournalEvent', () => {
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
     // 5 admin.* kinds (ccsc-3w0) + system.stream_finalize (ccsc-ele) +
     // 4 admin.mute/unmute kinds (ccsc-gjm) + 2 session.recovery.* kinds
-    // (ccsc-o7x.1.2: session.recovery.requeued, session.recovery.orphaned).
+    // (ccsc-o7x.1.2: session.recovery.requeued, session.recovery.orphaned) +
+    // session.activate_rejected (ccsc-4e9bf backpressure).
     // If this number drifts, update the doc count in journal.ts's header
     // comment too.
-    expect(kinds).toHaveLength(36)
+    expect(kinds).toHaveLength(37)
+    expect(kinds).toContain('session.activate_rejected')
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -16077,6 +16079,163 @@ describe('ccsc-0k7x2 — channel-wide circuit breaker', () => {
       )
       expect(r.dropReason).not.toBe('rate.channel_cycle')
     }
+  })
+})
+
+describe('ccsc-4e9bf — backpressure + agents-online', () => {
+  test('resolveMaxConcurrentSessions parses a positive integer', async () => {
+    const { resolveMaxConcurrentSessions } = await import('./supervisor.ts')
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '50' })).toBe(50)
+  })
+
+  test('resolveMaxConcurrentSessions → undefined for unset/empty/non-numeric/non-positive', async () => {
+    const { resolveMaxConcurrentSessions } = await import('./supervisor.ts')
+    expect(resolveMaxConcurrentSessions({})).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '' })).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: 'abc' })).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '0' })).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '-5' })).toBeUndefined()
+  })
+
+  test('resolveMaxConcurrentSessions floors a float', async () => {
+    const { resolveMaxConcurrentSessions } = await import('./supervisor.ts')
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '3.9' })).toBe(3)
+  })
+
+  describe('supervisor cap', () => {
+    let rawRoot: string
+    let tmpRoot: string
+    const journalEvents: Array<{ kind: string; reason?: string }> = []
+    beforeEach(() => {
+      rawRoot = mkdtempSync(join(tmpdir(), 'bp-'))
+      tmpRoot = realpathSync.native(rawRoot)
+      journalEvents.length = 0
+    })
+    afterEach(() => rmSync(rawRoot, { recursive: true, force: true }))
+    function makeSup(maxConcurrentSessions?: number) {
+      return createSessionSupervisor({
+        stateRoot: tmpRoot,
+        log: () => {},
+        clock: () => 1_700_000_000_000,
+        maxConcurrentSessions,
+        journal: {
+          writeEvent: async (e: { kind: string; reason?: string }) => {
+            journalEvents.push(e)
+            return {}
+          },
+        } as unknown as import('./journal.ts').JournalWriter,
+      })
+    }
+
+    test('allows new sessions up to the cap, rejects the next new one', async () => {
+      const sup = makeSup(2)
+      await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      await sup.activate({ channel: 'C2', thread: 'T2' }, 'U2')
+      await expect(sup.activate({ channel: 'C3', thread: 'T3' }, 'U3')).rejects.toThrow(
+        /maxConcurrentSessions/,
+      )
+    })
+
+    test('reactivating an already-live session is never capped', async () => {
+      const sup = makeSup(1)
+      const a = await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      const again = await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      expect(again).toBe(a)
+    })
+
+    test('the over-cap rejection is journaled as session.activate_rejected', async () => {
+      const sup = makeSup(1)
+      await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      await expect(sup.activate({ channel: 'C2', thread: 'T2' }, 'U2')).rejects.toThrow()
+      await new Promise((r) => setTimeout(r, 0)) // flush the fire-and-forget journal write
+      const rej = journalEvents.find((e) => e.kind === 'session.activate_rejected')
+      expect(rej).toBeDefined()
+      expect(rej?.reason).toContain('maxConcurrentSessions')
+    })
+
+    test('undefined cap = unlimited (no rejection across many activations)', async () => {
+      const sup = makeSup(undefined)
+      for (let i = 0; i < 12; i++) {
+        await sup.activate({ channel: `C${i}`, thread: 'T' }, 'U')
+      }
+      expect(journalEvents.find((e) => e.kind === 'session.activate_rejected')).toBeUndefined()
+    })
+
+    test('cap counts DISTINCT sessions under concurrency — cap=2, 3 fired at once → 2 ok, 1 rejected', async () => {
+      // Guards the live∪activating double-count fix (Gemini, PR #250): a key
+      // briefly in both maps must not inflate the count.
+      const sup = makeSup(2)
+      const results = await Promise.allSettled([
+        sup.activate({ channel: 'C1', thread: 'T' }, 'U'),
+        sup.activate({ channel: 'C2', thread: 'T' }, 'U'),
+        sup.activate({ channel: 'C3', thread: 'T' }, 'U'),
+      ])
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(2)
+      expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1)
+    })
+  })
+
+  test('activeBots lists bots active within the window, excluding stale + other channels', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 100, windowMs: 60_000 }
+    store.check('C_OPS', 'B_alice', 1_000_000, cfg)
+    store.check('C_OPS', 'B_bob', 1_000_000, cfg)
+    store.check('C_OTHER', 'B_carol', 1_000_000, cfg)
+    expect(store.activeBots('C_OPS', 1_002_000, 5_000).sort()).toEqual(['B_alice', 'B_bob'])
+    // After the window, none are active.
+    expect(store.activeBots('C_OPS', 1_000_000 + 10_000, 5_000)).toEqual([])
+  })
+
+  const envelope = {
+    channelId: 'C_OPS',
+    requestedBy: 'U_ALICE',
+    threadTs: '1700000000.000100',
+    messageTs: '1700000000.000100',
+  }
+  function adminDeps(
+    overrides: Partial<import('./admin.ts').DispatchDeps> = {},
+  ): import('./admin.ts').DispatchDeps {
+    return {
+      isAllowed: () => true,
+      journalWrite: async () => undefined,
+      quiesceAndDeactivate: async () => {},
+      sendTmuxKeys: async () => {},
+      issueChallenge: async () => ({ nonce: 'x', expiresAt: 0 }),
+      verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+      postReaction: async () => {},
+      ...overrides,
+    }
+  }
+
+  test('parses !agents; rejects !agents with an argument', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!agents', envelope)).toEqual({ kind: 'agents', ...envelope })
+    expect(parseAdminCommand('!agents foo', envelope)).toBeNull()
+  })
+
+  test('!agents lists active peer agents', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'agents', ...envelope },
+      adminDeps({ getActiveAgents: () => ['B_alice', 'B_bob'] }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') {
+      expect(result.verb).toBe('agents')
+      expect(result.message).toContain('B_alice')
+      expect(result.message).toContain('B_bob')
+    }
+  })
+
+  test('!agents reports none when no agents active', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'agents', ...envelope },
+      adminDeps({ getActiveAgents: () => [] }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toMatch(/No peer agents/i)
   })
 })
 

@@ -114,6 +114,13 @@ export interface AdminRateLimitCommand extends AdminCommandBase {
   kind: 'rate-limit'
 }
 
+/** !agents — READ-ONLY (ccsc-4e9bf): list the peer bots seen active in this
+ *  channel recently. A lightweight "who's online" view; no arg, no state
+ *  change. */
+export interface AdminAgentsCommand extends AdminCommandBase {
+  kind: 'agents'
+}
+
 export type AdminCommand =
   | AdminClearCommand
   | AdminRestartCommand
@@ -121,6 +128,7 @@ export type AdminCommand =
   | AdminUnmuteCommand
   | AdminMuteStatusCommand
   | AdminRateLimitCommand
+  | AdminAgentsCommand
 
 // ---------------------------------------------------------------------------
 // Parser — text → AdminCommand
@@ -148,7 +156,8 @@ export type AdminCommand =
  */
 // `mute-status` / `rate-limit` precede `mute` so the longer verb wins the
 // alternation; both take no argument (ccsc-yl6k9).
-const ADMIN_COMMAND_RE = /^!(clear|restart|mute-status|rate-limit|mute|unmute)(?:\s+(.+))?$/
+const ADMIN_COMMAND_RE =
+  /^!(clear|restart|mute-status|rate-limit|agents|mute|unmute)(?:\s+(.+))?$/
 
 /** Parse a normalized text body into an `AdminCommand`, or `null` if
  *  the text doesn't match an admin verb. Pure function — no side
@@ -172,7 +181,14 @@ export function parseAdminCommand(
 ): AdminCommand | null {
   const match = ADMIN_COMMAND_RE.exec(text.trim())
   if (match === null) return null
-  const verb = match[1] as 'clear' | 'restart' | 'mute' | 'unmute' | 'mute-status' | 'rate-limit'
+  const verb = match[1] as
+    | 'clear'
+    | 'restart'
+    | 'mute'
+    | 'unmute'
+    | 'mute-status'
+    | 'rate-limit'
+    | 'agents'
   const arg = match[2]
 
   if (verb === 'clear') {
@@ -184,9 +200,10 @@ export function parseAdminCommand(
     return { kind: 'clear', ...envelope }
   }
 
-  // !mute-status / !rate-limit — read-only, no argument (ccsc-yl6k9). Same
-  // conservative rule as !clear: a stray arg falls through to normal chat.
-  if (verb === 'mute-status' || verb === 'rate-limit') {
+  // !mute-status / !rate-limit / !agents — read-only, no argument (ccsc-yl6k9,
+  // ccsc-4e9bf). Same conservative rule as !clear: a stray arg falls through to
+  // normal chat.
+  if (verb === 'mute-status' || verb === 'rate-limit' || verb === 'agents') {
     if (arg !== undefined) return null
     return { kind: verb, ...envelope }
   }
@@ -219,7 +236,7 @@ export type DispatchOutcome =
   | { kind: 'denied'; reason: string }
   /** Read-only verb result (ccsc-yl6k9). The dispatcher built a status
    *  message; the caller posts it to the channel. No state changed. */
-  | { kind: 'status'; verb: 'mute-status' | 'rate-limit'; message: string }
+  | { kind: 'status'; verb: 'mute-status' | 'rate-limit' | 'agents'; message: string }
 
 /** Dependencies the dispatcher needs. Injected so tests can swap
  *  mocks for the side-effectful pieces (tmux, journal, Slack, nonce
@@ -274,6 +291,11 @@ export interface DispatchDeps {
     peerBot: RateLimitConfig
     channel: RateLimitConfig
   }
+  /** List peer-bot user IDs seen active in the channel recently, for the
+   *  read-only `!agents` verb (ccsc-4e9bf). The server derives this from the
+   *  peer-bot rate-limit store's per-channel activity. Absent → `!agents`
+   *  reports the view is unavailable. */
+  getActiveAgents?: (channelId: string, now: number) => string[]
 }
 
 /** Dispatch an admin command through the full pipeline:
@@ -310,7 +332,7 @@ export async function dispatchAdminCommand(
   // NOT journaled — they change no state, and the journal records decisions,
   // not queries. Handled before the generic gate below so they never reach
   // journalAttempt, whose kindMap only covers state-changing verbs.
-  if (cmd.kind === 'mute-status' || cmd.kind === 'rate-limit') {
+  if (cmd.kind === 'mute-status' || cmd.kind === 'rate-limit' || cmd.kind === 'agents') {
     if (!deps.isAllowed(cmd.channelId, cmd.requestedBy)) {
       return {
         kind: 'denied',
@@ -318,10 +340,14 @@ export async function dispatchAdminCommand(
       }
     }
     const now = deps.now !== undefined ? deps.now() : Date.now()
-    const message =
-      cmd.kind === 'mute-status'
-        ? formatMuteStatus(deps.muteStore, cmd.channelId, now)
-        : formatRateLimit(deps.getChannelRateLimits, cmd.channelId)
+    let message: string
+    if (cmd.kind === 'mute-status') {
+      message = formatMuteStatus(deps.muteStore, cmd.channelId, now)
+    } else if (cmd.kind === 'rate-limit') {
+      message = formatRateLimit(deps.getChannelRateLimits, cmd.channelId)
+    } else {
+      message = formatAgents(deps.getActiveAgents, cmd.channelId, now)
+    }
     return { kind: 'status', verb: cmd.kind, message }
   }
 
@@ -441,6 +467,20 @@ function formatMuteStatus(store: MuteStore | undefined, channelId: string, now: 
   return `:mute: *Active peer-bot mutes:*\n${lines.join('\n')}`
 }
 
+/** Build the `!agents` message — peer bots seen active in the channel recently
+ *  (ccsc-4e9bf). Read-only "who's online" view. */
+function formatAgents(
+  resolve: DispatchDeps['getActiveAgents'],
+  channelId: string,
+  now: number,
+): string {
+  if (resolve === undefined) return ':satellite_antenna: Agent activity view is unavailable.'
+  const bots = resolve(channelId, now)
+  if (bots.length === 0) return ':satellite_antenna: No peer agents active in this channel recently.'
+  const lines = bots.map((b) => `• <@${b}>`)
+  return `:satellite_antenna: *Peer agents active recently:*\n${lines.join('\n')}`
+}
+
 /** Build the `!rate-limit` message — the channel's effective per-bot limit and
  *  channel-wide circuit breaker. Read-only; tuning stays terminal-only. */
 function formatRateLimit(
@@ -467,7 +507,7 @@ function formatRateLimit(
  *  (mute-status / rate-limit) are read-only and never reach here. */
 async function journalAttempt(
   deps: DispatchDeps,
-  cmd: Exclude<AdminCommand, AdminMuteStatusCommand | AdminRateLimitCommand>,
+  cmd: Exclude<AdminCommand, AdminMuteStatusCommand | AdminRateLimitCommand | AdminAgentsCommand>,
   outcome: 'allow' | 'denied',
   reason?: string,
 ): Promise<void> {

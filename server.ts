@@ -142,7 +142,12 @@ if (_verifyPath !== null) {
   }
 }
 
-import { createSessionSupervisor, resolveIdleMs, type SessionSupervisor } from './supervisor.ts'
+import {
+  createSessionSupervisor,
+  resolveIdleMs,
+  resolveMaxConcurrentSessions,
+  type SessionSupervisor,
+} from './supervisor.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PAIRING_REPLIES, MAX_PENDING, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -3213,6 +3218,10 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
         channel: chPolicy?.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER,
       }
     },
+    // ccsc-4e9bf — "agents online": peer bots active in the last 5 min, derived
+    // from the rate-limit store's per-channel activity.
+    getActiveAgents: (chId: string, now: number) =>
+      peerBotRateLimitStore.activeBots(chId, now, 5 * 60_000),
   }
 
   try {
@@ -3507,6 +3516,9 @@ async function main(): Promise<void> {
     stateRoot: STATE_DIR,
     idleMs: resolveIdleMs(process.env),
     journal: journal ?? undefined,
+    // ccsc-4e9bf — optional global backpressure cap (SLACK_MAX_CONCURRENT_SESSIONS).
+    // Unset → unlimited (default).
+    maxConcurrentSessions: resolveMaxConcurrentSessions(process.env),
   })
 
   // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is
