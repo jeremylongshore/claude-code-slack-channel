@@ -15703,6 +15703,162 @@ describe('ccsc-ele — Gemini #181 review fixes', () => {
 // A→B→A runaway loops when multiple peer bots are opted into one
 // channel via allowBotIds.
 
+describe('ccsc-0k7x2 — channel-wide circuit breaker', () => {
+  test('checkChannel counts ALL bots together and trips at the threshold', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 3, windowMs: 60_000 }
+    // Three different senders, each well under any per-bot cap, together exhaust
+    // the channel aggregate: 3 allowed, the 4th (from any bot) trips the ring.
+    expect(store.checkChannel('C_OPS', 1_000_000, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_100, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_200, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_300, cfg)).toBe(false)
+  })
+
+  test('checkChannel is independent per channel', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 1, windowMs: 60_000 }
+    expect(store.checkChannel('C_A', 1_000_000, cfg)).toBe(true)
+    expect(store.checkChannel('C_A', 1_000_100, cfg)).toBe(false)
+    expect(store.checkChannel('C_B', 1_000_200, cfg)).toBe(true)
+  })
+
+  test('checkChannel resets after the window slides', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 1, windowMs: 60_000 }
+    expect(store.checkChannel('C_OPS', 1_000_000, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_100, cfg)).toBe(false)
+    // Past the window → old entry pruned, allowed again
+    expect(store.checkChannel('C_OPS', 1_000_000 + 60_001, cfg)).toBe(true)
+  })
+
+  test('checkChannel { count: 0 } disables (always allows)', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 0, windowMs: 0 }
+    for (let i = 0; i < 100; i++) {
+      expect(store.checkChannel('C_OPS', 1_000_000 + i, cfg)).toBe(true)
+    }
+  })
+
+  test('prune sweeps channel-aggregate buckets too', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 5, windowMs: 60_000 }
+    store.checkChannel('C_OPS', 1_000_000, cfg)
+    // Long after the window, prune removes the stale channel bucket.
+    expect(store.prune(1_000_000 + 120_000, 60_000)).toBeGreaterThanOrEqual(1)
+  })
+
+  test('gate trips an A→B→C→A ring with rate.channel_cycle though each bot is under its per-bot cap', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const { gate } = await import('./lib.ts')
+    const store = createPeerBotRateLimitStore()
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_RING: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_A', 'U_B', 'U_C'],
+          peerBotRateLimit: { count: 100, windowMs: 60_000 }, // generous → per-bot never trips first
+          channelCircuitBreaker: { count: 5, windowMs: 60_000 },
+        },
+      },
+      pending: {},
+    }
+    let now = 1_000_000
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      peerBotRateLimitStore: store,
+      now: () => now,
+    }
+    const ring = ['U_A', 'U_B', 'U_C', 'U_A', 'U_B'] // 5 messages, each sender ≤ 2
+    for (const user of ring) {
+      const r = await gate(
+        {
+          type: 'message',
+          channel: 'C_RING',
+          user,
+          bot_id: `B_${user}`,
+          text: 'looping',
+          ts: '1700000000.000100',
+        },
+        opts,
+      )
+      expect(r.action).not.toBe('drop')
+      now += 100
+    }
+    // 6th message: channel aggregate (5) is at threshold → breaker trips.
+    const tripped = await gate(
+      {
+        type: 'message',
+        channel: 'C_RING',
+        user: 'U_C',
+        bot_id: 'B_U_C',
+        text: 'looping',
+        ts: '1700000000.000100',
+      },
+      opts,
+    )
+    expect(tripped.action).toBe('drop')
+    expect(tripped.dropReason).toBe('rate.channel_cycle')
+  })
+
+  test('gate channelCircuitBreaker { count: 0 } disables the breaker', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const { gate } = await import('./lib.ts')
+    const store = createPeerBotRateLimitStore()
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_RING: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_A'],
+          peerBotRateLimit: { count: 0, windowMs: 0 },
+          channelCircuitBreaker: { count: 0, windowMs: 0 },
+        },
+      },
+      pending: {},
+    }
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      peerBotRateLimitStore: store,
+      now: () => 1_000_000,
+    }
+    for (let i = 0; i < 50; i++) {
+      const r = await gate(
+        {
+          type: 'message',
+          channel: 'C_RING',
+          user: 'U_A',
+          bot_id: 'B_A',
+          text: 'x',
+          ts: '1700000000.000100',
+        },
+        opts,
+      )
+      expect(r.dropReason).not.toBe('rate.channel_cycle')
+    }
+  })
+})
+
 describe('ccsc-gyt — createPeerBotRateLimitStore', () => {
   test('first message from a (channel, bot) pair is allowed', async () => {
     const { createPeerBotRateLimitStore, DEFAULT_PEER_BOT_RATE_LIMIT } = await import(

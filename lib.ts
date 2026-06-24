@@ -13,7 +13,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { basename, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
-import { DEFAULT_PEER_BOT_RATE_LIMIT } from './peer-bot-rate-limit.ts'
+import {
+  DEFAULT_CHANNEL_CIRCUIT_BREAKER,
+  DEFAULT_PEER_BOT_RATE_LIMIT,
+} from './peer-bot-rate-limit.ts'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -77,6 +80,14 @@ export interface ChannelPolicy {
    *  applies (10 msgs in 60s). Set `{ count: 0, windowMs: 0 }` only
    *  to explicitly DISABLE the limit; default-on is intentional. */
   peerBotRateLimit?: { count: number; windowMs: number }
+  /** Channel-wide circuit breaker for N-cycle (A→B→C→A) peer-bot loops
+   *  (ccsc-0k7x2). The per-(channel, bot) `peerBotRateLimit` only breaks
+   *  PAIRWISE loops; a 3+-bot ring keeps each sender under its own cap, so
+   *  this aggregate counter trips the whole channel's bot traffic when total
+   *  peer-bot velocity is runaway-high. Absent →
+   *  DEFAULT_CHANNEL_CIRCUIT_BREAKER (40 msgs in 60s). Set
+   *  `{ count: 0, windowMs: 0 }` to DISABLE; default-on is intentional. */
+  channelCircuitBreaker?: { count: number; windowMs: number }
 }
 
 export interface PendingEntry {
@@ -119,6 +130,7 @@ export type GateDropReason =
   | 'bot.not_allowlisted' // peer bot not in the channel's allowBotIds
   | 'admin.muted' // ccsc-gjm — operator muted this peer bot in this channel
   | 'rate.cross_bot_loop' // ccsc-gyt — peer bot exceeded per-(channel, bot_id) sliding window
+  | 'rate.channel_cycle' // ccsc-0k7x2 — channel-wide peer-bot velocity tripped the circuit breaker (N-cycle ring)
   | 'bot.permission_relay' // peer-bot message looked like a permission-approval relay
   // -- top-level stage (gate) --
   | 'subtype.filtered' // non-message subtype (message_changed, message_deleted, …) — see ccsc-apj.3
@@ -1725,6 +1737,22 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
       const allowed = opts.peerBotRateLimitStore.check(channel, botUser, now, config)
       if (!allowed) {
         return { action: 'drop', dropReason: 'rate.cross_bot_loop' }
+      }
+    }
+  }
+
+  // ccsc-0k7x2 — channel-wide circuit breaker for N-cycle (A→B→C→A) rings.
+  // The per-(channel, bot) check above only breaks PAIRWISE loops; a 3+-bot
+  // ring keeps each sender under its own cap, so it slips through. This
+  // aggregate counter trips the whole channel's peer-bot traffic when total
+  // velocity is runaway-high. Default-on at DEFAULT_CHANNEL_CIRCUIT_BREAKER
+  // (40 msgs in 60s); { count: 0, windowMs: 0 } disables.
+  if (opts.peerBotRateLimitStore !== undefined) {
+    const breaker = policy.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER
+    if (breaker.count > 0 && breaker.windowMs > 0) {
+      const now = opts.now !== undefined ? opts.now() : Date.now()
+      if (!opts.peerBotRateLimitStore.checkChannel(channel, now, breaker)) {
+        return { action: 'drop', dropReason: 'rate.channel_cycle' }
       }
     }
   }
