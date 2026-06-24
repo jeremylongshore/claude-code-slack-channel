@@ -39,6 +39,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { JournalWriter } from './journal.ts'
 import { DEFAULT_MUTE_TTL_MS, type MuteStore, parseSlackMention } from './mute-store.ts'
+import type { RateLimitConfig } from './peer-bot-rate-limit.ts'
 import type { NonceStore } from './nonce-hitl.ts'
 import { verifyNonce } from './nonce-hitl.ts'
 
@@ -99,11 +100,27 @@ export interface AdminUnmuteCommand extends AdminCommandBase {
   targetBotId: string
 }
 
+/** !mute-status — READ-ONLY (ccsc-yl6k9): list the channel's active peer-bot
+ *  mutes + remaining TTL. No arg, no state change. */
+export interface AdminMuteStatusCommand extends AdminCommandBase {
+  kind: 'mute-status'
+}
+
+/** !rate-limit — READ-ONLY (ccsc-yl6k9): show the channel's effective peer-bot
+ *  rate limit + circuit-breaker thresholds. No arg, no state change. Tuning the
+ *  numbers stays terminal-only (access.json) by design — a Slack message must
+ *  never loosen a security limit. */
+export interface AdminRateLimitCommand extends AdminCommandBase {
+  kind: 'rate-limit'
+}
+
 export type AdminCommand =
   | AdminClearCommand
   | AdminRestartCommand
   | AdminMuteCommand
   | AdminUnmuteCommand
+  | AdminMuteStatusCommand
+  | AdminRateLimitCommand
 
 // ---------------------------------------------------------------------------
 // Parser — text → AdminCommand
@@ -129,7 +146,9 @@ export type AdminCommand =
  *  downstream `parseSlackMention` accepts spaces inside the
  *  display-name capture (`[^>]*`).
  */
-const ADMIN_COMMAND_RE = /^!(clear|restart|mute|unmute)(?:\s+(.+))?$/
+// `mute-status` / `rate-limit` precede `mute` so the longer verb wins the
+// alternation; both take no argument (ccsc-yl6k9).
+const ADMIN_COMMAND_RE = /^!(clear|restart|mute-status|rate-limit|mute|unmute)(?:\s+(.+))?$/
 
 /** Parse a normalized text body into an `AdminCommand`, or `null` if
  *  the text doesn't match an admin verb. Pure function — no side
@@ -153,7 +172,7 @@ export function parseAdminCommand(
 ): AdminCommand | null {
   const match = ADMIN_COMMAND_RE.exec(text.trim())
   if (match === null) return null
-  const verb = match[1] as 'clear' | 'restart' | 'mute' | 'unmute'
+  const verb = match[1] as 'clear' | 'restart' | 'mute' | 'unmute' | 'mute-status' | 'rate-limit'
   const arg = match[2]
 
   if (verb === 'clear') {
@@ -163,6 +182,13 @@ export function parseAdminCommand(
     // refuse it for other reasons). This is the conservative choice.
     if (arg !== undefined) return null
     return { kind: 'clear', ...envelope }
+  }
+
+  // !mute-status / !rate-limit — read-only, no argument (ccsc-yl6k9). Same
+  // conservative rule as !clear: a stray arg falls through to normal chat.
+  if (verb === 'mute-status' || verb === 'rate-limit') {
+    if (arg !== undefined) return null
+    return { kind: verb, ...envelope }
   }
 
   if (verb === 'restart') {
@@ -191,6 +217,9 @@ export type DispatchOutcome =
   | { kind: 'executed'; verb: 'clear' | 'restart' | 'mute' | 'unmute' }
   | { kind: 'challenge_issued'; nonce: string; expiresAt: number }
   | { kind: 'denied'; reason: string }
+  /** Read-only verb result (ccsc-yl6k9). The dispatcher built a status
+   *  message; the caller posts it to the channel. No state changed. */
+  | { kind: 'status'; verb: 'mute-status' | 'rate-limit'; message: string }
 
 /** Dependencies the dispatcher needs. Injected so tests can swap
  *  mocks for the side-effectful pieces (tmux, journal, Slack, nonce
@@ -236,6 +265,15 @@ export interface DispatchDeps {
   /** Clock for mute TTL math. Defaults to `Date.now`. Tests inject
    *  for deterministic expiry assertions. */
   now?: () => number
+  /** Resolve the channel's EFFECTIVE peer-bot rate-limit + circuit-breaker
+   *  config (policy override or the built-in default) for the read-only
+   *  `!rate-limit` verb (ccsc-yl6k9). The server computes this from
+   *  access.json + the DEFAULT_* constants. Absent → `!rate-limit` reports
+   *  that the limits view is unavailable. */
+  getChannelRateLimits?: (channelId: string) => {
+    peerBot: RateLimitConfig
+    channel: RateLimitConfig
+  }
 }
 
 /** Dispatch an admin command through the full pipeline:
@@ -268,6 +306,25 @@ export async function dispatchAdminCommand(
   cmd: AdminCommand,
   deps: DispatchDeps,
 ): Promise<DispatchOutcome> {
+  // Read-only verbs (ccsc-yl6k9): allowlist-gated like every admin verb, but
+  // NOT journaled — they change no state, and the journal records decisions,
+  // not queries. Handled before the generic gate below so they never reach
+  // journalAttempt, whose kindMap only covers state-changing verbs.
+  if (cmd.kind === 'mute-status' || cmd.kind === 'rate-limit') {
+    if (!deps.isAllowed(cmd.channelId, cmd.requestedBy)) {
+      return {
+        kind: 'denied',
+        reason: 'requester not authorized for admin commands in this channel',
+      }
+    }
+    const now = deps.now !== undefined ? deps.now() : Date.now()
+    const message =
+      cmd.kind === 'mute-status'
+        ? formatMuteStatus(deps.muteStore, cmd.channelId, now)
+        : formatRateLimit(deps.getChannelRateLimits, cmd.channelId)
+    return { kind: 'status', verb: cmd.kind, message }
+  }
+
   // Allowlist gate — same shape regardless of verb.
   if (!deps.isAllowed(cmd.channelId, cmd.requestedBy)) {
     await journalAttempt(deps, cmd, 'denied', 'requester not on adminCommands.allowFrom')
@@ -353,12 +410,64 @@ export async function dispatchAdminCommand(
   return { kind: 'executed', verb: 'restart' }
 }
 
+// ---------------------------------------------------------------------------
+// Read-only verb formatters (ccsc-yl6k9) — pure, no side effects
+// ---------------------------------------------------------------------------
+
+/** "4m 12s" / "45s" from a millisecond duration (floored at 0). */
+function formatRemaining(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000))
+  const m = Math.floor(totalSec / 60)
+  const s = totalSec % 60
+  return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+
+/** "10 msgs / 60s" or "disabled" for a rate-limit config. Defensive against a
+ *  missing/malformed cfg from a hand-edited access.json (Gemini, PR #249). */
+function describeLimit(cfg: RateLimitConfig | undefined | null): string {
+  if (!cfg || cfg.count <= 0 || cfg.windowMs <= 0) return 'disabled'
+  return `${cfg.count} msgs / ${Math.round(cfg.windowMs / 1000)}s`
+}
+
+/** Build the `!mute-status` message — the channel's active peer-bot mutes with
+ *  remaining TTL. Read-only; never mutates the store. */
+function formatMuteStatus(store: MuteStore | undefined, channelId: string, now: number): string {
+  if (store === undefined) return ':mute: Mute status is unavailable (no mute store configured).'
+  const mutes = store.list(channelId, now)
+  if (mutes.length === 0) return ':mute: No active peer-bot mutes in this channel.'
+  const lines = mutes.map(
+    (m) => `• <@${m.botId}> — ${formatRemaining(m.expiresAt - now)} left (muted by <@${m.mutedBy}>)`,
+  )
+  return `:mute: *Active peer-bot mutes:*\n${lines.join('\n')}`
+}
+
+/** Build the `!rate-limit` message — the channel's effective per-bot limit and
+ *  channel-wide circuit breaker. Read-only; tuning stays terminal-only. */
+function formatRateLimit(
+  resolve: DispatchDeps['getChannelRateLimits'],
+  channelId: string,
+): string {
+  if (resolve === undefined) return ':bar_chart: Rate-limit view is unavailable.'
+  const limits = resolve(channelId)
+  if (limits === undefined || limits === null) {
+    return ':bar_chart: Rate-limit view is unavailable.'
+  }
+  const { peerBot, channel } = limits
+  return [
+    ':bar_chart: *Effective peer-bot limits for this channel:*',
+    `• Per-bot: ${describeLimit(peerBot)}`,
+    `• Channel breaker: ${describeLimit(channel)}`,
+    '_Tuning is terminal-only — edit the channel policy via `/slack-channel:access`._',
+  ].join('\n')
+}
+
 /** Common journal-write path for admin events. Records verb +
  *  outcome + requester + channel. Defensive on throw — admin
- *  decision is authoritative even on a broken journal. */
+ *  decision is authoritative even on a broken journal. Status verbs
+ *  (mute-status / rate-limit) are read-only and never reach here. */
 async function journalAttempt(
   deps: DispatchDeps,
-  cmd: AdminCommand,
+  cmd: Exclude<AdminCommand, AdminMuteStatusCommand | AdminRateLimitCommand>,
   outcome: 'allow' | 'denied',
   reason?: string,
 ): Promise<void> {
