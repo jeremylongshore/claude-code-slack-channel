@@ -16160,6 +16160,19 @@ describe('ccsc-4e9bf — backpressure + agents-online', () => {
       }
       expect(journalEvents.find((e) => e.kind === 'session.activate_rejected')).toBeUndefined()
     })
+
+    test('cap counts DISTINCT sessions under concurrency — cap=2, 3 fired at once → 2 ok, 1 rejected', async () => {
+      // Guards the live∪activating double-count fix (Gemini, PR #250): a key
+      // briefly in both maps must not inflate the count.
+      const sup = makeSup(2)
+      const results = await Promise.allSettled([
+        sup.activate({ channel: 'C1', thread: 'T' }, 'U'),
+        sup.activate({ channel: 'C2', thread: 'T' }, 'U'),
+        sup.activate({ channel: 'C3', thread: 'T' }, 'U'),
+      ])
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(2)
+      expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1)
+    })
   })
 
   test('activeBots lists bots active within the window, excluding stale + other channels', async () => {

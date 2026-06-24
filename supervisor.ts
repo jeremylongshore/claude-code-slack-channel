@@ -806,37 +806,43 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
 
       // ccsc-4e9bf — global backpressure. A genuinely NEW session is refused
       // once live + in-flight activations are at the cap, so a runaway burst
-      // can't exhaust resources. Counts in-flight too (they will become live).
-      // The load-shed decision is BOTH logged (operator stderr) and journaled
-      // (audit record of the refusal, per the ccsc-4e9bf acceptance criteria).
-      // The caller (deliverEvent) logs + drops the message.
-      if (
-        maxConcurrentSessions !== undefined &&
-        live.size + activating.size >= maxConcurrentSessions
-      ) {
-        const active = live.size + activating.size
-        log('session.activate_rejected', {
-          channel: key.channel,
-          thread: key.thread,
-          reason: 'max_concurrent_sessions',
-          active,
-          cap: maxConcurrentSessions,
-        })
-        // Fire-and-forget: the journal must never block the hot path (audit-
-        // journal-architecture.md invariant); journalWrite is internally
-        // resilient and swallows its own failures.
-        void journalWrite({
-          kind: 'session.activate_rejected',
-          outcome: 'deny',
-          actor: 'system',
-          sessionKey: key,
-          reason: `maxConcurrentSessions cap (${maxConcurrentSessions}) reached; active=${active}`,
-        })
-        return Promise.reject(
-          new Error(
-            `SessionSupervisor.activate: at maxConcurrentSessions cap (${maxConcurrentSessions})`,
-          ),
-        )
+      // can't exhaust resources. The load-shed decision is BOTH logged (operator
+      // stderr) and journaled (audit record of the refusal, per the ccsc-4e9bf
+      // acceptance criteria). The caller (deliverEvent) logs + drops the message.
+      if (maxConcurrentSessions !== undefined) {
+        // Count DISTINCT in-progress sessions. A key whose doActivate has
+        // already resolved is briefly in BOTH `live` and `activating` (the
+        // .finally cleanup runs a microtask later), so `live.size +
+        // activating.size` would double-count it and could reject spuriously
+        // near the cap (Gemini, PR #250). Count in-flight keys not yet in
+        // `live`, plus live. `activating` is small (concurrent activations).
+        let inFlightNew = 0
+        for (const k of activating.keys()) if (!live.has(k)) inFlightNew++
+        const active = live.size + inFlightNew
+        if (active >= maxConcurrentSessions) {
+          log('session.activate_rejected', {
+            channel: key.channel,
+            thread: key.thread,
+            reason: 'max_concurrent_sessions',
+            active,
+            cap: maxConcurrentSessions,
+          })
+          // Fire-and-forget: the journal must never block the hot path (audit-
+          // journal-architecture.md invariant); journalWrite is internally
+          // resilient and swallows its own failures.
+          void journalWrite({
+            kind: 'session.activate_rejected',
+            outcome: 'deny',
+            actor: 'system',
+            sessionKey: key,
+            reason: `maxConcurrentSessions cap (${maxConcurrentSessions}) reached; active=${active}`,
+          })
+          return Promise.reject(
+            new Error(
+              `SessionSupervisor.activate: at maxConcurrentSessions cap (${maxConcurrentSessions})`,
+            ),
+          )
+        }
       }
 
       const promise = doActivate(key, initialOwnerId).finally(() => {

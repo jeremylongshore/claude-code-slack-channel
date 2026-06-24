@@ -3220,8 +3220,8 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
     },
     // ccsc-4e9bf — "agents online": peer bots active in the last 5 min, derived
     // from the rate-limit store's per-channel activity.
-    getActiveAgents: (chId: string) =>
-      peerBotRateLimitStore.activeBots(chId, Date.now(), 5 * 60_000),
+    getActiveAgents: (chId: string, now: number) =>
+      peerBotRateLimitStore.activeBots(chId, now, 5 * 60_000),
   }
 
   try {

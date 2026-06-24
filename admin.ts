@@ -295,7 +295,7 @@ export interface DispatchDeps {
    *  read-only `!agents` verb (ccsc-4e9bf). The server derives this from the
    *  peer-bot rate-limit store's per-channel activity. Absent → `!agents`
    *  reports the view is unavailable. */
-  getActiveAgents?: (channelId: string) => string[]
+  getActiveAgents?: (channelId: string, now: number) => string[]
 }
 
 /** Dispatch an admin command through the full pipeline:
@@ -346,7 +346,7 @@ export async function dispatchAdminCommand(
     } else if (cmd.kind === 'rate-limit') {
       message = formatRateLimit(deps.getChannelRateLimits, cmd.channelId)
     } else {
-      message = formatAgents(deps.getActiveAgents, cmd.channelId)
+      message = formatAgents(deps.getActiveAgents, cmd.channelId, now)
     }
     return { kind: 'status', verb: cmd.kind, message }
   }
@@ -472,9 +472,10 @@ function formatMuteStatus(store: MuteStore | undefined, channelId: string, now: 
 function formatAgents(
   resolve: DispatchDeps['getActiveAgents'],
   channelId: string,
+  now: number,
 ): string {
   if (resolve === undefined) return ':satellite_antenna: Agent activity view is unavailable.'
-  const bots = resolve(channelId)
+  const bots = resolve(channelId, now)
   if (bots.length === 0) return ':satellite_antenna: No peer agents active in this channel recently.'
   const lines = bots.map((b) => `• <@${b}>`)
   return `:satellite_antenna: *Peer agents active recently:*\n${lines.join('\n')}`
