@@ -591,8 +591,17 @@ function inboundSessionKey(
   access: Access,
   ev: Record<string, unknown>,
 ): import('./lib.ts').SessionKey {
-  if (access.channels[channelId]?.perUserSessions === true && ev.user !== undefined) {
-    return { channel: channelId, thread: threadKey, userId: ev.user as string }
+  // Sender identity: the human user_id, or the bot's id for a peer bot. Validate
+  // it is a NON-EMPTY string before keying (ev fields are `unknown`); an
+  // empty/absent sender falls back to the shared session rather than building an
+  // invalid empty-userId key (Gemini, PR #248).
+  const senderId = (ev.user ?? ev.bot_id) as unknown
+  if (
+    access.channels[channelId]?.perUserSessions === true &&
+    typeof senderId === 'string' &&
+    senderId !== ''
+  ) {
+    return { channel: channelId, thread: threadKey, userId: senderId }
   }
   return { channel: channelId, thread: threadKey }
 }

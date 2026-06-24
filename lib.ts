@@ -561,7 +561,7 @@ export function sessionPath(root: string, key: SessionKey): string {
   // it with the SAME component rule (no `.`/`..`, restricted charset) so it
   // can never inject path traversal — the on-disk leaf becomes
   // `sessions/<channel>/<userId>/<thread>.json`.
-  if (key.userId !== undefined && !isValidSessionComponent(key.userId)) {
+  if (key.userId !== undefined && (key.userId === '' || !isValidSessionComponent(key.userId))) {
     throw new Error(`sessionPath: invalid userId component: ${JSON.stringify(key.userId)}`)
   }
 

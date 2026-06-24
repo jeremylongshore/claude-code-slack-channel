@@ -2451,6 +2451,12 @@ describe('sessionPath', () => {
     ).toThrow(/invalid userId component/)
   })
 
+  test('rejects empty userId component (no collision with the shared session)', () => {
+    expect(() => sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: '' })).toThrow(
+      /invalid userId component/,
+    )
+  })
+
   test('rejects thread component that is exactly ..', () => {
     expect(() => sessionPath(tmpRoot, key('C_CHAN', '..'))).toThrow(/invalid thread component/)
   })
