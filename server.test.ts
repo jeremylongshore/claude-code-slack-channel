@@ -80,6 +80,7 @@ import {
   validateSendableRoots,
 } from './lib.ts'
 import {
+  beginDurableStream,
   createDeliverySendDeps,
   createReplyPoster,
   DurableUnavailableError,
@@ -7588,6 +7589,120 @@ describe('deliverChunkedReplyDurably (ccsc-o7x.4)', () => {
 
     expect(result).toEqual({ status: 'delivered', ts: 'ts-0', sent: 1 })
     expect(calls).toEqual([{ id: 'r-1:0', key: 'ccsc-reply:r-1:0', text: 'only' }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable streaming reply finalize — beginDurableStream (ccsc-o7x.6). A stream
+// records ONE full-text obligation up front; completing marks it delivered, an
+// in-process failure marks it dead, and a process crash (neither mark called)
+// leaves it pending so the poller redelivers the final message. (ADR-002
+// addendum.)
+// ---------------------------------------------------------------------------
+
+describe('beginDurableStream (ccsc-o7x.6)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_STREAM', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-stream-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  /** Pre-create the session file so the owner-less activate resolves it from
+   *  disk (mirrors a session the inbound message created). */
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  const reply = { id: 's-1', channel: 'C_STREAM', thread: 'T1', text: 'the full streamed reply' }
+
+  test('records ONE pending obligation carrying the FULL text before returning', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+
+    await beginDurableStream({ supervisor: sup }, reply)
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox).toHaveLength(1)
+    // Full text as the payload — a stream-finalize obligation, NOT a chunk.
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 's-1',
+      state: 'pending',
+      payload: 'the full streamed reply',
+    })
+    // Pending → a crash here means the poller redelivers the final message.
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['s-1'])
+  })
+
+  test('markDelivered: stream completed → obligation delivered, nothing pending', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const handle = await beginDurableStream({ supervisor: sup }, reply)
+
+    await handle.markDelivered()
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 's-1', state: 'delivered', attempts: 1 })
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('markDead: in-process stream failure → obligation dead with the reason, nothing pending', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const handle = await beginDurableStream({ supervisor: sup }, reply)
+
+    await handle.markDead('failed mid-stream: channel removed')
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 's-1',
+      state: 'dead',
+      attempts: 1,
+      lastError: 'failed mid-stream: channel removed',
+    })
+    // Dead, not pending → the poller never auto-redelivers a gate-rejected stream.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('crash mid-stream (neither mark called) leaves the obligation pending across a restart', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    // Begin, then "crash": never call markDelivered/markDead.
+    await beginDurableStream({ supervisor: sup }, reply)
+
+    // A fresh supervisor (simulating a restart) still sees the pending obligation
+    // — the boot-drain / poller redelivers the full text.
+    const afterRestart = makeSupervisor()
+    expect((await afterRestart.pendingDeliveries()).map((o) => o.id)).toEqual(['s-1'])
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession() — the session file does not exist and the owner-less
+    // activate rejects, so nothing is recorded.
+    const sup = makeSupervisor()
+
+    await expect(beginDurableStream({ supervisor: sup }, reply)).rejects.toBeInstanceOf(
+      DurableUnavailableError,
+    )
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
   })
 })
 
