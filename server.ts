@@ -3207,7 +3207,7 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
     muteStore: adminMuteStore,
     // ccsc-yl6k9 — effective rate-limit view for the read-only !rate-limit verb.
     getChannelRateLimits: (chId: string) => {
-      const chPolicy = getAccess().channels[chId]
+      const chPolicy = getAccess().channels?.[chId]
       return {
         peerBot: chPolicy?.peerBotRateLimit ?? DEFAULT_PEER_BOT_RATE_LIMIT,
         channel: chPolicy?.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER,

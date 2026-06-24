@@ -15009,6 +15009,17 @@ describe('ccsc-yl6k9 — read-only admin verbs (mute-status / rate-limit)', () =
     if (result.kind === 'status') expect(result.message).toContain('disabled')
   })
 
+  test('!rate-limit degrades gracefully when the resolver returns undefined (ccsc-yl6k9)', async () => {
+    // Defensive against a malformed/missing config (Gemini, PR #249).
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'rate-limit', ...envelope },
+      baseDeps({ getChannelRateLimits: () => undefined as unknown as never }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toMatch(/unavailable/i)
+  })
+
   test('read-only verbs are allowlist-gated — non-allowlisted user denied, not journaled', async () => {
     const { dispatchAdminCommand } = await import('./admin.ts')
     const { createMuteStore } = await import('./mute-store.ts')

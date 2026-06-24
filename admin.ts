@@ -422,9 +422,10 @@ function formatRemaining(ms: number): string {
   return m > 0 ? `${m}m ${s}s` : `${s}s`
 }
 
-/** "10 msgs / 60s" or "disabled" for a rate-limit config. */
-function describeLimit(cfg: RateLimitConfig): string {
-  if (cfg.count <= 0 || cfg.windowMs <= 0) return 'disabled'
+/** "10 msgs / 60s" or "disabled" for a rate-limit config. Defensive against a
+ *  missing/malformed cfg from a hand-edited access.json (Gemini, PR #249). */
+function describeLimit(cfg: RateLimitConfig | undefined | null): string {
+  if (!cfg || cfg.count <= 0 || cfg.windowMs <= 0) return 'disabled'
   return `${cfg.count} msgs / ${Math.round(cfg.windowMs / 1000)}s`
 }
 
@@ -447,7 +448,11 @@ function formatRateLimit(
   channelId: string,
 ): string {
   if (resolve === undefined) return ':bar_chart: Rate-limit view is unavailable.'
-  const { peerBot, channel } = resolve(channelId)
+  const limits = resolve(channelId)
+  if (limits === undefined || limits === null) {
+    return ':bar_chart: Rate-limit view is unavailable.'
+  }
+  const { peerBot, channel } = limits
   return [
     ':bar_chart: *Effective peer-bot limits for this channel:*',
     `• Per-bot: ${describeLimit(peerBot)}`,
