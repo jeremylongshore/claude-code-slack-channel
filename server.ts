@@ -97,13 +97,15 @@ import {
   evaluate as policyEvaluate,
 } from './policy.ts'
 import {
+  beginDurableStream,
   createDeliverySendDeps,
   createReplyPoster,
+  type DurableStreamHandle,
   DurableUnavailableError,
   deliverChunkedReplyDurably,
   deliverReplyDurably,
 } from './slack-delivery.ts'
-import { streamReply } from './stream-reply.ts'
+import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 
 // ---------------------------------------------------------------------------
 // --verify-audit-log subcommand (ccsc-t7j, Epic 30-A.15)
@@ -1148,13 +1150,85 @@ async function executeReplyFileUploads(
   }
 }
 
+/** ccsc-o7x.6 — record a stream-finalize obligation (full text) if the session
+ *  can go durable, else `null` (best-effort — stream without a net, the prior
+ *  behavior). Module-level so `executeReplyStreamingPath` stays under CRAP-30.
+ *
+ *  The obligation here is a crash safety-net that is SEPARATE from the send (the
+ *  send is the stream itself), unlike the text/chunked durable paths where the
+ *  obligation IS the send. So ANY failure to set it up — `DurableUnavailableError`
+ *  (no session/lease) OR a `recordTerminalDelivery` write failure (disk, fence) —
+ *  degrades to best-effort streaming rather than failing the reply. This keeps
+ *  o7x.6 durability strictly additive: it can never make streaming worse than the
+ *  pre-o7x.6 behavior. A non-`DurableUnavailableError` failure is logged to
+ *  stderr (it signals a real storage problem) but never propagated. */
+async function maybeBeginDurableStream(
+  chatId: string,
+  threadTs: string | undefined,
+  text: string,
+): Promise<DurableStreamHandle | null> {
+  if (supervisor === null || threadTs === undefined) return null
+  try {
+    return await beginDurableStream(
+      { supervisor },
+      { id: randomUUID(), channel: chatId, thread: threadTs, text },
+    )
+  } catch (err) {
+    if (!(err instanceof DurableUnavailableError)) {
+      console.error('[slack] beginDurableStream failed; streaming best-effort', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    return null
+  }
+}
+
+/** ccsc-o7x.6 — resolve the stream-finalize obligation from the `streamReply`
+ *  outcome: `completed` → `delivered`; any clean in-process failure
+ *  (`failed_mid_stream` or `gate_rejected_at_start`) → `dead` (the partial
+ *  message that landed is the same best-effort outcome as before; the poller does
+ *  NOT re-run the outbound gate, so a gate-rejected stream must never be
+ *  auto-redelivered). A process crash never reaches here, leaving the obligation
+ *  `pending` for the poller to redeliver. No-op when there is no durable handle. */
+async function resolveStreamObligation(
+  durable: DurableStreamHandle | null,
+  result: StreamReplyResult,
+): Promise<void> {
+  if (durable === null) return
+  switch (result.kind) {
+    case 'completed':
+      await durable.markDelivered()
+      return
+    case 'failed_mid_stream':
+      await durable.markDead(`failed mid-stream: ${result.reason}`)
+      return
+    case 'gate_rejected_at_start':
+      await durable.markDead(`stream rejected at start: ${result.reason}`)
+      return
+    default: {
+      // Exhaustiveness guard: a new StreamReplyResult variant must declare its
+      // obligation resolution here, failing to compile rather than silently
+      // dead-lettering with a misleading reason (matches the
+      // permissionRouteJournalEvents never-guard, ccsc-175).
+      const _exhaustive: never = result
+      return _exhaustive
+    }
+  }
+}
+
 /** ccsc-h1h — extracted streaming path for executeReply. Posts the
  *  reply via streamReply (single message that grows via chat.update)
  *  + handles the file-upload tail + builds the result. streamReply
  *  emits its own gate.outbound.allow + system.stream_finalize events
  *  so this path does NOT write a separate allow event. Kept as a
  *  module-level function so executeReply itself stays under the
- *  CRAP-30 threshold. */
+ *  CRAP-30 threshold.
+ *
+ *  ccsc-o7x.6 — wraps the stream in a stream-finalize obligation so a process
+ *  crash mid-stream redelivers the full text as a fresh message (ADR-002
+ *  addendum). The obligation is recorded BEFORE streaming and resolved after:
+ *  delivered on completion, dead on any in-process failure, left pending only by
+ *  an actual crash. */
 async function executeReplyStreamingPath(opts: {
   chatId: string
   threadTs: string | undefined
@@ -1164,40 +1238,60 @@ async function executeReplyStreamingPath(opts: {
   ctx: ToolContext
 }): Promise<ToolResult> {
   const { chatId, threadTs, text, files, limit, ctx } = opts
-  const result = await streamReply(
-    { channel: chatId, threadTs, text, chunkSize: limit },
-    {
-      assertOutboundAllowed: (c, t) => ctx.assertOutboundAllowed(c, t),
-      postMessage: async (a) => {
-        const res = await ctx.web.chat.postMessage({
-          channel: a.channel,
-          text: a.text,
-          thread_ts: a.thread_ts,
-          unfurl_links: false,
-          unfurl_media: false,
-        })
-        const ts = res.ts as string | undefined
-        // Per Gemini review on PR #188: validate ts BEFORE returning
-        // an empty string downstream. streamReply's invariant is that
-        // subsequent chat.update calls target a real ts; an empty
-        // string would cause each update to fail with a confusing
-        // "channel_not_found"-style Slack error. Throw here so
-        // streamReply's init-failure path runs cleanly + the
-        // system.stream_finalize event records the failure reason.
-        if (!ts) throw new Error('chat.postMessage returned no ts')
-        return { ts }
+
+  const durable = await maybeBeginDurableStream(chatId, threadTs, text)
+
+  let result: StreamReplyResult
+  try {
+    result = await streamReply(
+      { channel: chatId, threadTs, text, chunkSize: limit },
+      {
+        assertOutboundAllowed: (c, t) => ctx.assertOutboundAllowed(c, t),
+        postMessage: async (a) => {
+          const res = await ctx.web.chat.postMessage({
+            channel: a.channel,
+            text: a.text,
+            thread_ts: a.thread_ts,
+            unfurl_links: false,
+            unfurl_media: false,
+          })
+          const ts = res.ts as string | undefined
+          // Per Gemini review on PR #188: validate ts BEFORE returning
+          // an empty string downstream. streamReply's invariant is that
+          // subsequent chat.update calls target a real ts; an empty
+          // string would cause each update to fail with a confusing
+          // "channel_not_found"-style Slack error. Throw here so
+          // streamReply's init-failure path runs cleanly + the
+          // system.stream_finalize event records the failure reason.
+          if (!ts) throw new Error('chat.postMessage returned no ts')
+          return { ts }
+        },
+        updateMessage: async (a) => {
+          await ctx.web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
+        },
+        // Per Gemini review on PR #188: inject toolName so streamReply's
+        // gate.outbound.allow + system.stream_finalize events attribute
+        // to 'reply' in the audit log (streamReply is a generic
+        // primitive; it doesn't know the calling tool's name).
+        journalWrite: async (input) => ctx.journalWrite({ ...input, toolName: 'reply' }),
+        sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       },
-      updateMessage: async (a) => {
-        await ctx.web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
-      },
-      // Per Gemini review on PR #188: inject toolName so streamReply's
-      // gate.outbound.allow + system.stream_finalize events attribute
-      // to 'reply' in the audit log (streamReply is a generic
-      // primitive; it doesn't know the calling tool's name).
-      journalWrite: async (input) => ctx.journalWrite({ ...input, toolName: 'reply' }),
-      sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-    },
-  )
+    )
+  } catch (streamErr) {
+    // streamReply re-throws on init failure (the journal-allow write or the
+    // initial postMessage threw before any chunk landed). Resolve the obligation
+    // terminal — best-effort, NOT auto-redelivered — then re-throw so the agent
+    // sees the real failure, exactly as before. Leaving it pending would risk a
+    // double-send (the agent may retry AND the poller would redeliver).
+    await durable?.markDead(streamErr instanceof Error ? streamErr.message : String(streamErr))
+    throw streamErr
+  }
+
+  // Resolve the stream-finalize obligation before any throw, so a
+  // gate_rejected_at_start marks dead (never auto-redelivered) rather than
+  // staying pending.
+  await resolveStreamObligation(durable, result)
+
   if (result.kind === 'gate_rejected_at_start') {
     // Unreachable in practice — assertOutboundAllowed already passed
     // in executeReply — but documented as the structured outcome.
