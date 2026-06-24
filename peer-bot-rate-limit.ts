@@ -124,10 +124,12 @@ function slidingWindowAllow(
   now: number,
   config: RateLimitConfig,
 ): boolean {
-  // Operator opt-out: { count: 0, windowMs: 0 } (or either zero) disables the
-  // limit for this call — always allow, record nothing. Single coherent
-  // semantic across the store + gate (per Gemini review on PR #182).
-  if (config.count === 0 || config.windowMs === 0) return true
+  // Operator opt-out: { count: 0, windowMs: 0 } disables the limit for this
+  // call — always allow, record nothing. `<= 0` (not `=== 0`) so a negative
+  // misconfiguration also disables rather than producing surprising behavior.
+  // Single coherent semantic across the store + gate (per Gemini reviews on
+  // PRs #182 and #246).
+  if (config.count <= 0 || config.windowMs <= 0) return true
 
   const arr = buckets.get(key) ?? []
   // Drop stale timestamps before evaluating. In-place filter, memory bounded.
@@ -142,9 +144,9 @@ function slidingWindowAllow(
 
   if (arr.length >= config.count) {
     // Over threshold — DO NOT append. The next call after enough old entries
-    // age out will succeed naturally.
-    if (arr.length === 0) buckets.delete(key)
-    else buckets.set(key, arr)
+    // age out will succeed naturally. `arr` is necessarily non-empty here
+    // (config.count >= 1 after the guard above, and arr.length >= config.count).
+    buckets.set(key, arr)
     return false
   }
 
