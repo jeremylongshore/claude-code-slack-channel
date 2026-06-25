@@ -420,10 +420,15 @@ and a best-effort scan dedup.**
 - **Dedup (best-effort, honest).** Before uploading, the send checks: (a) if the
   obligation already carries `uploadedFileId` and that file is still shared in the
   thread → skip (delivered); else (b) scan `conversations.replies` for a
-  file-share matching this upload by `(filename, size)` → if found, treat as
-  delivered and record its id. Only if neither matches does it upload, then record
-  the returned file id and mark `delivered`. Transient error → `pending` (poller
-  retries); non-retryable → `dead`.
+  file-share matching this upload by `(filename, size)` **shared at/after the
+  obligation's `createdAt`** → if found, treat as delivered and record its id. Only
+  if neither matches does it upload, then record the returned file id and mark
+  `delivered`. Transient error → `pending` (poller retries); non-retryable →
+  `dead`. **The `createdAt` delivery-window filter on (b) is load-bearing:** a
+  multi-turn thread can hold an OLDER file with the same name + size from a
+  previous turn, and matching it would falsely dedup and *drop* the new upload (a
+  loss, not a dup). The recorded-`uploadedFileId` match (a) is exact, so it is
+  NOT time-scoped.
 
 - **Residual (documented, narrow).** Because file shares carry no app metadata,
   the dedup is a `(filename, size)` scan. The un-deduped window is: the upload

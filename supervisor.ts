@@ -41,6 +41,7 @@ import type { DeliveryObligation, InFlightTurn, Session, SessionKey } from './li
 import {
   classifyDeliveryError,
   computeBackoffMs,
+  ExfilBlockedError,
   extractSlackErrorCode,
   listSessions,
   loadSession,
@@ -1245,7 +1246,14 @@ export function createSessionSupervisor(opts: SupervisorOptions): SessionSupervi
             attempts++
             const code = extractSlackErrorCode(err)
             lastError = code ?? errorMessage(err)
-            if (classifyDeliveryError(code) === 'non-retryable') {
+            // ccsc-o7x.5 — an exfil-guard block on a file (re)upload is permanent:
+            // the bytes won't pass on a retry, so dead-letter immediately rather
+            // than burn maxAttempts. ExfilBlockedError carries no Slack code, so
+            // classifyDeliveryError would otherwise treat it as retryable.
+            if (
+              err instanceof ExfilBlockedError ||
+              classifyDeliveryError(code) === 'non-retryable'
+            ) {
               finalState = 'dead'
               break
             }
