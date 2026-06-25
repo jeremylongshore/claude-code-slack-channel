@@ -585,6 +585,106 @@ export async function deliverFileReplyDurably(
   return { status: 'delivered', ts: firstTs, messagesSent, filesSent }
 }
 
+/** Pull the uploaded Slack file id out of a `filesUploadV2` response, tolerant of
+ *  the SDK's nested/loose shape. Returns `''` if none is extractable — callers
+ *  treat that as "no recorded id" and fall back to the `(filename, size)` scan. */
+function extractUploadedFileId(res: unknown): string {
+  const r = res as { files?: Array<{ id?: string; files?: Array<{ id?: string }> }> }
+  const first = r.files?.[0]
+  return first?.id ?? first?.files?.[0]?.id ?? ''
+}
+
+/** Build the production `FileUploadDeps` (ccsc-o7x.5 part 2) bound to a Slack
+ *  `WebClient` + the outbound exfil guards + injected fs reads. Kept here (not
+ *  `server.ts`) so it is unit-testable against a fake client — fs is INJECTED
+ *  (`readFile` / `fileSize`) so tests need no real files and this module stays
+ *  fs-free.
+ *
+ *  - `readAndGuard` reads the file ONCE via `readFile`, runs `assertSendable`
+ *    (path denylist) + `assertNoSecretValues` on the latin1 content AND the
+ *    filename, and returns the bytes. A guard hit journals `exfil.block` then
+ *    throws `ExfilBlockedError` (non-retryable everywhere). The returned buffer
+ *    is exactly what `upload` sends — no second read (TOCTOU-safe).
+ *  - `findUploaded` dedups: a recorded `uploadedFileId` still shared in the
+ *    thread, else a `(filename, size)` scan of `conversations.replies`. Returns
+ *    `null` (never `''`) on no match.
+ *  - `upload` sends the already-guarded bytes via `filesUploadV2` and returns the
+ *    new file id. */
+export function createFileSendDeps(deps: {
+  client: WebClient
+  assertSendable: (path: string) => void
+  assertNoSecretValues: (text: string) => void
+  journalExfilBlock: (reason: string) => void
+  readFile: (path: string) => Uint8Array
+  fileSize: (path: string) => number
+}): FileUploadDeps {
+  const blocked = (err: unknown): never => {
+    const reason = err instanceof Error ? err.message : String(err)
+    deps.journalExfilBlock(reason)
+    throw new ExfilBlockedError(reason)
+  }
+  return {
+    async readAndGuard(upload): Promise<Uint8Array> {
+      try {
+        deps.assertSendable(upload.path)
+      } catch (err) {
+        blocked(err)
+      }
+      // One read — its bytes are guarded AND sent (no second read).
+      const bytes = deps.readFile(upload.path)
+      // latin1 maps every byte 1:1 to a char, so no decode can split/drop a token.
+      try {
+        deps.assertNoSecretValues(Buffer.from(bytes).toString('latin1'))
+        deps.assertNoSecretValues(upload.filename)
+      } catch (err) {
+        blocked(err)
+      }
+      return bytes
+    },
+    async findUploaded(obligation): Promise<string | null> {
+      if (obligation.upload === undefined || !obligation.thread) return null
+      const { filename, path } = obligation.upload
+      const recordedId = obligation.uploadedFileId
+      let size = -1
+      try {
+        size = deps.fileSize(path)
+      } catch {
+        size = -1
+      }
+      const res = await deps.client.conversations.replies({
+        channel: obligation.channel,
+        ts: obligation.thread,
+        limit: 200,
+      })
+      const messages = (res.messages ?? []) as Array<{
+        files?: Array<{ id?: string; name?: string; size?: number }>
+      }>
+      for (const m of messages) {
+        for (const f of m.files ?? []) {
+          if (recordedId && f.id === recordedId) return f.id ?? 'delivered'
+          if (size >= 0 && f.name === filename && f.size === size) return f.id ?? 'delivered'
+        }
+      }
+      return null
+    },
+    async upload(obligation, bytes): Promise<string> {
+      if (obligation.upload === undefined) {
+        throw new Error('createFileSendDeps.upload: obligation has no upload descriptor')
+      }
+      const res = await deps.client.filesUploadV2({
+        channel_id: obligation.channel,
+        file: Buffer.from(bytes),
+        filename: obligation.upload.filename,
+        ...(obligation.thread ? { thread_ts: obligation.thread } : {}),
+        ...(obligation.upload.comment ? { initial_comment: obligation.upload.comment } : {}),
+        // filesUploadV2's argument type is a strict union (channel-vs-thread
+        // destination); the reply tool casts the same way (executeReplyFileUploads).
+      } as Parameters<typeof deps.client.filesUploadV2>[0])
+      return extractUploadedFileId(res)
+    },
+  }
+}
+
 /** Best-effort fenced patch of one obligation's state. Never throws: a fenced /
  *  save failure leaves the obligation as-is for the poller to reconcile (see
  *  `deliverReplyDurably`). */

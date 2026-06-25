@@ -83,6 +83,7 @@ import {
 import {
   beginDurableStream,
   createDeliverySendDeps,
+  createFileSendDeps,
   createReplyPoster,
   DurableUnavailableError,
   deliverChunkedReplyDurably,
@@ -7212,6 +7213,172 @@ describe('createDeliverySendDeps — Slack adapter (ccsc-o7x.3)', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Slack file adapter — createFileSendDeps (ccsc-o7x.5 part 2). read-once
+// readAndGuard (exfil guard on the bytes that will be sent), (filename,size)
+// dedup scan, filesUploadV2 upload. The production FileUploadDeps consumed by the
+// inline path AND the poller.
+// ---------------------------------------------------------------------------
+
+describe('createFileSendDeps — Slack file adapter (ccsc-o7x.5)', () => {
+  const fileOb = {
+    id: 'r-1:file:0',
+    channel: 'C1',
+    thread: 'T1',
+    payload: '',
+    attempts: 0,
+    state: 'pending' as const,
+    createdAt: 1,
+    upload: { path: '/inbox/a.png', filename: 'a.png' },
+  }
+
+  function makeDeps(
+    opts: {
+      threadFiles?: Array<{ id?: string; name?: string; size?: number }>
+      uploadResult?: unknown
+      sendableErr?: Error
+      contentErr?: Error
+      filenameErr?: Error
+      readBytes?: Uint8Array
+      size?: number
+      sizeThrows?: boolean
+    } = {},
+  ) {
+    const journaled: string[] = []
+    const uploadCalls: Array<Record<string, unknown>> = []
+    const repliesCalls: Array<Record<string, unknown>> = []
+    const client = {
+      conversations: {
+        replies: async (args: Record<string, unknown>) => {
+          repliesCalls.push(args)
+          return { messages: [{ files: opts.threadFiles ?? [] }] }
+        },
+      },
+      filesUploadV2: async (args: Record<string, unknown>) => {
+        uploadCalls.push(args)
+        return opts.uploadResult ?? { files: [{ id: 'F-new' }] }
+      },
+    }
+    const deps = createFileSendDeps({
+      client: client as unknown as Parameters<typeof createFileSendDeps>[0]['client'],
+      assertSendable: () => {
+        if (opts.sendableErr) throw opts.sendableErr
+      },
+      // The guard is called on the latin1 content first, then the filename — tell
+      // them apart by the argument so a test can target either.
+      assertNoSecretValues: (t) => {
+        if (t === fileOb.upload.filename) {
+          if (opts.filenameErr) throw opts.filenameErr
+        } else if (opts.contentErr) {
+          throw opts.contentErr
+        }
+      },
+      journalExfilBlock: (reason) => journaled.push(reason),
+      readFile: () => opts.readBytes ?? new Uint8Array([1, 2, 3]),
+      fileSize: () => {
+        if (opts.sizeThrows) throw new Error('ENOENT')
+        return opts.size ?? 3
+      },
+    })
+    return { deps, journaled, uploadCalls, repliesCalls }
+  }
+
+  test('readAndGuard reads once, runs guards, returns the bytes', async () => {
+    const { deps } = makeDeps({ readBytes: new Uint8Array([9, 9]) })
+    expect(
+      Array.from(await deps.readAndGuard({ path: '/inbox/a.png', filename: 'a.png' })),
+    ).toEqual([9, 9])
+  })
+
+  test('readAndGuard: assertSendable block → journals exfil.block + throws ExfilBlockedError', async () => {
+    const { deps, journaled } = makeDeps({ sendableErr: new Error('state-dir denied') })
+    await expect(
+      deps.readAndGuard({ path: '/state/access.json', filename: 'access.json' }),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(journaled).toEqual(['state-dir denied'])
+  })
+
+  test('readAndGuard: secret in content → ExfilBlockedError + journaled', async () => {
+    const { deps, journaled } = makeDeps({ contentErr: new Error('secret value in payload') })
+    await expect(
+      deps.readAndGuard({ path: '/inbox/a.png', filename: 'a.png' }),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(journaled).toEqual(['secret value in payload'])
+  })
+
+  test('readAndGuard: secret in filename → ExfilBlockedError + journaled', async () => {
+    const { deps, journaled } = makeDeps({ filenameErr: new Error('secret in filename') })
+    await expect(
+      deps.readAndGuard({ path: '/inbox/a.png', filename: 'a.png' }),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(journaled).toEqual(['secret in filename'])
+  })
+
+  test('findUploaded: recorded uploadedFileId still shared in thread → returns it', async () => {
+    const { deps } = makeDeps({ threadFiles: [{ id: 'F-prev', name: 'x', size: 1 }] })
+    expect(await deps.findUploaded({ ...fileOb, uploadedFileId: 'F-prev' })).toBe('F-prev')
+  })
+
+  test('findUploaded: (filename, size) scan match → returns the file id', async () => {
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-match', name: 'a.png', size: 3 }],
+      size: 3,
+    })
+    expect(await deps.findUploaded(fileOb)).toBe('F-match')
+  })
+
+  test('findUploaded: no match → null', async () => {
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-other', name: 'b.png', size: 99 }],
+      size: 3,
+    })
+    expect(await deps.findUploaded(fileOb)).toBeNull()
+  })
+
+  test('findUploaded: no thread → null without an API call', async () => {
+    const { deps, repliesCalls } = makeDeps({})
+    expect(await deps.findUploaded({ ...fileOb, thread: '' })).toBeNull()
+    expect(repliesCalls).toHaveLength(0)
+  })
+
+  test('findUploaded: a fileSize error degrades to no (filename,size) match', async () => {
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F', name: 'a.png', size: 3 }],
+      sizeThrows: true,
+    })
+    expect(await deps.findUploaded(fileOb)).toBeNull()
+  })
+
+  test('upload sends the guarded bytes via filesUploadV2 and returns the new file id', async () => {
+    const { deps, uploadCalls } = makeDeps({})
+    const id = await deps.upload(
+      { ...fileOb, upload: { path: '/inbox/a.png', filename: 'a.png', comment: 'see attached' } },
+      new Uint8Array([7, 7]),
+    )
+    expect(id).toBe('F-new')
+    expect(uploadCalls[0]).toMatchObject({
+      channel_id: 'C1',
+      filename: 'a.png',
+      thread_ts: 'T1',
+      initial_comment: 'see attached',
+    })
+  })
+
+  test('upload extracts a nested file id shape, and tolerates none (empty string)', async () => {
+    const nested = makeDeps({ uploadResult: { files: [{ files: [{ id: 'F-nested' }] }] } })
+    expect(await nested.deps.upload(fileOb, new Uint8Array([1]))).toBe('F-nested')
+    const none = makeDeps({ uploadResult: { files: [{}] } })
+    expect(await none.deps.upload(fileOb, new Uint8Array([1]))).toBe('')
+  })
+
+  test('upload throws when the obligation has no upload descriptor', async () => {
+    const { deps } = makeDeps({})
+    await expect(
+      deps.upload({ ...fileOb, upload: undefined }, new Uint8Array([1])),
+    ).rejects.toThrow(/no upload descriptor/)
+  })
+})
+
 describe('outbox poller × Slack adapter end-to-end (ccsc-o7x.3)', () => {
   let rawRoot: string
   let tmpRoot: string
@@ -7262,6 +7429,36 @@ describe('outbox poller × Slack adapter end-to-end (ccsc-o7x.3)', () => {
     })
     const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
     expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+
+  test('drainOutbox dead-letters an ExfilBlockedError on the FIRST failure (no retry to maxAttempts)', async () => {
+    // ccsc-o7x.5 — a file (re)upload that fails the exfil guard is permanent: the
+    // poller must dead-letter immediately, not burn maxAttempts retrying bytes
+    // that will never pass.
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'x-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'x',
+    })
+
+    const sup = makeSupervisor()
+    let attempts = 0
+    const report = await sup.drainOutbox(async () => {
+      attempts++
+      throw new ExfilBlockedError('secret value in payload')
+    })
+
+    expect(report.deadLettered).toEqual([{ id: 'x-1', error: 'secret value in payload' }])
+    expect(attempts).toBe(1) // dead-lettered on the first failure, NOT retried
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      state: 'dead',
+      attempts: 1,
+      lastError: 'secret value in payload',
+    })
   })
 
   test('ack-loss recovery: a pending obligation whose post already landed is deduped, not re-posted', async () => {

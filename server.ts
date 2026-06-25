@@ -36,6 +36,7 @@ import {
   buildSecretPlaceholderMap,
   buildSecretValueSet,
   chunkText,
+  type DeliveryObligation,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -99,11 +100,14 @@ import {
 import {
   beginDurableStream,
   createDeliverySendDeps,
+  createFileSendDeps,
   createReplyPoster,
   type DurableStreamHandle,
   DurableUnavailableError,
   deliverChunkedReplyDurably,
+  deliverFileReplyDurably,
   deliverReplyDurably,
+  sendFileObligation,
 } from './slack-delivery.ts'
 import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 
@@ -1401,6 +1405,73 @@ async function executeReplyChunkedDurablePath(opts: {
   }
 }
 
+/** ccsc-o7x.5 — durable path for a reply WITH file attachments. Records the text
+ *  chunks + one obligation per file and delivers them in order via
+ *  `deliverFileReplyDurably`; each file uploads through `createFileSendDeps`,
+ *  which re-runs the outbound exfil guard on the file's bytes before every
+ *  (re)upload and dedups by `(filename, size)` thread scan. A transient failure
+ *  queues the tail for the poller; an `ExfilBlockedError` (a file failed the
+ *  guard) marks that file dead and propagates to the agent — exactly as the
+ *  best-effort path surfaced a block. Throws `DurableUnavailableError` (before any
+ *  record/send) when the session can't go durable — the caller falls back to the
+ *  best-effort direct path. Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyFileDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  chunks: string[]
+  files: string[]
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, chunks, files, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const fileDeps = createFileSendDeps({
+    client: ctx.web,
+    assertSendable: ctx.assertSendable,
+    assertNoSecretValues: ctx.assertNoSecretValues,
+    journalExfilBlock: (reason) =>
+      ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName: 'reply', reason }),
+    readFile: (p) => readFileSync(resolve(p)),
+    fileSize: (p) => statSync(resolve(p)).size,
+  })
+
+  // Drop empty chunks so a files-only reply (empty text) uploads files without an
+  // empty Slack message; each path resolves to a basename for the upload filename.
+  const textChunks = chunks.filter((c) => c.length > 0)
+  const fileDescriptors = files.map((p) => ({ path: p, filename: basename(resolve(p)) }))
+
+  const result = await deliverFileReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web), files: fileDeps },
+    {
+      id: randomUUID(),
+      channel: chatId,
+      thread: threadTs,
+      chunks: textChunks,
+      files: fileDescriptors,
+    },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent ${result.messagesSent} message(s) + ${result.filesSent} file(s) to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  const total = result.delivered + result.pending
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent ${result.delivered} of ${total} item(s) to ${chatId}; ${result.pending} queued for delivery (transient Slack error; the poller retries the rest in order)`,
+      },
+    ],
+  }
+}
+
 async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const text: string = args.text
@@ -1447,18 +1518,25 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     input: { channel: chatId, thread_ts: threadTs },
   })
 
-  // ccsc-o7x.3/.4 — durable reply path (ADR-002 addendum, Option A). Applies to
-  // any non-streaming, file-free reply in a thread while the supervisor is up:
-  // the reply is recorded as durable obligation(s) so a transient Slack failure
-  // or a crash is retried by the delivery poller instead of lost. One chunk → the
-  // single-message path (ccsc-o7x.3); N chunks → the chunked path (ccsc-o7x.4),
-  // one obligation per chunk delivered in order. Falls back to the best-effort
-  // direct send below if the session can't go durable (DurableUnavailableError).
-  // File / streaming replies are still NOT routed here (ccsc-o7x.5/.6).
+  // ccsc-o7x.3/.4/.5 — durable reply path (ADR-002 addendum, Option A). Applies to
+  // any non-streaming reply in a thread while the supervisor is up: the reply is
+  // recorded as durable obligation(s) so a transient Slack failure or a crash is
+  // retried by the delivery poller instead of lost. One text chunk → the
+  // single-message path (ccsc-o7x.3); N chunks → the chunked path (ccsc-o7x.4);
+  // a reply WITH files → the file path (ccsc-o7x.5), which records the text chunks
+  // + one obligation per file and uploads each with the exfil guard re-run on the
+  // bytes. Falls back to the best-effort direct send below if the session can't go
+  // durable (DurableUnavailableError). Streaming replies are handled above
+  // (ccsc-o7x.6). An ExfilBlockedError from the file path propagates to the agent
+  // (a blocked file surfaces, exactly as the best-effort path did).
   const chunks = chunkText(text, limit, mode)
+  const hasFiles = files !== undefined && files.length > 0
 
-  if (!stream && (!files || files.length === 0) && threadTs !== undefined && supervisor !== null) {
+  if (!stream && threadTs !== undefined && supervisor !== null) {
     try {
+      if (hasFiles) {
+        return await executeReplyFileDurablePath({ chatId, threadTs, chunks, files, ctx })
+      }
       return chunks.length <= 1
         ? await executeReplyDurablePath({ chatId, threadTs, text, ctx })
         : await executeReplyChunkedDurablePath({ chatId, threadTs, chunks, ctx })
@@ -3668,9 +3746,27 @@ async function main(): Promise<void> {
   // idempotent (lib.ts `makeIdempotentSend` over the Slack adapter), so a
   // redelivery after a lost ack never double-posts.
   const idempotentSend = makeIdempotentSend(createDeliverySendDeps(web))
+  // ccsc-o7x.5 — file obligations upload via filesUploadV2 with the outbound exfil
+  // guard re-run on the bytes (a file's content can change between record and
+  // redelivery); text obligations post via the idempotent text send. The guard
+  // uses the same module-level assertSendable / assertNoSecretValues the reply
+  // tool uses, and journals exfil.block on a block.
+  const fileSendDeps = createFileSendDeps({
+    client: web,
+    assertSendable,
+    assertNoSecretValues,
+    journalExfilBlock: (reason) =>
+      journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName: 'reply', reason }),
+    readFile: (p) => readFileSync(resolve(p)),
+    fileSize: (p) => statSync(resolve(p)).size,
+  })
+  const outboxSend = (ob: DeliveryObligation): Promise<void> =>
+    ob.upload !== undefined
+      ? sendFileObligation(fileSendDeps, ob).then(() => undefined)
+      : idempotentSend(ob)
   const drainOutboxOnce = (): void => {
     void supervisor!
-      .drainOutbox(idempotentSend)
+      .drainOutbox(outboxSend)
       .then((report) => {
         if (report.deadLettered.length > 0) {
           console.error('[slack] outbox: dead-lettered obligations', report.deadLettered)
