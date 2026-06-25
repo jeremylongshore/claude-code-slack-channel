@@ -40,6 +40,7 @@ import {
   deliveryIdempotencyKey,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
+  ExfilBlockedError,
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
@@ -87,7 +88,6 @@ import {
   deliverChunkedReplyDurably,
   deliverFileReplyDurably,
   deliverReplyDurably,
-  ExfilBlockedError,
   type FileUploadDeps,
   type ReplyPoster,
   sendFileObligation,
@@ -7720,9 +7720,10 @@ describe('sendFileObligation (ccsc-o7x.5)', () => {
   function makeFileDeps(opts: { found?: string | null; uploadId?: string; guardErr?: Error }) {
     const calls: string[] = []
     const deps: FileUploadDeps = {
-      guard: (u) => {
-        calls.push(`guard:${u.filename}`)
+      readAndGuard: async (u) => {
+        calls.push(`readAndGuard:${u.filename}`)
         if (opts.guardErr) throw opts.guardErr
+        return new Uint8Array([1, 2, 3])
       },
       findUploaded: async () => {
         calls.push('findUploaded')
@@ -7758,8 +7759,9 @@ describe('sendFileObligation (ccsc-o7x.5)', () => {
     const { deps, calls } = makeFileDeps({ found: null, uploadId: 'F-new' })
     const id = await sendFileObligation(deps, fileOb)
     expect(id).toBe('F-new')
-    // Order proves the guard ran before the upload (re-validate, then send).
-    expect(calls).toEqual(['findUploaded', 'guard:a.png', 'upload'])
+    // Order proves read+guard ran before the upload (re-validate, then send the
+    // same bytes).
+    expect(calls).toEqual(['findUploaded', 'readAndGuard:a.png', 'upload'])
   })
 
   test('guard block: throws ExfilBlockedError and NEVER uploads', async () => {
@@ -7768,7 +7770,7 @@ describe('sendFileObligation (ccsc-o7x.5)', () => {
       guardErr: new ExfilBlockedError('secret in file'),
     })
     await expect(sendFileObligation(deps, fileOb)).rejects.toBeInstanceOf(ExfilBlockedError)
-    expect(calls).toEqual(['findUploaded', 'guard:a.png']) // upload never reached
+    expect(calls).toEqual(['findUploaded', 'readAndGuard:a.png']) // upload never reached
   })
 
   test('throws when the obligation has no upload descriptor', async () => {
@@ -7823,8 +7825,9 @@ describe('deliverFileReplyDurably (ccsc-o7x.5)', () => {
     const uploads: string[] = []
     let n = 0
     const deps: FileUploadDeps = {
-      guard: () => {
+      readAndGuard: async () => {
         if (opts.guardErr) throw opts.guardErr
+        return new Uint8Array([1, 2, 3])
       },
       findUploaded: async () => opts.found ?? null,
       upload: async (ob) => {

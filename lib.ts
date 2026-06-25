@@ -352,6 +352,21 @@ export function extractSlackErrorCode(err: unknown): string | undefined {
   return undefined
 }
 
+/** Thrown when an outbound file fails the exfil guard (`assertSendable` denylist,
+ *  or a secret value in the content/filename) — ccsc-o7x.5. Lives in the kernel
+ *  (not `slack-delivery.ts`) so BOTH the inline durable file path AND the delivery
+ *  poller (`supervisor.ts` `drainOutbox`) can classify it as **non-retryable**
+ *  without a slack-delivery↔supervisor import cycle: a blocked file is marked
+ *  `dead`, never uploaded, never retried (its bytes won't pass on a retry, and
+ *  the agent must see the block). The guard impl journals `exfil.block` before
+ *  throwing this. */
+export class ExfilBlockedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ExfilBlockedError'
+  }
+}
+
 /** Tunables for `computeBackoffMs`. */
 export interface BackoffOptions {
   /** Delay before the first retry, in ms. Default 250. */

@@ -28,6 +28,7 @@ import {
   DELIVERY_METADATA_EVENT_TYPE,
   type DeliveryObligation,
   deliveryIdempotencyKey,
+  ExfilBlockedError,
   extractSlackErrorCode,
   type IdempotentSendDeps,
 } from './lib.ts'
@@ -414,48 +415,44 @@ export async function beginDurableStream(
 // Durable file-upload reply delivery (ccsc-o7x.5 — ADR-002 addendum)
 // ---------------------------------------------------------------------------
 
-/** Thrown by `FileUploadDeps.guard` when an outbound file fails the exfil guard
- *  (`assertSendable` denylist, or a secret value in the content/filename). The
- *  durable file loop treats it as **non-retryable** — a blocked file is marked
- *  `dead`, never uploaded, never retried (its bytes won't pass on a retry either,
- *  and the agent must see the block). The guard impl journals `exfil.block`
- *  before throwing this. */
-export class ExfilBlockedError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'ExfilBlockedError'
-  }
-}
-
 /** Injected Slack + guard I/O for durable file uploads (ccsc-o7x.5). Kept as an
- *  interface so `slack-delivery.ts` imports no Slack SDK and the guard/upload
+ *  interface so `slack-delivery.ts` imports no Slack SDK and the read/guard/upload
  *  wiring lives in `server.ts`. Consumed by BOTH the inline path and the poller,
- *  so a file's exfil guards re-run on every (re)upload. */
+ *  so a file's exfil guards re-run on every (re)upload.
+ *
+ *  **Read-once contract (closes a TOCTOU gap).** `readAndGuard` reads the file
+ *  ONCE, runs the exfil guards on those exact bytes, and RETURNS them; `upload`
+ *  sends that same buffer and never re-reads the path. So the bytes guarded are
+ *  provably the bytes sent — a file that changes on disk a microsecond after the
+ *  guard cannot slip past it for that delivery. (`ExfilBlockedError` lives in
+ *  `lib.ts` so the poller can classify it too.) */
 export interface FileUploadDeps {
-  /** Re-run the outbound file exfil guards on the bytes that will ACTUALLY be
-   *  sent — `assertSendable(path)` + secret-value scan of content + filename.
-   *  THROWS `ExfilBlockedError` on a block (the impl journals `exfil.block`
-   *  first). MUST run before every upload: a file's bytes can change between
-   *  record-time and redelivery-time, so a record-time check is insufficient. */
-  guard(upload: { path: string; filename: string }): void
+  /** Read `upload.path` ONCE, run the outbound file exfil guards on those bytes —
+   *  `assertSendable(path)` + secret-value scan of content + filename — and
+   *  return the bytes. THROWS `ExfilBlockedError` on a block (the impl journals
+   *  `exfil.block` first). The returned buffer is exactly what `upload` sends. */
+  readAndGuard(upload: { path: string; filename: string }): Promise<Uint8Array>
   /** Dedup: the Slack file id if this upload already landed in the thread — a
    *  recorded `uploadedFileId` still shared there, or a `(filename, size)` scan
    *  match — else `null`. File shares carry no app metadata, so this is a thread
    *  scan, not a metadata key. */
   findUploaded(obligation: DeliveryObligation): Promise<string | null>
-  /** Upload `obligation.upload` via `filesUploadV2`; resolve the Slack file id.
-   *  Throws on Slack failure (the caller classifies for retry / dead-letter). */
-  upload(obligation: DeliveryObligation): Promise<string>
+  /** Upload the ALREADY-READ, ALREADY-GUARDED `bytes` for `obligation.upload` via
+   *  `filesUploadV2`; resolve the Slack file id. Never re-reads the path — the
+   *  guarded bytes are sent verbatim. Throws on Slack failure (the caller
+   *  classifies for retry / dead-letter). */
+  upload(obligation: DeliveryObligation, bytes: Uint8Array): Promise<string>
 }
 
-/** Idempotent, guarded durable file upload (ccsc-o7x.5). Order is **dedup → guard
- *  → upload**: skip if already delivered, otherwise re-validate the exact bytes
- *  that will be sent, then upload. Returns the Slack file id (existing on a dedup
- *  hit, fresh otherwise). The guard runs on every call that reaches the upload —
- *  inline AND poller — so a file whose content changed to a secret since
- *  record-time is blocked at redelivery, not merely at record-time. Throws
- *  `ExfilBlockedError` on a guard block and the Slack error on an upload failure;
- *  the caller marks the obligation accordingly. */
+/** Idempotent, guarded durable file upload (ccsc-o7x.5). Order is **dedup →
+ *  read+guard → upload**: skip if already delivered, otherwise read the file once
+ *  and re-validate those exact bytes, then upload the SAME bytes. Returns the
+ *  Slack file id (existing on a dedup hit, fresh otherwise). The read+guard runs
+ *  on every call that reaches the upload — inline AND poller — so a file whose
+ *  content changed to a secret since record-time is blocked at redelivery, not
+ *  merely at record-time, and the guarded bytes are provably the sent bytes (no
+ *  second read). Throws `ExfilBlockedError` on a guard block and the Slack error
+ *  on an upload failure; the caller marks the obligation accordingly. */
 export async function sendFileObligation(
   deps: FileUploadDeps,
   obligation: DeliveryObligation,
@@ -465,9 +462,12 @@ export async function sendFileObligation(
   }
   const existing = await deps.findUploaded(obligation)
   if (existing) return existing
-  // Re-validate the bytes that will be sent BEFORE the upload — every time.
-  deps.guard({ path: obligation.upload.path, filename: obligation.upload.filename })
-  return deps.upload(obligation)
+  // Read once + re-validate the exact bytes that will be sent, then send THEM.
+  const bytes = await deps.readAndGuard({
+    path: obligation.upload.path,
+    filename: obligation.upload.filename,
+  })
+  return deps.upload(obligation, bytes)
 }
 
 /** One logical reply with file attachments (ccsc-o7x.5). `chunks` is the
