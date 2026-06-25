@@ -7235,6 +7235,7 @@ describe('createFileSendDeps — Slack file adapter (ccsc-o7x.5)', () => {
   function makeDeps(
     opts: {
       threadFiles?: Array<{ id?: string; name?: string; size?: number }>
+      threadTs?: string
       uploadResult?: unknown
       sendableErr?: Error
       contentErr?: Error
@@ -7251,7 +7252,11 @@ describe('createFileSendDeps — Slack file adapter (ccsc-o7x.5)', () => {
       conversations: {
         replies: async (args: Record<string, unknown>) => {
           repliesCalls.push(args)
-          return { messages: [{ files: opts.threadFiles ?? [] }] }
+          // ts default is well after fileOb.createdAt (1) so the (filename,size)
+          // scan's delivery-window filter passes unless a test overrides it.
+          return {
+            messages: [{ ts: opts.threadTs ?? '1700000000.000200', files: opts.threadFiles ?? [] }],
+          }
         },
       },
       filesUploadV2: async (args: Record<string, unknown>) => {
@@ -7314,17 +7319,41 @@ describe('createFileSendDeps — Slack file adapter (ccsc-o7x.5)', () => {
     expect(journaled).toEqual(['secret in filename'])
   })
 
-  test('findUploaded: recorded uploadedFileId still shared in thread → returns it', async () => {
-    const { deps } = makeDeps({ threadFiles: [{ id: 'F-prev', name: 'x', size: 1 }] })
-    expect(await deps.findUploaded({ ...fileOb, uploadedFileId: 'F-prev' })).toBe('F-prev')
+  test('findUploaded: recorded uploadedFileId match is exact and NOT time-scoped', async () => {
+    // Even a file shared BEFORE the obligation's createdAt matches by recorded id
+    // (the id is definitive proof this obligation already uploaded).
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-prev', name: 'x', size: 1 }],
+      threadTs: '1700000000.400',
+    })
+    expect(
+      await deps.findUploaded({
+        ...fileOb,
+        uploadedFileId: 'F-prev',
+        createdAt: 1_700_000_000_500,
+      }),
+    ).toBe('F-prev')
   })
 
-  test('findUploaded: (filename, size) scan match → returns the file id', async () => {
+  test('findUploaded: (filename, size) scan match within the delivery window → returns the file id', async () => {
     const { deps } = makeDeps({
       threadFiles: [{ id: 'F-match', name: 'a.png', size: 3 }],
       size: 3,
     })
     expect(await deps.findUploaded(fileOb)).toBe('F-match')
+  })
+
+  test('findUploaded: a STALE older file (same name+size, shared before createdAt) is NOT matched — no false dedup/drop', async () => {
+    // The thread holds an older file with the SAME name + size from a previous
+    // turn; without the delivery-window filter this would falsely dedup and DROP
+    // the new upload (the loss bug). The message ts is before the obligation's
+    // createdAt, so it must not match.
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-stale', name: 'a.png', size: 3 }],
+      threadTs: '1700000000.400',
+      size: 3,
+    })
+    expect(await deps.findUploaded({ ...fileOb, createdAt: 1_700_000_000_500 })).toBeNull()
   })
 
   test('findUploaded: no match → null', async () => {

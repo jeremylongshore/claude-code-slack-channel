@@ -657,12 +657,23 @@ export function createFileSendDeps(deps: {
         limit: 200,
       })
       const messages = (res.messages ?? []) as Array<{
+        ts?: string
         files?: Array<{ id?: string; name?: string; size?: number }>
       }>
       for (const m of messages) {
+        // Only a file shared as part of THIS obligation's delivery window counts
+        // for the (filename, size) scan: a multi-turn thread can hold an OLDER
+        // file with the same name + size, and matching it would falsely dedup and
+        // DROP this upload (a loss, not a dup). Slack `ts` is epoch seconds; the
+        // obligation's `createdAt` is epoch ms. The recorded-id match is exact, so
+        // it is NOT time-scoped.
+        const msgMs = m.ts ? Math.round(Number.parseFloat(m.ts) * 1000) : 0
+        const fromThisDelivery = msgMs >= obligation.createdAt
         for (const f of m.files ?? []) {
           if (recordedId && f.id === recordedId) return f.id ?? 'delivered'
-          if (size >= 0 && f.name === filename && f.size === size) return f.id ?? 'delivered'
+          if (fromThisDelivery && size >= 0 && f.name === filename && f.size === size) {
+            return f.id ?? 'delivered'
+          }
         }
       }
       return null
