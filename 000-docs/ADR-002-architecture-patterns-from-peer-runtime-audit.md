@@ -305,6 +305,153 @@ can't be idempotently replayed (needs a stream-finalize obligation). Until then
 those two keep best-effort behavior and do not enqueue — zero double-send risk,
 same as before.
 
+## Addendum (2026-06-24): streaming replies made durable (ccsc-o7x.6)
+
+The second deferred rich path. A streaming reply (`stream:true`, text over the
+chunk limit) posts an initial message and grows it via `chat.update`
+(`stream-reply.ts`). The `ccsc-o7x.3` addendum deferred it because "a stream
+can't be idempotently replayed" — you cannot re-run a progressive `chat.update`
+sequence after a crash and land in the same place.
+
+**Decision — a stream-finalize obligation carrying the full text.** Before the
+stream starts, record ONE `pending` `DeliveryObligation` whose `payload` is the
+**complete** reply text (not a chunk). The obligation is a *crash safety-net for
+the whole stream*, not a per-chunk record:
+
+- **`completed`** → mark the obligation `delivered`. The streamed message already
+  holds the full content; nothing is owed.
+- **clean mid-stream failure** (`failed_mid_stream`, or a thrown init error) →
+  mark the obligation **`dead`**, NOT pending. This is the load-bearing safety
+  rule: the delivery poller's `send` does **not** re-run `assertOutboundAllowed`
+  (it is a pure redelivery path), and `streamReply`'s single mid-stream catch
+  cannot distinguish a gate rejection (channel removed mid-stream) from a
+  transient Slack error. Leaving the obligation `pending` would let the poller
+  redeliver the full text to a channel the outbound gate just rejected — a gate
+  bypass. So an *in-process* stream failure resolves terminal (`dead`, with the
+  reason recorded) and is never auto-redelivered; the partial message that landed
+  is the same best-effort outcome as before.
+- **process crash mid-stream** (no result at all — the process dies) → the
+  obligation stays `pending`, and the boot-time drain / poller redelivers the
+  **full text as a fresh `chat.postMessage`**. The partial streamed message is
+  orphaned; the user gets the complete message after restart. This is exactly the
+  bead's wording: "a crash mid-stream redelivers the final message."
+
+**Why no kernel or poller change.** The full-text obligation is an ordinary
+single-message `DeliveryObligation` (`payload` = full text). The existing poller
+posts `payload` via `chat.postMessage` — precisely the redelivery we want — and
+the idempotency key (`ccsc-o7x.2.3`) dedups *poller-side* re-attempts of that
+obligation. `lib.ts` (the AGP-vendored kernel) and `drainOutbox` are untouched.
+
+**Residual (documented, narrow).** The streamed message itself is posted by
+`stream-reply.ts` without our delivery `metadata` stamp, so `findDelivered`
+cannot recognise it. Therefore the one un-deduped duplicate is the
+**completed-but-crashed-before-marking-`delivered`** window: the full stream
+landed, the process died in the microtask before the `delivered` mark, so the
+poller redelivers a second full copy. The mark is written immediately on
+`completed` to keep the window minimal. This mirrors the pre-idempotency-key
+residual of the text path (`ccsc-o7x.2.3`) and is the accepted cost of "a stream
+can't be idempotently replayed."
+
+A second, narrower edge: the redelivery posts the full text as ONE
+`chat.postMessage`. A reply whose full text exceeds Slack's 40k single-message
+limit would redeliver as `msg_too_long` and **dead-letter** (recorded, not
+silent) — but such a reply could not have streamed cleanly in the first place
+(`chat.update` shares the same 40k limit, so it would have hit
+`failed_mid_stream` → `dead` before completing). The only way to reach it is a
+process crash before the stream organically hit that wall. Chunking the
+finalize obligation (as `ccsc-o7x.4` does for chunked replies) would close it;
+deferred as not worth the complexity for that window.
+
+**Scope still deferred:** file uploads (`ccsc-o7x.5`) — separate uploads that
+need an additive `files` field on the obligation, a poller send-adapter that
+branches to `filesUploadV2`, and an upload-dedup token (a `filesUploadV2`
+message-share does not carry our `chat.postMessage` metadata). Its own addendum
+and PR.
+
+## Addendum (2026-06-24): file-upload replies made durable (ccsc-o7x.5)
+
+The last deferred rich path, completing the crash-safety epic. A reply with
+`files` uploads each file via `filesUploadV2` (a separate Slack upload, not a
+`chat.postMessage`). `ccsc-o7x.3` deferred it because files "are separate uploads
+[that] need an upload-dedup token."
+
+Two facts shape the design, and the first is a hard ceiling:
+
+1. **A Slack file-share message cannot carry app `metadata`.** The text path's
+   exact-once dedup (`ccsc-o7x.2.3`) works because `chat.postMessage` stamps a
+   `metadata.event_payload.idempotency_key` that `findDelivered` scans for.
+   `files.completeUploadExternal` / `filesUploadV2` has no such field. So
+   **true metadata-keyed exact-once is not achievable for file uploads** — the
+   dedup must be a thread *scan*, which is necessarily heuristic.
+2. **The file's bytes can change between record-time and redelivery-time.** A path
+   recorded in an obligation, re-uploaded minutes later by the poller, may now
+   hold different — possibly secret — content. So a record-time exfil check is
+   *insufficient*; the guard must run at **every** upload.
+
+**Decision — a file-upload obligation with an exfil-guard-at-redelivery contract
+and a best-effort scan dedup.**
+
+- **Obligation shape (additive to `lib.ts` `DeliveryObligation`).** Two new
+  optional fields: `upload?: { path: string; filename: string; comment?: string }`
+  marks the obligation as a file upload (when present, `payload` is unused and the
+  send branches to `filesUploadV2` instead of `chat.postMessage`); and
+  `uploadedFileId?: string` is recorded *after* a successful upload to dedup a
+  later redelivery. Both additive + optional, so existing session files and the
+  text/chunked paths are unchanged. (AGP impact: **none** — the reply-delivery
+  outbox is not part of AGP's reimplemented subset; verified against
+  `agent-governance-plane/substrate/UPSTREAM.md`. The change still needs CCSC
+  mutation tests — `lib.ts` is in the Stryker mutate set.)
+
+- **One obligation per file**, id `<replyId>:file:<i>`; the accompanying text (if
+  any) rides the existing text/chunked obligations (`<replyId>:<i>`). All are
+  recorded atomically before any send (`recordTerminalDeliveries`), text first
+  then files, so the poller drains them in order (text lands before its files).
+
+- **Exfil-guard-at-redelivery (the security crux).** The durable file send — inline
+  *and* in the poller — re-runs the full outbound file guard before *every*
+  upload: `assertSendable(path)` (state-dir denylist), then
+  `assertNoSecretValues(fileContent)` and `assertNoSecretValues(filename)`. A hit
+  journals `exfil.block` and marks the obligation **`dead`** — it is never
+  uploaded and never retried. This closes the gap that the generic text poller
+  ignores (its `send` runs no guards because the text was guarded once at
+  `executeReply`); a file's content is re-validated on the bytes that will
+  actually be sent, every time.
+
+- **Dedup (best-effort, honest).** Before uploading, the send checks: (a) if the
+  obligation already carries `uploadedFileId` and that file is still shared in the
+  thread → skip (delivered); else (b) scan `conversations.replies` for a
+  file-share matching this upload by `(filename, size)` **shared at/after the
+  obligation's `createdAt`** → if found, treat as delivered and record its id. Only
+  if neither matches does it upload, then record the returned file id and mark
+  `delivered`. Transient error → `pending` (poller retries); non-retryable →
+  `dead`. **The `createdAt` delivery-window filter on (b) is load-bearing:** a
+  multi-turn thread can hold an OLDER file with the same name + size from a
+  previous turn, and matching it would falsely dedup and *drop* the new upload (a
+  loss, not a dup). The recorded-`uploadedFileId` match (a) is exact, so it is
+  NOT time-scoped.
+
+- **Residual (documented, narrow).** Because file shares carry no app metadata,
+  the dedup is a `(filename, size)` scan. The un-deduped window is: the upload
+  landed, the process crashed before `uploadedFileId` was recorded, **and** the
+  rescan finds no matching `(filename, size)` (e.g. the file was renamed or its
+  size collided ambiguously) — then the poller re-uploads, producing a duplicate
+  file. This is strictly narrower than the pre-`o7x.2.3` text residual and is the
+  best Slack's file API permits. It is a *double-deliver* of an already-guarded
+  file, never a *lost* one and never a *gate bypass*.
+
+**Why not a carrier-message anchor.** Posting a `chat.postMessage` carrier (which
+*can* hold the metadata key) and threading the upload under it would give
+metadata-keyed dedup for the *carrier* but still not for the *upload itself* (the
+upload can land while the carrier post fails, or vice versa), at the cost of an
+extra visible message per file. It trades one residual for another plus a UX
+regression — rejected.
+
+**Consequence.** File replies gain durable crash-recovery and a re-validated
+exfil guard on every (re)upload, with practical exact-once for the crash/ack-loss
+case and one documented narrow double-upload window. With this, the crash-safety
+epic's rich paths are complete: single (`.3`), chunked (`.4`), streaming (`.6`),
+and file (`.5`).
+
 ## References
 
 - The `ccsc-*` peer-audit hardening backlog (Epics 1–5), filed alongside this ADR;

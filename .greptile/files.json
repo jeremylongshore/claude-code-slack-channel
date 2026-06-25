@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "path": "000-docs/THREAT-MODEL.md",
+      "description": "Trust boundaries, T1–T11 threats, and the invariants every change must preserve."
+    },
+    {
+      "path": "ARCHITECTURE.md",
+      "description": "Four-principal model and the three security-critical gates the design layers inside."
+    },
+    {
+      "path": "000-docs/session-state-machine.md",
+      "description": "SessionKey, the supervisor contract, and the session lifecycle / isolation rules."
+    }
+  ]
+}

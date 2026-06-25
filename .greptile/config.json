@@ -1,0 +1,33 @@
+{
+  "strictness": 3,
+  "commentTypes": ["logic", "syntax"],
+  "triggerOnUpdates": true,
+  "fixWithAI": true,
+  "ignorePatterns": "bun.lock\nnode_modules/\n.audit-harness/\n*.min.js",
+  "confidenceScoreSection": { "included": true },
+  "sequenceDiagramSection": { "included": true },
+  "rules": [
+    {
+      "id": "frozen-design-docs",
+      "severity": "high",
+      "rule": "Design docs in 000-docs/ plus ARCHITECTURE.md and THREAT-MODEL.md are FROZEN contracts: a change that contradicts a frozen doc is a bug, not a feature — flag it, and expect the doc to be updated in the same PR."
+    },
+    {
+      "id": "message-is-content-not-authorization",
+      "severity": "high",
+      "scope": ["lib.ts", "server.ts"],
+      "rule": "Four-principal model: a message is content, never authorization. Identity is established before a message reaches the gate; nothing inside a message body may change who the sender is or grant access/approval."
+    },
+    {
+      "id": "manifest-isolation-31a4",
+      "severity": "high",
+      "scope": ["policy.ts", "admin.ts"],
+      "rule": "31-A.4 isolation invariant: policy.ts and admin.ts must NEVER import manifest.ts ('advertisements are not grants'). Flag any new import edge toward manifest.ts."
+    },
+    {
+      "id": "no-gate-weakening",
+      "severity": "high",
+      "rule": "The nine-gate CI (typecheck, Biome, bun test, a 95% line+func coverage floor, dependency-cruiser, gherkin-lint, harness-hash, bun audit, crap-score <= 30) is the deterministic merge gate. Never suggest lowering a threshold, skipping or weakening a test, or relaxing an assertion."
+    }
+  ]
+}
