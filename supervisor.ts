@@ -263,10 +263,21 @@ export interface SessionHandle {
    *  Each caller-supplied `id` must be unique (the chunk index is folded in by
    *  the caller, e.g. `<replyId>:<i>`) so each chunk gets its own idempotency
    *  key. Order is preserved: the obligations append in `replies` order, and the
-   *  poller drains a session's outbox in array order. Fenced by `token`. */
+   *  poller drains a session's outbox in array order. Fenced by `token`.
+   *
+   *  ccsc-o7x.5 — a reply may also carry FILE-upload obligations: a reply with an
+   *  `upload` descriptor becomes a durable `filesUploadV2` obligation rather than
+   *  a `chat.postMessage`. Text obligations are recorded before file ones so the
+   *  poller posts the message before its attachments. */
   recordTerminalDeliveries(
     token: number,
-    replies: readonly { id: string; channel: string; thread: string; payload: string }[],
+    replies: readonly {
+      id: string
+      channel: string
+      thread: string
+      payload: string
+      upload?: { path: string; filename: string; comment?: string }
+    }[],
   ): Promise<void>
 
   /** Serialise an update through the per-session mutex, persist it via
@@ -1496,7 +1507,14 @@ class ConcreteHandle implements SessionHandle {
 
   recordTerminalDeliveries(
     token: number,
-    replies: readonly { id: string; channel: string; thread: string; payload: string }[],
+    replies: readonly {
+      id: string
+      channel: string
+      thread: string
+      payload: string
+      // ccsc-o7x.5 — when present, this is a durable FILE-upload obligation.
+      upload?: { path: string; filename: string; comment?: string }
+    }[],
   ): Promise<void> {
     const now = this.clock()
     const obligations: DeliveryObligation[] = replies.map((reply) => ({
@@ -1507,6 +1525,7 @@ class ConcreteHandle implements SessionHandle {
       attempts: 0,
       state: 'pending',
       createdAt: now,
+      ...(reply.upload !== undefined ? { upload: reply.upload } : {}),
     }))
     // One atomic save appends ALL obligations AND clears the in-flight marker:
     // a chunked reply's "turn done, N replies owed" is a single durable fact.

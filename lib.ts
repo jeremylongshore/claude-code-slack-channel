@@ -262,6 +262,21 @@ export interface DeliveryObligation {
    *  was abandoned, never a silent black hole. Absent until the first failure;
    *  additive + optional so 2.1-era records and clean sends carry no field. */
   lastError?: string
+  /** ccsc-o7x.5 — file-upload obligation. When present, this obligation is a
+   *  durable FILE upload (`filesUploadV2`), NOT a text post: the send branches to
+   *  upload `upload.path` as `upload.filename` (with optional `upload.comment` as
+   *  the initial comment) and `payload` is unused. The send re-runs the outbound
+   *  file exfil guards on `upload.path` before EVERY upload (incl. poller
+   *  redelivery), because a file's bytes can change between record and redelivery
+   *  (ADR-002 addendum). Additive + optional, so text obligations and pre-o7x.5
+   *  records are unchanged. */
+  upload?: { path: string; filename: string; comment?: string }
+  /** ccsc-o7x.5 — Slack file id recorded AFTER a successful upload. A poller
+   *  redelivery of the same file obligation dedups by checking this file is still
+   *  shared in the thread (file shares carry no app `metadata`, so this recorded
+   *  id — plus a `(filename, size)` thread scan — is the dedup anchor). Absent
+   *  until the first successful upload. */
+  uploadedFileId?: string
 }
 
 /** How the delivery poller (ccsc-o7x.2.2) treats a failed send. `retryable`
@@ -335,6 +350,21 @@ export function extractSlackErrorCode(err: unknown): string | undefined {
   }
   if (typeof e.code === 'string' && e.code.length > 0) return e.code
   return undefined
+}
+
+/** Thrown when an outbound file fails the exfil guard (`assertSendable` denylist,
+ *  or a secret value in the content/filename) — ccsc-o7x.5. Lives in the kernel
+ *  (not `slack-delivery.ts`) so BOTH the inline durable file path AND the delivery
+ *  poller (`supervisor.ts` `drainOutbox`) can classify it as **non-retryable**
+ *  without a slack-delivery↔supervisor import cycle: a blocked file is marked
+ *  `dead`, never uploaded, never retried (its bytes won't pass on a retry, and
+ *  the agent must see the block). The guard impl journals `exfil.block` before
+ *  throwing this. */
+export class ExfilBlockedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ExfilBlockedError'
+  }
 }
 
 /** Tunables for `computeBackoffMs`. */
@@ -495,6 +525,18 @@ export const SessionSchema = z
             // ccsc-o7x.2.2 — optional last-failure marker (Slack error code or
             // message). Optional so 2.1-era records validate under `.strict()`.
             lastError: z.string().optional(),
+            // ccsc-o7x.5 — optional file-upload descriptor + recorded file id.
+            // Optional so text obligations + pre-o7x.5 records validate under
+            // the outer `.strict()`.
+            upload: z
+              .object({
+                path: z.string(),
+                filename: z.string(),
+                comment: z.string().optional(),
+              })
+              .strict()
+              .optional(),
+            uploadedFileId: z.string().optional(),
           })
           .strict(),
       )

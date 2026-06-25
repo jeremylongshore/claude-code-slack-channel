@@ -368,6 +368,85 @@ branches to `filesUploadV2`, and an upload-dedup token (a `filesUploadV2`
 message-share does not carry our `chat.postMessage` metadata). Its own addendum
 and PR.
 
+## Addendum (2026-06-24): file-upload replies made durable (ccsc-o7x.5)
+
+The last deferred rich path, completing the crash-safety epic. A reply with
+`files` uploads each file via `filesUploadV2` (a separate Slack upload, not a
+`chat.postMessage`). `ccsc-o7x.3` deferred it because files "are separate uploads
+[that] need an upload-dedup token."
+
+Two facts shape the design, and the first is a hard ceiling:
+
+1. **A Slack file-share message cannot carry app `metadata`.** The text path's
+   exact-once dedup (`ccsc-o7x.2.3`) works because `chat.postMessage` stamps a
+   `metadata.event_payload.idempotency_key` that `findDelivered` scans for.
+   `files.completeUploadExternal` / `filesUploadV2` has no such field. So
+   **true metadata-keyed exact-once is not achievable for file uploads** — the
+   dedup must be a thread *scan*, which is necessarily heuristic.
+2. **The file's bytes can change between record-time and redelivery-time.** A path
+   recorded in an obligation, re-uploaded minutes later by the poller, may now
+   hold different — possibly secret — content. So a record-time exfil check is
+   *insufficient*; the guard must run at **every** upload.
+
+**Decision — a file-upload obligation with an exfil-guard-at-redelivery contract
+and a best-effort scan dedup.**
+
+- **Obligation shape (additive to `lib.ts` `DeliveryObligation`).** Two new
+  optional fields: `upload?: { path: string; filename: string; comment?: string }`
+  marks the obligation as a file upload (when present, `payload` is unused and the
+  send branches to `filesUploadV2` instead of `chat.postMessage`); and
+  `uploadedFileId?: string` is recorded *after* a successful upload to dedup a
+  later redelivery. Both additive + optional, so existing session files and the
+  text/chunked paths are unchanged. (AGP impact: **none** — the reply-delivery
+  outbox is not part of AGP's reimplemented subset; verified against
+  `agent-governance-plane/substrate/UPSTREAM.md`. The change still needs CCSC
+  mutation tests — `lib.ts` is in the Stryker mutate set.)
+
+- **One obligation per file**, id `<replyId>:file:<i>`; the accompanying text (if
+  any) rides the existing text/chunked obligations (`<replyId>:<i>`). All are
+  recorded atomically before any send (`recordTerminalDeliveries`), text first
+  then files, so the poller drains them in order (text lands before its files).
+
+- **Exfil-guard-at-redelivery (the security crux).** The durable file send — inline
+  *and* in the poller — re-runs the full outbound file guard before *every*
+  upload: `assertSendable(path)` (state-dir denylist), then
+  `assertNoSecretValues(fileContent)` and `assertNoSecretValues(filename)`. A hit
+  journals `exfil.block` and marks the obligation **`dead`** — it is never
+  uploaded and never retried. This closes the gap that the generic text poller
+  ignores (its `send` runs no guards because the text was guarded once at
+  `executeReply`); a file's content is re-validated on the bytes that will
+  actually be sent, every time.
+
+- **Dedup (best-effort, honest).** Before uploading, the send checks: (a) if the
+  obligation already carries `uploadedFileId` and that file is still shared in the
+  thread → skip (delivered); else (b) scan `conversations.replies` for a
+  file-share matching this upload by `(filename, size)` → if found, treat as
+  delivered and record its id. Only if neither matches does it upload, then record
+  the returned file id and mark `delivered`. Transient error → `pending` (poller
+  retries); non-retryable → `dead`.
+
+- **Residual (documented, narrow).** Because file shares carry no app metadata,
+  the dedup is a `(filename, size)` scan. The un-deduped window is: the upload
+  landed, the process crashed before `uploadedFileId` was recorded, **and** the
+  rescan finds no matching `(filename, size)` (e.g. the file was renamed or its
+  size collided ambiguously) — then the poller re-uploads, producing a duplicate
+  file. This is strictly narrower than the pre-`o7x.2.3` text residual and is the
+  best Slack's file API permits. It is a *double-deliver* of an already-guarded
+  file, never a *lost* one and never a *gate bypass*.
+
+**Why not a carrier-message anchor.** Posting a `chat.postMessage` carrier (which
+*can* hold the metadata key) and threading the upload under it would give
+metadata-keyed dedup for the *carrier* but still not for the *upload itself* (the
+upload can land while the carrier post fails, or vice versa), at the cost of an
+extra visible message per file. It trades one residual for another plus a UX
+regression — rejected.
+
+**Consequence.** File replies gain durable crash-recovery and a re-validated
+exfil guard on every (re)upload, with practical exact-once for the crash/ack-loss
+case and one documented narrow double-upload window. With this, the crash-safety
+epic's rich paths are complete: single (`.3`), chunked (`.4`), streaming (`.6`),
+and file (`.5`).
+
 ## References
 
 - The `ccsc-*` peer-audit hardening backlog (Epics 1–5), filed alongside this ADR;

@@ -40,6 +40,7 @@ import {
   deliveryIdempotencyKey,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
+  ExfilBlockedError,
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
@@ -85,8 +86,11 @@ import {
   createReplyPoster,
   DurableUnavailableError,
   deliverChunkedReplyDurably,
+  deliverFileReplyDurably,
   deliverReplyDurably,
+  type FileUploadDeps,
   type ReplyPoster,
+  sendFileObligation,
 } from './slack-delivery.ts'
 import {
   classifyRecovery,
@@ -7702,6 +7706,257 @@ describe('beginDurableStream (ccsc-o7x.6)', () => {
     await expect(beginDurableStream({ supervisor: sup }, reply)).rejects.toBeInstanceOf(
       DurableUnavailableError,
     )
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable file-upload reply delivery — sendFileObligation + deliverFileReplyDurably
+// (ccsc-o7x.5). dedup → guard → upload, with the exfil guard re-run on EVERY
+// upload; the files-bearing sibling of deliverChunkedReplyDurably.
+// ---------------------------------------------------------------------------
+
+describe('sendFileObligation (ccsc-o7x.5)', () => {
+  function makeFileDeps(opts: { found?: string | null; uploadId?: string; guardErr?: Error }) {
+    const calls: string[] = []
+    const deps: FileUploadDeps = {
+      readAndGuard: async (u) => {
+        calls.push(`readAndGuard:${u.filename}`)
+        if (opts.guardErr) throw opts.guardErr
+        return new Uint8Array([1, 2, 3])
+      },
+      findUploaded: async () => {
+        calls.push('findUploaded')
+        return opts.found ?? null
+      },
+      upload: async () => {
+        calls.push('upload')
+        return opts.uploadId ?? 'F123'
+      },
+    }
+    return { deps, calls }
+  }
+
+  const fileOb = {
+    id: 'r-1:file:0',
+    channel: 'C',
+    thread: 'T',
+    payload: '',
+    attempts: 0,
+    state: 'pending' as const,
+    createdAt: 0,
+    upload: { path: '/inbox/a.png', filename: 'a.png' },
+  }
+
+  test('dedup hit: returns the existing file id WITHOUT guarding or uploading', async () => {
+    const { deps, calls } = makeFileDeps({ found: 'F-existing' })
+    const id = await sendFileObligation(deps, fileOb)
+    expect(id).toBe('F-existing')
+    expect(calls).toEqual(['findUploaded']) // no guard, no upload on a dedup hit
+  })
+
+  test('dedup miss: guards BEFORE uploading, returns the new file id', async () => {
+    const { deps, calls } = makeFileDeps({ found: null, uploadId: 'F-new' })
+    const id = await sendFileObligation(deps, fileOb)
+    expect(id).toBe('F-new')
+    // Order proves read+guard ran before the upload (re-validate, then send the
+    // same bytes).
+    expect(calls).toEqual(['findUploaded', 'readAndGuard:a.png', 'upload'])
+  })
+
+  test('guard block: throws ExfilBlockedError and NEVER uploads', async () => {
+    const { deps, calls } = makeFileDeps({
+      found: null,
+      guardErr: new ExfilBlockedError('secret in file'),
+    })
+    await expect(sendFileObligation(deps, fileOb)).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(calls).toEqual(['findUploaded', 'readAndGuard:a.png']) // upload never reached
+  })
+
+  test('throws when the obligation has no upload descriptor', async () => {
+    const { deps } = makeFileDeps({})
+    await expect(sendFileObligation(deps, { ...fileOb, upload: undefined })).rejects.toThrow(
+      /no upload descriptor/,
+    )
+  })
+})
+
+describe('deliverFileReplyDurably (ccsc-o7x.5)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_FILE', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-file-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+  function makePoster(behavior: 'ok' | Error, ts = 'ts-0') {
+    const calls: string[] = []
+    const poster: ReplyPoster = async (ob) => {
+      calls.push(ob.id)
+      if (behavior !== 'ok') throw behavior
+      return ts
+    }
+    return { poster, calls }
+  }
+  function makeFileDeps(opts: { found?: string | null; uploadErr?: Error; guardErr?: Error } = {}) {
+    const uploads: string[] = []
+    let n = 0
+    const deps: FileUploadDeps = {
+      readAndGuard: async () => {
+        if (opts.guardErr) throw opts.guardErr
+        return new Uint8Array([1, 2, 3])
+      },
+      findUploaded: async () => opts.found ?? null,
+      upload: async (ob) => {
+        if (opts.uploadErr) throw opts.uploadErr
+        uploads.push(ob.id)
+        return `F-${n++}`
+      },
+    }
+    return { deps, uploads }
+  }
+
+  const base = {
+    id: 'r-1',
+    channel: 'C_FILE',
+    thread: 'T1',
+    chunks: ['the message'],
+    files: [{ path: '/inbox/a.png', filename: 'a.png' }],
+  }
+
+  test('text + file all deliver: each marked delivered, file carries uploadedFileId, nothing pending', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok', 'ts-9')
+    const { deps, uploads } = makeFileDeps()
+
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: poster, files: deps },
+      base,
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-9', messagesSent: 1, filesSent: 1 })
+    expect(uploads).toEqual(['r-1:file:0'])
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:0')).toMatchObject({ state: 'delivered' })
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({
+      state: 'delivered',
+      uploadedFileId: 'F-0',
+    })
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records ALL obligations (text + file) before any send', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    let pendingAtFirstSend = -1
+    const poster: ReplyPoster = async () => {
+      pendingAtFirstSend = (await makeSupervisor().pendingDeliveries()).length
+      return 'ts-0'
+    }
+    const { deps } = makeFileDeps()
+    await deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base)
+    expect(pendingAtFirstSend).toBe(2) // text + file both durable before the first post
+  })
+
+  test('dedup: an already-uploaded file is not re-uploaded, still marked delivered', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps, uploads } = makeFileDeps({ found: 'F-existing' })
+
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: poster, files: deps },
+      base,
+    )
+
+    expect(result.status).toBe('delivered')
+    expect(uploads).toHaveLength(0) // dedup hit → no upload
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({
+      state: 'delivered',
+      uploadedFileId: 'F-existing',
+    })
+  })
+
+  test('exfil block on the file: marks it dead and rethrows (text already landed)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps({ guardErr: new ExfilBlockedError('secret in a.png') })
+
+    await expect(
+      deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:0')).toMatchObject({ state: 'delivered' })
+    // The blocked file is dead, never pending → the poller never redelivers it.
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({ state: 'dead' })
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('non-retryable Slack error on the file: marks dead with the code, rethrows', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps({ uploadErr: slackError('channel_not_found') })
+
+    await expect(
+      deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base),
+    ).rejects.toThrow(/channel_not_found/)
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({
+      state: 'dead',
+      lastError: 'channel_not_found',
+    })
+  })
+
+  test('transient file upload error: marks pending + stops, returns queued (poller redelivers)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps({ uploadErr: slackError('rate_limited') })
+
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: poster, files: deps },
+      base,
+    )
+
+    expect(result).toEqual({ status: 'queued', delivered: 1, pending: 1 }) // text delivered, file pending
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1:file:0'])
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps()
+    await expect(
+      deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
     expect(await sup.pendingDeliveries()).toHaveLength(0)
   })
 })
