@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs**: True up `CLAUDE.md` + `README.md` to the current codebase — test count `~1,033`/`1,237` → `~1,251` (authoritative `bun test` count; noted the `it`/`test` grep undercounts at ~1,120 because it misses `test.each` expansions and the Gherkin runner), refreshed the module LoC table (`server.ts` 3820 / `lib.ts` 2552 / `supervisor.ts` 1810 / `journal.ts` 1461), and dropped the stale "thin adapter" label on `slack-delivery.ts` (738 LoC). Reconciles `CLAUDE.md` ↔ `README.md` ↔ `AGENTS.md`. (#257)
+
 ## [0.12.0] - 2026-06-24
 
 ### Added

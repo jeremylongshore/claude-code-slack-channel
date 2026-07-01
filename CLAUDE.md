@@ -14,10 +14,10 @@ Bun/TypeScript, strict mode. ~17 production source files (LoC drifts every commi
 
 | File | ~LoC | Purpose |
 |---|---|---|
-| `server.ts` | 3518 | Stateful runtime — Slack client bootstrap, MCP server, event handlers, file I/O |
-| `lib.ts` | 2369 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt + idempotent-send helpers |
-| `supervisor.ts` | 1721 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32), outbox drain (`drainOutbox`, ccsc-o7x) |
-| `journal.ts` | 1458 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
+| `server.ts` | 3820 | Stateful runtime — Slack client bootstrap, MCP server, event handlers, file I/O |
+| `lib.ts` | 2552 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt + idempotent-send helpers |
+| `supervisor.ts` | 1810 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32), outbox drain (`drainOutbox`, ccsc-o7x) |
+| `journal.ts` | 1461 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
 | `policy.ts` | 818 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
 | `manifest.ts` | 573 | Bot-manifest protocol — schema, publish-side validation, subset check (Epic 31) |
 
@@ -31,7 +31,7 @@ Supporting modules (epic-scoped; each file header carries its `ccsc-*` bead tag)
 | `peer-bot-rate-limit.ts` | Per-(channel, bot_id) sliding-window limit breaking A→B→A runaway loops |
 | `stream-reply.ts` | Progressive Slack reply via `chat.update` |
 | `acp-adapter.ts` | Agent Client Protocol (ACP) stdio boundary adapter |
-| `slack-delivery.ts` | Thin Slack-`WebClient` adapter for the crash-safe reply-delivery outbox (ccsc-o7x): `findDelivered` / `post` with the idempotency key stamped into message metadata. Kept a sibling of `server.ts` so it can be unit-tested against a faked client without triggering server module-load side effects; the idempotent-send logic itself lives in `lib.ts` (`makeIdempotentSend`, `deliveryIdempotencyKey`). |
+| `slack-delivery.ts` | Slack-`WebClient` adapter (~738 LoC) for the crash-safe reply-delivery outbox (ccsc-o7x): `findDelivered` / `post` with the idempotency key stamped into message metadata. Kept a sibling of `server.ts` so it can be unit-tested against a faked client without triggering server module-load side effects; the idempotent-send logic itself lives in `lib.ts` (`makeIdempotentSend`, `deliveryIdempotencyKey`). |
 
 Runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`, `tsx`. No frameworks.
 
@@ -52,7 +52,7 @@ Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude
 ```bash
 bun install                              # Install deps
 bun run typecheck                        # TypeScript strict check (tsc --noEmit)
-bun test                                 # Run test suite (bun:test) — ~1,033 tests
+bun test                                 # Run test suite (bun:test) — ~1,251 tests
 bun test --timeout 15000                 # Match CI's timeout
 bun test --watch                         # Watch mode
 bun test --test-name-pattern "gate"      # Run tests matching a pattern
@@ -133,7 +133,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `manifest.ts` — bot-manifest protocol (Epic 31): schema, `assertPublishAllowed`, `validateManifestSubset`
 
 ### Tests & acceptance contracts
-- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`). Total across all four test files (`server.test.ts` + `features/gate-properties.test.ts` + `features/jcs-interop.test.ts` + `features/runner.test.ts`) is **~1,033 `it`/`test` blocks** (`grep -cE "^\s*(it|test)\(" server.test.ts features/*.test.ts`; `features/runner.test.ts` adds the 61 Gherkin scenarios through a hand-rolled runner rather than `it()` blocks). A moving snapshot — exact count drifts with every feature commit; the soft floor lives in coverage, not test count. Run a subset with `bun test --test-name-pattern "<pattern>"`.
+- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`). `bun test` reports **~1,251 tests** across the four test files (`server.test.ts` + `features/gate-properties.test.ts` + `features/jcs-interop.test.ts` + `features/runner.test.ts`), where `features/runner.test.ts` runs the 61 Gherkin scenarios through a hand-rolled runner. (A raw `grep -cE "^\s*(it|test)\(" server.test.ts features/*.test.ts` undercounts at ~1,120 — it misses `test.each` expansions and the Gherkin scenarios.) A moving snapshot — exact count drifts with every feature commit; the soft floor lives in coverage, not test count. Run a subset with `bun test --test-name-pattern "<pattern>"`.
 - `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); seven primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`, `admin_commands`, `tier-shadow`
 - `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 61 scenarios against the real primitives
 - `features/gate-properties.test.ts` — fast-check property-based tests for `gate()`; `features/jcs-interop.test.ts` — RFC 8785 JCS canonicalization interop for audit signing
