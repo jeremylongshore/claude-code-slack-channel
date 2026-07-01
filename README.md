@@ -267,7 +267,7 @@ Security-critical code earns a hard gate. `ci.yml` runs nine checks in sequence 
 |---|---|
 | `bun run typecheck` | TypeScript strict, no `any` escape hatches |
 | Biome lint | curated rule set |
-| `bun test` | **1,237 tests / 6,760 assertions** across unit + property + Gherkin suites |
+| `bun test` | **1,251 tests / 6,782 assertions** across unit + property + Gherkin suites |
 | coverage floor | **≥ 95%** line + function (`scripts/coverage-floor.sh`) |
 | dependency-cruiser | architecture invariants (e.g. `policy.ts` may never import `manifest.ts`) |
 | Gherkin lint | acceptance-feature style, `--strict` |
