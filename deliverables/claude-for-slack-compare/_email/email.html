@@ -1,0 +1,441 @@
+<p>Ezekiel —</p>
+<p>Here are the four pieces to post, each ready to copy-paste.
+<strong>Post the Substack article FIRST</strong>, then copy its URL and
+paste it into the <code>[PASTE SUBSTACK ARTICLE URL]</code> slot in each
+of the three social posts (so every link resolves).</p>
+<p><strong>What goes where</strong> 1. <strong>Substack</strong> — the
+long-form article below (“Rent the Agent, Own the Proof”). 2. <strong>X
+/ Twitter</strong> — the long-form post (Post #2). 3. <strong>LinkedIn —
+Jeremy’s personal profile</strong> — Post #3. 4. <strong>LinkedIn —
+Intent Solutions company page</strong> — Post #4.</p>
+<p><strong>Optional visual asset</strong> (a comparison infographic,
+live now):
+https://demos.intentsolutions.io/claude-for-slack-rent-vs-own.html —
+attach a screenshot to the Substack post or the LinkedIn posts if you
+want a graphic.</p>
+<p><strong>Two small notes before posting</strong> - The article and the
+LinkedIn/company posts describe Anthropic’s “Agent Proxy” credential
+handling as <em>“per launch coverage”</em> — that detail comes from
+Claude Tag launch write-ups, not Anthropic’s official announcement page.
+It’s phrased carefully; leave the “per launch coverage” wording in. -
+Tone is deliberately fair to Anthropic (no FUD) — the whole point is an
+ownership/verifiability argument, not “theirs is insecure.” Please keep
+that framing intact.</p>
+<hr />
+<h1 id="part-1-substack-article-post-this-first">PART 1 — SUBSTACK
+ARTICLE (post this first)</h1>
+<h1 id="rent-the-agent-own-the-proof">Rent the Agent, Own the Proof</h1>
+<p><em>Editor’s note: On June 23, Anthropic shipped Claude Tag, a
+genuinely strong agentic teammate for Slack that runs with zero
+infrastructure. It’s an excellent product. But the governance question
+it doesn’t answer — who owns the memory, and who can verify the audit —
+matters for teams that can’t outsource their substrate. What follows is
+an honest assessment of the trade, and two open-source alternatives that
+make the opposite bet.</em></p>
+<hr />
+<p>On June 23, 2026, Anthropic <a
+href="https://www.anthropic.com/news/introducing-claude-tag">shipped
+Claude Tag</a>: tag <code>@Claude</code> in a Slack channel and it works
+as an agentic teammate — running tool calls, following threads, building
+memory, acting under your org’s identity. The legacy “Claude in Slack”
+chat app <a
+href="https://www.techtimes.com/articles/319206/20260627/claude-tag-brings-ambient-ai-slack-admins-have-until-august-3-migrate.htm">retires
+August 3, 2026</a>; admins get 30 days to migrate. It is, by a distance,
+the best agentic teammate you can <em>rent</em>.</p>
+<p>I want to be honest about that up front, because the interesting
+question isn’t whether Claude Tag is good. It’s good. The interesting
+question is the one it doesn’t answer: <strong>when an agent has
+admin-scoped tools in your workspace, who owns the memory it builds, and
+who can verify the log of what it did?</strong></p>
+<h2 id="give-claude-tag-its-due">Give Claude Tag its due</h2>
+<p>A hit piece would be easy and wrong. Claude Tag’s engineering is
+strong, and the honest version of this argument starts by saying so:</p>
+<ul>
+<li><strong>Zero infrastructure.</strong> No servers, no deploy, no
+on-call. Tag the bot, it works. Nothing self-hosted competes on setup
+cost.</li>
+<li><strong>Multiplayer shared context.</strong> “One Claude that
+interacts with everyone” in a channel — anyone can see what it’s working
+on and pick up where the last person left off.</li>
+<li><strong>Compounding memory.</strong> It “learns over time… builds
+more context about the work,” and can learn across channels with
+permission.</li>
+<li><strong>Central governance.</strong> Admins specify which tools and
+data the model can touch, per channel. Usage is billed to the org.
+Admins can set <strong>token-spend caps</strong> per org and per
+channel.</li>
+<li><strong>A genuinely good security model.</strong> Work runs in an
+<strong>isolated sandbox on Anthropic’s infrastructure</strong>. When it
+needs an external system, requests cross an <strong>Agent Proxy</strong>
+where — per launch coverage — credentials “stay in a store and are
+injected at the network boundary without the model receiving raw keys,”
+with a <strong>default policy of deny</strong> for un-allowlisted
+hosts.</li>
+</ul>
+<p>That last point deserves emphasis, because it’s the part people
+underrate: keeping raw credentials out of the model and defaulting
+egress to deny is <em>exactly</em> the posture a security-minded
+self-hosted stack would build. Anthropic did the hard, correct thing. If
+you want an agent in Slack tomorrow with no infrastructure, Claude Tag
+is an excellent product and you should use it.</p>
+<p>So this is not “their thing is insecure.” It’s a different question
+entirely.</p>
+<h2 id="the-trade-youre-actually-making">The trade you’re actually
+making</h2>
+<p>Every one of those benefits shares a root: <strong>the substrate is
+Anthropic’s.</strong> The sandbox is on their infra. And so is the
+memory — as <a
+href="https://alphasignalai.substack.com/p/the-real-claude-tag-question-is-context">AlphaSignal
+argues</a>, the real Claude Tag question is context ownership: the
+organizational knowledge Claude builds becomes the vendor’s proprietary
+state, not an exportable dataset your next vendor can ingest. The
+principle it points to is simple — rent the agent, but own the memory —
+and Claude Tag inverts it: you rent the agent <em>and</em> the memory
+lives with the vendor. Critics have named the deeper trap the same way:
+<a
+href="https://ksingh7.medium.com/everyones-worried-about-model-lock-in-but-the-real-trap-is-context-lock-in-af04c16167b0">not
+model lock-in but <em>context</em> lock-in</a>. And they’ve been fair
+about it — the concern isn’t that Anthropic is doing anything wrong,
+it’s that the incentives are obvious.</p>
+<p>Two more things live on that substrate, and they matter more than
+memory portability:</p>
+<ol type="1">
+<li><strong>Governance is coarse.</strong> Admin control means <em>which
+channels</em>, <em>which tools/data</em>, and <em>spend caps</em>. That
+is scope plus budget. It is not a documented, mandatory human approval
+<strong>before each consequential tool call executes</strong>.</li>
+<li><strong>The audit log is the vendor’s.</strong> Admins “can view a
+log of everything that <span class="citation"
+data-cites="Claude">@Claude</span> has done.” You can <em>view</em>
+Anthropic’s record. You cannot <em>verify</em> it, independently, with
+your own key, with no vendor in the trust path.</li>
+</ol>
+<p>For a lot of teams, none of that is a dealbreaker — and they should
+use Claude Tag. But for a regulated shop, a security vendor, or anyone
+whose answer to “prove what your agent did” has to survive an adversary
+who controls the log’s storage, coarse governance and a vendor-shown
+record aren’t enough. That’s the gap two open-source projects were built
+to fill.</p>
+<h2 id="why-filters-were-never-the-boundary">Why filters were never the
+boundary</h2>
+<p>Before the alternative, the premise: for a tool-using agent reading
+untrusted text — every Slack message is untrusted input —
+<strong>content filtering is not a security boundary.</strong> This is
+true of <em>any</em> Slack-connected agent — CCSC and AGP included, not
+Claude Tag in particular — which is why the answer isn’t a better
+filter, it’s a different architecture. The literature is blunt about
+this. <a href="https://arxiv.org/abs/2403.02691">InjecAgent</a>
+(Findings of ACL 2024) found ReAct-prompted GPT-4 vulnerable to indirect
+prompt injection 24% of the time, with private-data exfiltration a
+primary attack class. Worse, <a
+href="https://arxiv.org/abs/2503.00061">Adaptive Attacks Break Defenses
+Against Indirect Prompt Injection</a> (NAACL 2025) bypassed <strong>all
+eight</strong> evaluated defenses, keeping attack success above 50%. And
+because tools reached over MCP are “first-class, composable objects with
+natural-language metadata,” <a
+href="https://arxiv.org/abs/2510.15994">MCP Security Bench</a> shows the
+standard <em>enlarges</em> the attack surface — name-collision,
+tool-description injection, out-of-scope parameters.</p>
+<p>The takeaway isn’t “add a better filter.” It’s that a probabilistic
+model cannot be the thing that decides whether a destructive action
+runs. You need <strong>a deterministic gate the model can’t talk its way
+past, a human in the loop for the consequential calls, and a record of
+what actually ran that you can trust without trusting the
+runtime.</strong> That’s three properties — and they’re the three
+pillars of what I’ll call customer-owned, verifiable governance.</p>
+<p>Two reference implementations: <strong><a
+href="https://github.com/jeremylongshore/claude-code-slack-channel">CCSC</a></strong>
+(Claude Code Slack Channel), a small auditable governance kernel that
+puts Claude Code in Slack behind exactly these gates; and <strong><a
+href="https://github.com/jeremylongshore/agent-governance-plane">AGP</a></strong>
+(Agent Governance Plane), which reimplements-and-hardens that kernel
+with sandboxed execution across multiple agent harnesses. AGP doesn’t
+vendor CCSC or depend on it — it’s an independent reimplementation
+(“adapt-and-harden”) pinned to CCSC’s v0.10.0 design. Both are open
+source; you run them on your own infrastructure.</p>
+<h3
+id="pillar-1-deterministic-fine-grained-policy-not-a-probabilistic-scope">Pillar
+1 — Deterministic, fine-grained policy (not a probabilistic scope)</h3>
+<p>The oversight literature lays out a <a
+href="https://arxiv.org/abs/2507.14034">spectrum</a>, from
+human-out-of-the-loop through human-on-the-loop. Claude Tag’s channel
+scope sits low on it: a coarse boundary set once, per channel.
+Fine-grained governance sits higher, and it looks like capability-based
+security — <a
+href="https://en.wikipedia.org/wiki/Object-capability_model">Miller’s
+object-capability model</a> and the principle of least authority, where
+authority is granted per <em>operation</em>, not per <em>door</em>.
+Established capability-security work is explicit that coarse role/scope
+access <a href="https://arxiv.org/abs/1909.12279">over-privileges by
+construction</a> and that fine-grained capabilities are how you get
+least authority at scale.</p>
+<p>In CCSC, that’s a pure decision procedure:
+<code>evaluate(call, rules, now)</code> maps a tool call to
+<code>allow | deny | require</code> with no side effects — same inputs,
+same verdict, every time. Tiered rules resolve strictest-wins, then
+first-applicable. Out of the box, one tool — <code>upload_file</code> —
+defaults to fail-closed (denied unless a rule allows it); every other
+tool follows the policy <em>you</em> author, so making the actions that
+matter in your workspace fail-closed is a rule you write, not a default
+you inherit. AGP takes the harder line and bakes it in: its engine is
+<strong>default-deny with deny &gt; require &gt; allow</strong>, so a
+call that matches no rule fails closed to deny, not allow. That’s
+precisely what “AGP hardens the kernel” means. Neither ships an
+<code>if (model === "claude")</code> branch anywhere near the decision;
+the gate is data, evaluated before execution.</p>
+<p>The difference from a spend cap is the whole point. A token budget
+limits <em>how much</em> the agent can do. A policy engine decides
+<em>whether this specific action</em> is allowed — and can force a human
+into the loop for the ones that matter.</p>
+<h3 id="pillar-2-human-in-command-approval-per-tool-call">Pillar 2 —
+Human-in-command approval, per tool call</h3>
+<p>On the oversight spectrum, the mode that matters for consequential
+actions is <strong>human-in-command</strong>: the action does not
+execute until a human approves it. Not “review the log afterward.” Not
+“set a budget.” A blocking approval on <em>this</em> call,
+<em>before</em> it runs.</p>
+<p>CCSC’s <code>require</code> verdict routes to a human approver:
+approval is a reply-code the gate recognizes, with quorum counted by
+distinct user IDs — and because permission-reply messages from peer bots
+are dropped at the inbound gate, an injected message can’t cast an
+approving vote. A separate, stronger handshake guards the admin command
+path (<code>!restart</code>): a single-use 64-bit nonce DM’d out of
+band, TTL-bounded, checked against wrong-channel replay — built
+specifically to defeat a same-channel-approval attack, an <a
+href="https://arxiv.org/abs/2509.10540">EchoLeak</a>-class injection
+where the request <em>and</em> the approval both originate in a
+compromised channel. AGP renders the per-call approval as Slack
+Block-Kit Approve/Deny buttons whose nonce is bound to
+<code>(messageId, sessionId)</code> — and crucially, <strong>a bot can
+never approve, and a bot’s click doesn’t even burn the
+nonce.</strong></p>
+<p>This is the pillar Claude Tag most visibly doesn’t have. Admin scope
+decides what tools are reachable; there’s no public evidence of a
+mandatory per-action human approval before each consequential call. For
+a broad class of “summarize the thread” work you don’t want one. For
+“open this PR,” “message this customer,” “run this migration,” a lot of
+orgs very much do.</p>
+<h3
+id="pillar-3-a-signed-audit-you-can-verify-without-trusting-the-runtime">Pillar
+3 — A signed audit you can verify without trusting the runtime</h3>
+<p>This is the sharpest line between renting and owning, so be precise
+about what “verifiable” means. Claude Tag gives admins a log they can
+<em>view</em>. CCSC and AGP produce a log you can <em>verify</em> — a
+different verb.</p>
+<p>CCSC’s journal is a hash chain: each entry commits
+<code>sha256(prevHash ‖ canonicalJson)</code>, so any reordering or edit
+breaks every downstream link. Each entry is then <strong>Ed25519-signed
+over RFC 8785 JSON Canonicalization</strong>, and carries a
+<code>policy_attestation</code> digest recording exactly which rules
+were in force when the decision was made. You verify the whole thing
+offline — <code>bun server.ts --verify-audit-log &lt;path&gt;</code> —
+with <strong>only the public key</strong>. No vendor. No live service.
+Key rotation is supported, so the verifier still works across a
+rotation. This is the <a
+href="https://datatracker.ietf.org/doc/html/rfc6962">Certificate
+Transparency</a> design lineage — append-only logs a third party can
+check without trusting the operator — the same lineage as verifiable
+ledger databases like <a
+href="https://doi.org/10.14778/3583140.3583152">GlassDB</a> and recent
+work on <a
+href="https://arxiv.org/abs/2509.18415">Certificate-Transparency-style
+provenance for agent action chains</a>, where external verifiers
+cryptographically validate what an agent did without access to the
+runtime.</p>
+<p>And here’s the honest, load-bearing detail most “verifiable log”
+claims skip: <strong>a bare hash chain does not stop
+truncation.</strong> If an attacker drops the last N entries, the
+remaining chain still verifies clean — CCSC documents this as threat T8,
+out loud, in its threat model. AGP closes exactly that hole: it writes a
+<strong>signed HEAD checkpoint</strong> — a
+<code>&lt;journal&gt;.head</code> file pinning <code>{seq, hash}</code>
+— so the offline verifier catches a truncated tail a chain alone cannot.
+<code>agp verify</code> checks the chain, the signatures, <em>and</em>
+the signed head — offline, with only the public key. That’s what owning
+the proof buys you: not “trust our log,” but “here is a record, check it
+yourself, and check that none of it was quietly cut off.”</p>
+<h3
+id="the-fourth-property-agp-adds-a-sandbox-that-proves-egress-is-off">The
+fourth property AGP adds — a sandbox that <em>proves</em> egress is
+off</h3>
+<p>Claude Tag’s sandbox is on Anthropic’s infra. AGP’s runs on yours,
+and it doesn’t <em>assume</em> isolation — it <em>proves</em> it.
+Containers launch with <code>--network none</code>,
+<code>--cap-drop ALL</code>, <code>no-new-privileges</code>, and
+pid/memory limits, with <strong>no silent fallback to the host</strong>
+if hardened flags fail. Then a <strong>network preflight</strong>
+actually runs an egress probe to a TEST-NET-1 address and <strong>fails
+closed</strong> — tearing the container down — if traffic is
+<em>not</em> isolated. Images are pinned — by digest, or at minimum a
+specific version tag, never <code>latest</code> — and host secrets are
+mounted through a deny-list. Same “gate, don’t impersonate” credential
+posture as Claude Tag’s Agent Proxy: AGP holds no model credentials, and
+<code>{{secret:NAME}}</code> is resolved only <em>after</em> the gate,
+at the exec boundary — the journal records secret <em>names</em>, never
+values.</p>
+<h2 id="the-part-where-i-dont-oversell-it">The part where I don’t
+oversell it</h2>
+<p>The reason to trust any of this is that both projects are relentless
+about their own limits, and I’m not going to break that streak here.</p>
+<p>CCSC does <strong>not</strong> protect you against a compromised host
+OS, a same-UID process, a supply-chain attack, or a socially-engineered
+operator at their own terminal — its threat model says so explicitly.
+Its manifest <em>consumer</em> doesn’t ship yet, so cross-bot identity
+is still just <code>bot_id</code>. And T8 truncation, again, is a real
+gap in CCSC alone — it’s <em>AGP</em> that fixes it, which is the whole
+reason AGP exists.</p>
+<p>AGP’s sandbox is namespace/cgroup isolation, <strong>not</strong> a
+VM — a kernel exploit or container escape defeats it, and the code
+comments say exactly that. Its multi-harness claim rests on a
+deterministic reference contract and a conformance test that drives
+Claude Code and Codex through identical governance; <strong>live Codex
+interception is provisional and not yet CI-validated.</strong> AGP’s own
+docs rate the current test suite a B− (78/100). And its marketing-claims
+checker <em>bans</em> certain words in CI — which is why I’ve said
+<strong>signed and offline-verifiable</strong> throughout, and not
+claims of being proof against attack. A log can be signed and still be
+stolen wholesale if your host is owned. Verifiability is a property of
+the record, not a force field around your infrastructure.</p>
+<p>That discipline is the point. A governance layer that oversells
+itself is worse than none, because it manufactures the exact false
+confidence it was supposed to remove.</p>
+<h2 id="so-rent-or-own">So: rent, or own?</h2>
+<p>Both stacks share one architectural signature —
+<strong>prove-don’t-trust: a deterministic gate, a human-in-command
+approval, and a signed record you can check.</strong> AGP takes it
+furthest and makes fail-closed the <em>default</em>: default-deny,
+no-decision-means-deny, egress <em>runtime-verified</em> off rather than
+assumed, an unresolved secret throws, an unpinned image throws. CCSC
+brings the deterministic policy, the human-in-command gate, and the
+signed record — and leaves which operations fail closed to the policy
+you author. Put together, it’s one posture: don’t trust the runtime —
+make it prove itself, and keep a record you can check. The single
+sharpest thing they do that a rented, vendor-logged agent doesn’t is
+produce <strong>a publicly verifiable, offline audit</strong> — and
+AGP’s signed-HEAD checkpoint closes the exact truncation hole CCSC
+documents. That’s the difference between a log you’re shown and a proof
+you hold.</p>
+<p>Claude Tag is the best agent you can rent, and for most teams that’s
+the right answer — take the zero-setup, the multiplayer memory, the
+strong sandbox, and go. But if your governance model needs the agent —
+and its memory, and its audit trail — to be <strong>yours</strong>, on
+<strong>your</strong> infrastructure, and <strong>verifiable with your
+own key</strong>, then you host it. You give up the free memory and the
+zero-ops UX; you get a substrate no vendor can revoke, relocate, or
+rewrite.</p>
+<p>Both are legitimate engineering positions. The question was never
+which agent is smarter. It’s who has to own the substrate — and who has
+to be able to prove what happened.</p>
+<hr />
+<p><em>CCSC and AGP are open source: <a
+href="https://github.com/jeremylongshore/claude-code-slack-channel">claude-code-slack-channel</a>
+(the governance kernel) and <a
+href="https://github.com/jeremylongshore/agent-governance-plane">agent-governance-plane</a>
+(sandboxed, multi-harness). A companion post, <a
+href="/posts/gate-the-statement-not-the-tool-name/">Gate the Statement,
+Not the Tool Name</a>, walks through the capability-based gate at the
+statement level.</em></p>
+<h2 id="references">References</h2>
+<ul>
+<li>Anthropic (2026). <em>Introducing Claude Tag.</em>
+anthropic.com/news/introducing-claude-tag</li>
+<li>Wulf, J., Meierhofer, J., &amp; Hannich, F. (2025). <em>Architecting
+Human-AI Cocreation for Technical Services.</em> arXiv:2507.14034 — the
+human-in-command / human-on-the-loop oversight spectrum.</li>
+<li>Zhan, Q., Liang, Z., Ying, Z., &amp; Kang, D. (2024).
+<em>InjecAgent: Benchmarking Indirect Prompt Injections in
+Tool-Integrated LLM Agents.</em> Findings of ACL 2024.
+arXiv:2403.02691.</li>
+<li>Zhan, Q., Fang, R., Panchal, H., &amp; Kang, D. (2025). <em>Adaptive
+Attacks Break Defenses Against Indirect Prompt Injection Attacks on LLM
+Agents.</em> NAACL 2025. arXiv:2503.00061.</li>
+<li>Zhang, D., et al. (2025). <em>MCP Security Bench (MSB).</em>
+arXiv:2510.15994.</li>
+<li>Reddy, P. &amp; Gujral, A. S. (2025). <em>EchoLeak: Zero-Click
+Indirect Prompt Injection in Microsoft 365 Copilot
+(CVE-2025-32711).</em> arXiv:2509.10540.</li>
+<li>Zigmond, E., Chong, S., Dimoulas, C., &amp; Moore, S. (2019).
+<em>Fine-Grained, Language-Based Access Control for Database-Backed
+Applications (ShillDB).</em> arXiv:1909.12279.</li>
+<li>Yue, C., et al. (2023). <em>GlassDB: An Efficient Verifiable Ledger
+Database System Through Transparency.</em> PVLDB.
+doi:10.14778/3583140.3583152.</li>
+<li>Malkapuram, S., Gangavarapu, S., Kavalakuntla, K. R., &amp;
+Gangavarapu, A. (2025). <em>Context Lineage Assurance for Non-Human
+Identities in Critical Multi-Agent Systems.</em> arXiv:2509.18415.</li>
+<li>Laurie, B., Langley, A., &amp; Kasper, E. (2013). <em>Certificate
+Transparency.</em> RFC 6962, IETF.</li>
+<li>AlphaSignal (2026). <em>The Real Claude Tag Question Is Context
+Ownership.</em> alphasignalai.substack.com</li>
+</ul>
+<hr />
+<h1 id="part-2-x-twitter-long-form-post">PART 2 — X / TWITTER (long-form
+post)</h1>
+<p>Copy everything inside the box:</p>
+<pre style="white-space:pre-wrap;word-break:break-word;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;"><code>Anthropic just shipped the best agentic teammate you can rent.
+
+Claude Tag drops @Claude into a Slack channel — autonomous tool calls, compounding memory, an isolated sandbox, an Agent Proxy that keeps raw keys away from the model. Zero infrastructure. It&#39;s genuinely good engineering, and if you want an agent in Slack tomorrow, use it.
+
+Here&#39;s the honest trade you&#39;re making: the substrate is theirs. The sandbox, the memory, and the audit log all live on Anthropic&#39;s infra and under their control. Governance is coarse — channel scope + spend caps, not a human approval before each consequential action. And the audit is a log you&#39;re shown, not one you can verify.
+
+AlphaSignal said it best: rent the agent, own the memory. Claude Tag inverts that — you rent the agent and the memory becomes the vendor&#39;s proprietary state.
+
+So we built the other side, open source (Apache-2.0):
+• CCSC — a deterministic per-tool-call policy engine + human-in-command approval + a signed, offline-verifiable audit you check with your OWN public key. No vendor in the trust path.
+• AGP — reimplements &amp; hardens that kernel with a sandbox that proves egress is off, and a signed-HEAD checkpoint that catches a truncated log a plain hash chain can&#39;t.
+
+Both approaches are legitimate. Pick by who has to own the substrate — and who has to be able to prove what the agent did.
+
+Deep-dive: [PASTE SUBSTACK ARTICLE URL]
+Code: github.com/jeremylongshore/claude-code-slack-channel · github.com/jeremylongshore/agent-governance-plane</code></pre>
+<hr />
+<h1 id="part-3-linkedin-jeremys-personal-profile">PART 3 — LINKEDIN
+(Jeremy’s personal profile)</h1>
+<pre style="white-space:pre-wrap;word-break:break-word;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;"><code>Anthropic just made every business ask a question most aren&#39;t ready for.
+
+Claude Tag went live last week — tag @Claude in a Slack channel and it works like a teammate: runs tools, files tickets, remembers your channel, acts autonomously. Zero setup. I&#39;ll say plainly: it&#39;s excellent. The sandbox is strong, and credentials are kept away from the model (with egress reportedly defaulting to deny). If you want an agent in Slack tomorrow with no infrastructure, this is the product.
+
+But there&#39;s a trade underneath the convenience, and it&#39;s worth naming out loud: the substrate is Anthropic&#39;s. The sandbox, the memory your agent builds, and the log of everything it did all live on their infrastructure, under their control. Governance is coarse — you choose which channels and tools, and you set a spend cap. What you don&#39;t get is a human approval before each consequential action, or an audit trail you can verify yourself.
+
+That&#39;s not a knock on Anthropic — the incentives are just obvious. AlphaSignal framed the principle well: rent the agent, own the memory. Claude Tag inverts it.
+
+I spent 20 years running restaurant and trucking operations before I wrote software. In both, you learn the same lesson: when something goes wrong, &quot;trust me&quot; is not an answer — you need a record you can prove. So I built the other side, open source:
+
+→ CCSC: a deterministic policy engine that approves or denies each tool call, with a human in the loop for the ones that matter, and a signed audit log you verify with your own key.
+→ AGP: the same guarantees, plus a sandbox that proves it&#39;s isolated and catches a log that&#39;s been quietly truncated.
+
+Both approaches are legitimate. If you want zero ops, rent. If you need the agent, its memory, and its audit trail to be yours and verifiable on your own infra, own it.
+
+The question was never which agent is smarter. It&#39;s who has to own the substrate — and who has to be able to prove what happened.
+
+Deep-dive + code in the comments. #AIagents #AIgovernance #Slack #OpenSource</code></pre>
+<p><strong>First comment to post under it</strong> (so the links don’t
+suppress reach):</p>
+<pre style="white-space:pre-wrap;word-break:break-word;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;"><code>Deep-dive: [PASTE SUBSTACK ARTICLE URL]
+CCSC: https://github.com/jeremylongshore/claude-code-slack-channel
+AGP: https://github.com/jeremylongshore/agent-governance-plane</code></pre>
+<hr />
+<h1 id="part-4-linkedin-intent-solutions-company-page">PART 4 — LINKEDIN
+(Intent Solutions company page)</h1>
+<pre style="white-space:pre-wrap;word-break:break-word;background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:12px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;"><code>Anthropic shipped Claude Tag. Here&#39;s the question it leaves on the table.
+
+Last week Anthropic launched Claude Tag — an agentic @Claude teammate inside Slack, replacing the legacy Claude in Slack app (retiring August 3). It&#39;s a strong product: zero-setup, multiplayer shared memory, an isolated sandbox, and an Agent Proxy that keeps credentials away from the model (deny-by-default egress, per its launch coverage). For teams that want an autonomous agent with no infrastructure, it&#39;s an excellent choice.
+
+The trade it asks you to accept: the substrate is the vendor&#39;s. The sandbox, the org memory the agent builds, and the audit log of what it did all run on Anthropic&#39;s infrastructure. Governance is coarse-grained — channel scope and spend caps — and the audit is a record you can view, not one you can independently verify.
+
+Intent Solutions builds the customer-owned alternative, open source under Apache-2.0:
+• CCSC — a governance kernel: a deterministic per-tool-call policy engine, human-in-command approval for consequential actions, and a signed, offline-verifiable audit log you check with your own public key. No vendor in the trust path.
+• AGP — reimplements and hardens that kernel with a self-hosted sandbox that proves its network isolation, and a signed-HEAD checkpoint that detects a truncated log a plain hash chain cannot.
+
+This isn&#39;t a security critique of Claude Tag — its sandbox and credential handling are genuinely strong. It&#39;s an ownership and verifiability position: for regulated, security-conscious, or sovereignty-sensitive teams, the agent, its memory, and its audit trail should be yours, on your infrastructure, provable with your own key.
+
+Both models are legitimate. The right one depends on who must own the substrate — and who must be able to prove what happened.
+
+Read the technical deep-dive: [PASTE SUBSTACK ARTICLE URL]
+CCSC: https://github.com/jeremylongshore/claude-code-slack-channel
+AGP: https://github.com/jeremylongshore/agent-governance-plane
+
+#AIagents #AIgovernance #EnterpriseAI #Slack #OpenSource</code></pre>
+<hr />
+<p><em>Any questions on the framing, ping Jeremy. — sent via Intent
+Solutions</em></p>

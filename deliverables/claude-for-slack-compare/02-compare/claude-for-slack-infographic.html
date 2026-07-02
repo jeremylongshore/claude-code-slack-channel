@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude for Slack, Four Ways — Rent vs. Own the Governance Substrate</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#121722; --panel2:#161c28; --line:#232c3d;
+    --ink:#e6edf6; --muted:#9aa7bd; --dim:#6b7890;
+    --rent:#f6a742;      /* amber — Anthropic / rent */
+    --rent-bg:rgba(246,167,66,.09); --rent-line:rgba(246,167,66,.35);
+    --own:#3ecf9a;        /* teal — CCSC/AGP / own */
+    --own-bg:rgba(62,207,154,.09); --own-line:rgba(62,207,154,.35);
+    --warn:#ff7a85;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;line-height:1.5}
+  .wrap{max-width:1180px;margin:0 auto;padding:40px 22px 72px}
+  .mono{font-family:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace}
+  /* hero */
+  .hero{text-align:center;padding:26px 0 34px;border-bottom:1px solid var(--line)}
+  .kicker{letter-spacing:.22em;text-transform:uppercase;font-size:12px;color:var(--dim);margin-bottom:14px}
+  h1{font-size:clamp(28px,4.4vw,46px);line-height:1.08;margin:0 0 14px;font-weight:800}
+  h1 .rent{color:var(--rent)} h1 .own{color:var(--own)}
+  .sub{color:var(--muted);max-width:760px;margin:0 auto;font-size:clamp(15px,1.7vw,18px)}
+  .axis{margin:22px auto 0;max-width:720px;background:var(--panel);border:1px solid var(--line);
+    border-radius:12px;padding:14px 18px;color:var(--muted);font-size:14.5px}
+  .axis b{color:var(--ink)}
+  section{margin-top:46px}
+  h2{font-size:20px;margin:0 0 16px;font-weight:700;display:flex;align-items:center;gap:10px}
+  h2 .tag{font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+  /* matrix */
+  .scroll{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:var(--panel)}
+  table{border-collapse:collapse;width:100%;min-width:860px;font-size:13.5px}
+  th,td{padding:12px 13px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+  thead th{position:sticky;top:0;background:var(--panel2);z-index:1;font-size:13px;font-weight:700}
+  tbody th{font-weight:600;color:var(--muted);white-space:nowrap;background:var(--panel2);width:150px}
+  td:nth-child(2),th:nth-child(2){background:var(--rent-bg)}
+  td:nth-child(3),th:nth-child(3){background:var(--rent-bg)}
+  td:nth-child(4),th:nth-child(4){background:var(--own-bg)}
+  td:nth-child(5),th:nth-child(5){background:var(--own-bg)}
+  th.hRent{color:var(--rent);border-top:3px solid var(--rent-line)}
+  th.hOwn{color:var(--own);border-top:3px solid var(--own-line)}
+  tbody tr:last-child td,tbody tr:last-child th{border-bottom:none}
+  .good{color:var(--own);font-weight:600}
+  .meh{color:var(--rent);font-weight:600}
+  .lim{color:var(--warn)}
+  em.note{color:var(--dim);font-style:italic;font-size:12.5px}
+  /* two highlight panels */
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px}
+  .card.rent{border-color:var(--rent-line);background:linear-gradient(180deg,var(--rent-bg),transparent 60%)}
+  .card.own{border-color:var(--own-line);background:linear-gradient(180deg,var(--own-bg),transparent 60%)}
+  .card h3{margin:0 0 12px;font-size:16.5px}
+  .card.rent h3{color:var(--rent)} .card.own h3{color:var(--own)}
+  ul.tick{list-style:none;margin:0;padding:0}
+  ul.tick li{position:relative;padding:6px 0 6px 26px;color:var(--ink);font-size:14px;border-bottom:1px dashed var(--line)}
+  ul.tick li:last-child{border-bottom:none}
+  ul.tick li::before{position:absolute;left:0;top:6px;font-weight:700}
+  .card.rent ul.tick li::before{content:"◆";color:var(--rent)}
+  .card.own ul.tick li::before{content:"✓";color:var(--own)}
+  /* pros/cons */
+  .grid4{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .pc{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+  .pc .name{font-weight:800;font-size:15.5px;margin-bottom:2px}
+  .pc .role{font-size:12.5px;color:var(--dim);margin-bottom:12px}
+  .pc.rent .name{color:var(--rent)} .pc.own .name{color:var(--own)}
+  .pc .row{font-size:13.5px;margin:7px 0;padding-left:20px;position:relative;color:var(--muted)}
+  .pc .row.p::before{content:"+";position:absolute;left:0;color:var(--own);font-weight:800}
+  .pc .row.c::before{content:"–";position:absolute;left:2px;color:var(--warn);font-weight:800}
+  .pc .row b{color:var(--ink);font-weight:600}
+  /* takeaway */
+  .takeaway{margin-top:44px;background:linear-gradient(120deg,var(--own-bg),var(--rent-bg));
+    border:1px solid var(--line);border-radius:16px;padding:28px 30px;text-align:center}
+  .takeaway p{margin:0;font-size:clamp(17px,2.2vw,22px);font-weight:600;line-height:1.4}
+  .takeaway .r{color:var(--rent)} .takeaway .o{color:var(--own)}
+  /* footer */
+  footer{margin-top:40px;padding-top:20px;border-top:1px solid var(--line);color:var(--dim);font-size:12.5px}
+  footer a{color:var(--own);text-decoration:none;border-bottom:1px solid var(--own-line)}
+  footer a:hover{border-bottom-color:var(--own)}
+  .cta{margin-top:44px}
+  .btn{display:block;text-align:center;padding:13px 16px;margin-bottom:10px;border-radius:10px;background:var(--own-bg);border:1px solid var(--own-line);color:var(--own);font-weight:600;text-decoration:none;font-size:14.5px;transition:background .15s}
+  .btn:hover{background:rgba(62,207,154,.18)}
+  #loopForm{display:flex;flex-direction:column;gap:10px}
+  #loopForm input{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:11px 13px;color:var(--ink);font-size:14px;font-family:inherit}
+  #loopForm input:focus{outline:none;border-color:var(--own-line)}
+  #loopBtn{background:var(--own);color:#062b20;border:none;border-radius:8px;padding:12px;font-weight:700;font-size:14.5px;cursor:pointer;transition:opacity .15s}
+  #loopBtn:hover{opacity:.9} #loopBtn:disabled{opacity:.5;cursor:default}
+  .honest{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--own-line);
+    border-radius:10px;padding:12px 16px;margin:14px 0 18px;color:var(--muted);font-size:12.5px}
+  @media(max-width:720px){.cols,.grid4{grid-template-columns:1fr}.wrap{padding:26px 14px 56px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hero">
+    <div class="kicker">Claude for Slack · Four Ways · June 2026</div>
+    <h1>Do you <span class="rent">rent</span> the agent,<br>or <span class="own">own</span> the substrate?</h1>
+    <p class="sub">Anthropic now ships two official Slack products; two open-source stacks answer them. They split on one axis: <b>who owns the sandbox, the memory, and the audit log the agent runs on.</b></p>
+    <div class="axis"><b>Claude Tag is the best agent you can rent</b> — zero-setup, strong managed sandbox, compounding memory. <b>CCSC + AGP</b> make the opposite trade: you host it, you own the memory, and the audit is a signed record you verify with your own key. Both are legitimate — pick by who must own the substrate.</div>
+  </div>
+
+  <section>
+    <h2>The matrix <span class="tag">rent ◀ ▶ own</span></h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th class="hRent">A — Claude in Slack<br><em class="note">legacy · retires Aug 3 2026</em></th>
+            <th class="hRent">B — Claude Tag / @Claude<br><em class="note">launched Jun 23 2026</em></th>
+            <th class="hOwn">CCSC<br><em class="note">governance kernel · Apache-2.0</em></th>
+            <th class="hOwn">AGP<br><em class="note">sandboxed · Apache-2.0</em></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th>Hosting</th><td>Anthropic (SaaS)</td><td>Anthropic infra</td><td class="good">Self-host</td><td class="good">Self-host</td></tr>
+          <tr><th>Agentic level</th><td>Non-agentic (Q&amp;A / summarize)</td><td>Fully agentic teammate</td><td>Agentic, gated per call</td><td>Agentic, gated + sandboxed</td></tr>
+          <tr><th>Approval model</th><td>N/A</td><td class="meh">Coarse — channel scope + spend caps; no per-action approval</td><td class="good">Per-tool-call HITL (allow/deny/require)</td><td class="good">Per-tool-call HITL (default-deny)</td></tr>
+          <tr><th>Audit</th><td>Vendor SaaS logs</td><td class="meh">Vendor log admins can <em>view</em></td><td class="good">Signed, offline-verifiable (hash-chain + Ed25519 + policy attestation)</td><td class="good">Signed + signed-HEAD checkpoint (closes truncation gap)</td></tr>
+          <tr><th>Memory &amp; data</th><td>Vendor</td><td class="meh">Vendor — memory is Anthropic's proprietary state</td><td class="good">Yours, on your infra</td><td class="good">Yours, on your infra</td></tr>
+          <tr><th>Cost control</th><td>Subscription</td><td class="good">Token-spend caps (org + channel)</td><td>Own the model bill; deny via policy <em class="note">(per-channel cap on roadmap)</em></td><td>Own the model bill; gate/deny via policy</td></tr>
+          <tr><th>Sandbox</th><td>N/A</td><td class="good">Strong, managed — sandbox + Agent Proxy <em class="note">(deny-by-default egress, per launch coverage)</em></td><td>None itself (delegated to AGP)</td><td class="good">Hardened container; preflight <em>proves</em> egress off <em class="note">(namespace/cgroup, not VM)</em></td></tr>
+          <tr><th>Credentials</th><td>Vendor-managed</td><td>Model never sees raw keys</td><td>Secret values never sent</td><td>"Gate, don't impersonate" — journals names, not values</td></tr>
+          <tr><th>Harnesses</th><td>Claude</td><td>Claude (Opus 4.8)</td><td>Claude Code</td><td class="good">Multi-harness (Claude + Codex) <em class="note">live Codex provisional</em></td></tr>
+          <tr><th>License</th><td>Proprietary</td><td>Proprietary</td><td class="good">Apache-2.0</td><td class="good">Apache-2.0</td></tr>
+          <tr><th>Setup cost</th><td>Low</td><td class="good">Lowest — tag &amp; go</td><td>Higher — you operate it</td><td>Higher — you operate it</td></tr>
+          <tr><th>Best for</th><td>Q&amp;A / summaries (sunsetting)</td><td>Teams wanting a zero-setup teammate on managed infra</td><td>Regulated / security-conscious teams needing verifiable audit + HITL</td><td>+ sandboxed multi-harness execution</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>What each side does that the other can't</h2>
+    <div class="cols">
+      <div class="card rent">
+        <h3>What only Claude Tag does</h3>
+        <ul class="tick">
+          <li>Zero infrastructure / zero-ops — tag and go</li>
+          <li>Multiplayer memory that compounds automatically across a channel</li>
+          <li>Ambient / proactive + scheduled autonomous work, no orchestration to build</li>
+          <li>Fully-managed strong sandbox + Agent Proxy — no security engineering on your part</li>
+          <li>Built-in token-spend caps + central org governance on day one</li>
+        </ul>
+      </div>
+      <div class="card own">
+        <h3>What only CCSC + AGP do</h3>
+        <ul class="tick">
+          <li>A signed, offline-verifiable audit you check with <b>your own public key</b> — no vendor in the trust path</li>
+          <li>AGP's signed-HEAD checkpoint catches a <b>truncated</b> log — the gap CCSC documents as T8</li>
+          <li>Deterministic, fine-grained per-tool-call policy (default-deny in AGP), not channel scope + budget</li>
+          <li>Human-in-command approval per consequential call, with anti-self-approval a bot can't satisfy</li>
+          <li>The memory + audit are <b>yours</b>, portable — no context lock-in</li>
+          <li>A sandbox that <b>proves</b> egress is off (preflight fails closed)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Pros &amp; cons <span class="tag">honest — no FUD</span></h2>
+    <div class="grid4">
+      <div class="pc rent">
+        <div class="name">Claude Tag / @Claude</div>
+        <div class="role">The best agent you can rent</div>
+        <div class="row p"><b>Zero infra</b>, multiplayer memory, ambient + scheduled work</div>
+        <div class="row p"><b>Genuinely strong managed security</b> — sandbox + Agent Proxy (deny-by-default egress per launch coverage)</div>
+        <div class="row p">Token-spend caps + central admin governance out of the box</div>
+        <div class="row c">Substrate is Anthropic's — <b>memory + audit live on their infra</b></div>
+        <div class="row c">Governance is coarse; audit is shown, not verifiable by you; context lock-in</div>
+      </div>
+      <div class="pc rent">
+        <div class="name">Claude in Slack (legacy)</div>
+        <div class="role">Retiring Aug 3, 2026</div>
+        <div class="row p">Dead-simple; good at summarize / answer; near-zero setup</div>
+        <div class="row c">Not agentic</div>
+        <div class="row c">Being retired — migration is effectively forced</div>
+      </div>
+      <div class="pc own">
+        <div class="name">CCSC</div>
+        <div class="role">The governance kernel · Apache-2.0</div>
+        <div class="row p">Deterministic per-tool-call policy (allow/deny/require) + human-in-command approval</div>
+        <div class="row p"><b>Signed, offline-verifiable audit</b> — public-key-only verification; five injection-defense layers</div>
+        <div class="row p">You own the memory + audit on your infra</div>
+        <div class="row c">You host + operate it; no execution sandbox of its own (that's AGP)</div>
+        <div class="row c">Bare chain doesn't stop truncation (T8 — AGP fixes it); no host-OS-compromise protection</div>
+      </div>
+      <div class="pc own">
+        <div class="name">AGP</div>
+        <div class="role">Sandboxed · multi-harness · Apache-2.0</div>
+        <div class="row p">CCSC's guarantees + a sandbox that <b>proves</b> egress off; signed-HEAD closes truncation</div>
+        <div class="row p">"Gate, don't impersonate" credentials; one gate across Claude Code + Codex</div>
+        <div class="row c">You host + operate it; sandbox is namespace/cgroup, <b>not VM-grade</b></div>
+        <div class="row c">Live Codex interception provisional; self-assessed test grade B− (78/100)</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="takeaway">
+    <p><span class="r">Claude Tag is the best agent you can rent.</span> If the agent — and its memory and its audit trail — must be <span class="o">yours and verifiable on your own infra</span>, you host it. Both are legitimate. Pick by <b>who must own the substrate.</b></p>
+  </div>
+
+  <section class="cta">
+    <h2>Try it &amp; stay in the loop</h2>
+    <div class="cols">
+      <div class="card own">
+        <h3>Get the code</h3>
+        <p style="color:var(--muted);font-size:14px;margin:0 0 16px">Both stacks are open source (Apache-2.0). Run them on your own infrastructure.</p>
+        <a class="btn" href="https://github.com/jeremylongshore/claude-code-slack-channel" target="_blank" rel="noopener">★ CCSC — the governance kernel →</a>
+        <a class="btn" href="https://github.com/jeremylongshore/agent-governance-plane" target="_blank" rel="noopener">★ AGP — sandboxed, multi-harness →</a>
+      </div>
+      <div class="card own">
+        <h3>Stay in the loop with Intent Solutions</h3>
+        <p style="color:var(--muted);font-size:14px;margin:0 0 14px">Customer-owned, verifiable AI governance — new drops, deep-dives, and releases. No spam.</p>
+        <form id="loopForm" novalidate>
+          <input type="text" id="loopName" placeholder="Name (optional)" autocomplete="name">
+          <input type="email" id="loopEmail" placeholder="you@company.com" required autocomplete="email">
+          <input type="text" id="loopHp" name="website" tabindex="-1" autocomplete="off" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0">
+          <button type="submit" id="loopBtn">Keep me in the loop</button>
+        </form>
+        <p id="loopMsg" style="font-size:13px;margin:10px 0 0;min-height:18px" aria-live="polite"></p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="honest"><b>Honest-claims note:</b> This graphic says "signed, offline-verifiable" — never "tamper-proof / forensic-grade / compliance-grade." A signed log can still be stolen wholesale if a host is compromised; verifiability is a property of the record, not a shield around your infrastructure. Claims trace to primary sources; own-stack limits are stated, not hidden.</div>
+    Sources: Anthropic — <a href="https://www.anthropic.com/news/introducing-claude-tag">Introducing Claude Tag</a> ·
+    AlphaSignal — <a href="https://alphasignalai.substack.com/p/the-real-claude-tag-question-is-context">The Real Claude Tag Question Is Context Ownership</a> ·
+    CCSC — <a href="https://github.com/jeremylongshore/claude-code-slack-channel">claude-code-slack-channel</a> ·
+    AGP — <a href="https://github.com/jeremylongshore/agent-governance-plane">agent-governance-plane</a> ·
+    Prompt-injection evidence: InjecAgent (arXiv:2403.02691), Adaptive Attacks Break Defenses (arXiv:2503.00061), MCP Security Bench (arXiv:2510.15994).
+    <br><br>Intent Solutions · intentsolutions.io · June 2026
+  </footer>
+
+</div>
+<script>
+(function(){
+  var f=document.getElementById('loopForm'),msg=document.getElementById('loopMsg'),btn=document.getElementById('loopBtn');
+  if(!f)return;
+  f.addEventListener('submit',function(e){
+    e.preventDefault();
+    var email=(document.getElementById('loopEmail').value||'').trim();
+    var name=(document.getElementById('loopName').value||'').trim()||'Newsletter subscriber';
+    var hp=document.getElementById('loopHp').value||'';
+    if(!email||email.indexOf('@')<1){msg.style.color='#ff7a85';msg.textContent='Please enter a valid email.';return;}
+    btn.disabled=true;btn.textContent='Sending…';msg.textContent='';
+    fetch('/api/forms/contact',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        name:name,email:email,interest:'learn',
+        message:'Stay-in-the-loop signup from the Claude-for-Slack infographic (demos.intentsolutions.io/claude-for-slack-rent-vs-own.html)',
+        website:hp
+      })
+    }).then(function(r){return r.ok?r.json():Promise.reject(r);})
+      .then(function(){f.style.display='none';msg.style.color='#3ecf9a';msg.textContent="You're in — thanks. We'll be in touch.";})
+      .catch(function(){btn.disabled=false;btn.textContent='Keep me in the loop';msg.style.color='#ff7a85';msg.textContent='Something went wrong — email jeremy@intentsolutions.io and we’ll add you.';});
+  });
+})();
+</script>
+</body>
+</html>
