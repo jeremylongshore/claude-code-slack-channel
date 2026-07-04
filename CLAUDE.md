@@ -231,6 +231,7 @@ Layout spec + lifecycle state machine + supervisor contract: [`000-docs/session-
 - Issues → 2–5 themed epics (A/B split + sub-epics when >5 children). Don't ship one flat epic with 10 children.
 - Branch naming: `feat/<description>-bz-<bead-id>` (multiple beads: chain `-bz-<bead>` per bead, e.g. `feat/security-scanners-bz-bsz-bz-8g6`). Docs-only: `docs/<description>`. Bug fixes: `fix/<description>-bz-<bead-id>`.
 - Client floor: Channels require Claude Code v2.1.80+ with `claude.ai` login (Research Preview constraint — see README).
+- `deliverables/` (top-level, tracked) holds **draft content, not code** — competitive one-pagers, social/blog drafts, and the standalone HTML infographic under `deliverables/claude-for-slack-compare/`. It's outside the runtime, the tests, and the CI gates; ignore it for codebase work (it's not architecture or spec).
 
 ## Issue tracking (bd) — readable-trail rule
 
