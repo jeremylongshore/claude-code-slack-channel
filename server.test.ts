@@ -658,6 +658,21 @@ describe('gate', () => {
     expect(result.dropReason).toBe('event.no_user')
   })
 
+  test('prototype-chain channel id is dropped, not read off the prototype (Object.hasOwn guard)', async () => {
+    // A channel id equal to an inherited Object.prototype member must be
+    // treated as not-opted-in. A bare `access.channels[channel]` lookup
+    // would read a truthy function (e.g. Object.prototype.constructor) and
+    // either bypass the opt-in gate or crash on `policy.allowFrom`.
+    for (const protoKey of ['constructor', 'toString', 'valueOf']) {
+      const result = await gate(
+        { user: 'U1', channel_type: 'channel', channel: protoKey },
+        makeOpts(),
+      )
+      expect(result.action).toBe('drop')
+      expect(result.dropReason).toBe('channel.not_opted')
+    }
+  })
+
   test('closed-DM drop carries dropReason dm.policy_closed (ccsc-apj.2)', async () => {
     const access = makeAccess({ dmPolicy: 'disabled' })
     const result = await gate(
@@ -1638,6 +1653,19 @@ describe('assertOutboundAllowed', () => {
     const delivered = new Set([deliveredThreadKey('C_SHARED', 'T_A')])
     expect(() => assertOutboundAllowed('C_SHARED', 'T_A', access, delivered)).not.toThrow()
     expect(() => assertOutboundAllowed('C_SHARED', 'T_B', access, delivered)).toThrow(/thread T_B/)
+  })
+
+  test('does NOT treat a prototype-chain channel id as opted-in (Object.hasOwn guard)', () => {
+    // A channel id that shadows an inherited Object.prototype member must
+    // NOT pass the gate via a truthy prototype-chain read. With a bare
+    // `access.channels[chatId]` check, 'constructor'/'toString' would read
+    // a truthy function off the prototype and silently authorize the send.
+    const access = makeAccess()
+    for (const protoKey of ['constructor', 'toString', 'hasOwnProperty', 'valueOf']) {
+      expect(() => assertOutboundAllowed(protoKey, 'T1', access, new Set())).toThrow(
+        'Outbound gate',
+      )
+    }
   })
 
   test('blocks top-level post when only a thread has delivered', async () => {
@@ -3384,7 +3412,7 @@ describe('PolicyRule schema (29-A.1)', () => {
     ).toThrow()
   })
 
-  // ── thread_ts predicate (schema-only until Epic 29-B wires evaluate()) ─
+  // ── thread_ts predicate (schema validation; enforcement wired 29-B) ────
 
   test('MatchSpec accepts a valid Slack thread_ts', async () => {
     const { PolicyRule } = await loadPolicyModule()
@@ -3767,6 +3795,70 @@ describe('evaluate() — policy engine (29-A.3)', () => {
       ttlMs: 60_000,
       approvers: 1,
     })
+  })
+
+  // ── thread_ts predicate enforcement (Epic 29-B wiring; regression) ──────
+  // Guards the fix for the hazard where a thread_ts-scoped rule silently
+  // matched EVERY thread because matchApplies() ignored match.thread_ts.
+
+  test('thread_ts rule applies only to the matching thread', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { thread_ts: '1712345678.001100' },
+      } as never),
+    ]
+    const decision = evaluate(
+      baseCall({ sessionKey: { channel: 'C_CHAN', thread: '1712345678.001100' } }),
+      rules,
+      0,
+    )
+    expect(decision).toEqual({ kind: 'allow', rule: 'r1' })
+  })
+
+  test('thread_ts rule does NOT apply to a different thread (no longer matches everything)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({
+        id: 'r1',
+        effect: 'auto_approve',
+        match: { thread_ts: '1712345678.001100' },
+      } as never),
+    ]
+    // A call in a different thread must fall through to the default allow
+    // with NO rule id — proving the auto_approve did not fire globally.
+    const decision = evaluate(
+      baseCall({ sessionKey: { channel: 'C_CHAN', thread: '9999999999.000000' } }),
+      rules,
+      0,
+    )
+    expect(decision).toEqual({ kind: 'allow' })
+  })
+
+  test('thread_ts deny scopes to one thread and leaves others unaffected', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const rules = [
+      rule({
+        id: 'block-thread',
+        effect: 'deny',
+        reason: 'thread quarantined',
+        match: { thread_ts: '1712345678.001100' },
+      } as never),
+    ]
+    const denied = evaluate(
+      baseCall({ sessionKey: { channel: 'C_CHAN', thread: '1712345678.001100' } }),
+      rules,
+      0,
+    )
+    expect(denied).toEqual({ kind: 'deny', rule: 'block-thread', reason: 'thread quarantined' })
+    const other = evaluate(
+      baseCall({ sessionKey: { channel: 'C_CHAN', thread: '2222222222.000000' } }),
+      rules,
+      0,
+    )
+    expect(other).toEqual({ kind: 'allow' })
   })
 
   // ── Approval flow ──────────────────────────────────────────────────────
@@ -11472,6 +11564,26 @@ describe('verifyJournal', () => {
       // prevHash mismatch — hash of the removed seq=3 is what seq=4
       // expected.
       expect(result.break.lineNumber).toBe(3)
+    }
+  })
+
+  test('detects head truncation: shearing the seq=1 event is caught by the genesis-seq pin', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(4)
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.split('\n').filter(Boolean)
+    // Delete the genesis event (seq=1). The surviving prefix (seq=2..4)
+    // chains cleanly among itself, and the new first event's prevHash is
+    // trusted as genesis — without the seq pin this would verify OK.
+    lines.splice(0, 1)
+    writeFileSync(logPath, `${lines.join('\n')}\n`, { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.lineNumber).toBe(1)
+      expect(result.break.seq).toBe(2)
+      expect(result.break.reason).toMatch(/head truncated/)
     }
   })
 

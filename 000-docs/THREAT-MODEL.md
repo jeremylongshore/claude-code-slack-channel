@@ -311,7 +311,11 @@ missed primitive is a bypass.
 > pending tool call they didn't request.
 
 - Codes are 5-letter, alphabet restricted (`[a-km-z]` in
-  `PERMISSION_REPLY_RE` — 22 letters, no ambiguous `l`/`o`) — ~5M space.
+  `PERMISSION_REPLY_RE` — 25 letters, excludes only the ambiguous `l`;
+  the class still includes `o`) — ~9.8M space (25⁵). The regex is a
+  fail-closed *validator* over the request_id Claude Code emits, not a
+  generator, so it is not tightened to also drop `o` (that would reject
+  legitimate ids); the keyspace figure is corrected here to match.
 - Codes are single-use, scoped to one pending call, short TTL.
 - The gate matches the reply format *before* MCP sees the text, so a
   non-matching body (which might be prompt-injection) never reaches Claude

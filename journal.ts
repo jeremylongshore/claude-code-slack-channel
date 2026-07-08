@@ -1202,6 +1202,37 @@ export interface VerifyOptions {
   initialPublicKey?: string
 }
 
+/** Sequence-continuity check, factored out of verifyJournal to keep its
+ *  cyclomatic complexity under the Wall-5 gate. Enforces two rules:
+ *   - genesis: the first accepted event (prevAcceptedSeq === null) must
+ *     carry seq 1, else the journal head was truncated;
+ *   - continuity: every later event increments seq by exactly 1.
+ *  Returns a break descriptor (reason + expected/actual) or null when the
+ *  seq is valid. */
+function checkSeqContinuity(
+  seq: number,
+  prevAcceptedSeq: number | null,
+): { reason: string; expected: string; actual: string } | null {
+  if (prevAcceptedSeq === null) {
+    if (seq !== 1) {
+      return {
+        reason: `first event has seq ${seq}, expected 1 — journal head truncated`,
+        expected: '1',
+        actual: String(seq),
+      }
+    }
+    return null
+  }
+  if (seq !== prevAcceptedSeq + 1) {
+    return {
+      reason: `seq gap — expected ${prevAcceptedSeq + 1}, got ${seq}`,
+      expected: String(prevAcceptedSeq + 1),
+      actual: String(seq),
+    }
+  }
+  return null
+}
+
 /** Verify a journal file end-to-end per audit-journal-architecture.md
  *  §237-261. Reads the file line-by-line, schema-validates each
  *  record, and recomputes `sha256(prevHash || canonicalJson(event
@@ -1224,7 +1255,15 @@ export interface VerifyOptions {
  *      (first event's `prevHash` is trusted as the genesis value —
  *      that's the `TRUSTED_ANCHOR` contract from §76-85; validating
  *      the anchor is a caller concern for now).
- *    - `seq` is strictly monotonic by +1 with no gaps.
+ *    - `seq` is strictly monotonic by +1 with no gaps, AND the first
+ *      accepted event has `seq === 1`. The genesis-seq pin defeats
+ *      head-truncation (shearing lines off the top): the surviving
+ *      prefix would otherwise verify cleanly because its new first
+ *      event's `prevHash` is trusted as genesis. Tail-truncation and a
+ *      full-file rewrite that downgrades every event to unsigned v1
+ *      (stripping Ed25519 signatures) remain residual — defeating the
+ *      latter needs a pinned "signing began at seq N" anchor (deferred;
+ *      tracked in the Fable-5-review follow-ups, see PR).
  *
  *  The function never modifies the file (read-only contract).
  *  Returns on the first break; a second broken event after a fixed
@@ -1328,18 +1367,12 @@ export async function verifyJournal(path: string, opts: VerifyOptions = {}): Pro
       }
     }
 
-    if (prevAcceptedSeq !== null && event.seq !== prevAcceptedSeq + 1) {
+    const seqBreak = checkSeqContinuity(event.seq, prevAcceptedSeq)
+    if (seqBreak !== null) {
       return {
         ok: false,
         eventsVerified,
-        break: {
-          lineNumber,
-          seq: event.seq,
-          ts: event.ts,
-          reason: `seq gap — expected ${prevAcceptedSeq + 1}, got ${event.seq}`,
-          expected: String(prevAcceptedSeq + 1),
-          actual: String(event.seq),
-        },
+        break: { lineNumber, seq: event.seq, ts: event.ts, ...seqBreak },
       }
     }
 
