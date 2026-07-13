@@ -517,19 +517,19 @@ export interface SessionSupervisor {
 /** Structured log line emitted by the supervisor. `event` is a stable
  *  identifier (e.g. `session.activate`); `fields` carries the event's
  *  payload. Consumers are expected to inject their own writer; the
- *  default writes one newline-delimited JSON object per call to stdout
- *  so the journal sink (Epic 30-A) can tail the stream. */
+ *  default writes one newline-delimited JSON object per call to stderr
+ *  (stdout is the MCP stdio protocol channel and must stay clean). */
 export type SupervisorLog = (event: string, fields: Record<string, unknown>) => void
 
 /** Injection points for a SessionSupervisor. All are optional; defaults
- *  give you a production-shaped supervisor that writes to stdout and
+ *  give you a production-shaped supervisor that logs to stderr and
  *  reads real wall-clock time. Tests supply their own `log` and `clock`
  *  to keep assertions deterministic. */
 export interface SupervisorOptions {
   /** State directory root, e.g. `~/.claude/channels/slack`. The same
    *  root passed to `sessionPath()` and `loadSession()` in lib.ts. */
   stateRoot: string
-  /** Optional structured log sink. Defaults to a stdout JSON-line
+  /** Optional structured log sink. Defaults to a stderr JSON-line
    *  writer. */
   log?: SupervisorLog
   /** Optional wall-clock source, returning epoch-ms. Defaults to
