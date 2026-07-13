@@ -3797,15 +3797,40 @@ async function main(): Promise<void> {
     console.error('[slack] Failed to resolve bot identity:', err)
   }
 
-  // Connect Socket Mode (Slack ↔ local WebSocket)
-  await socket.start()
-  console.error('[slack] Socket Mode connected')
-
-  // Connect MCP stdio (server ↔ Claude Code)
+  // Connect MCP stdio (server ↔ Claude Code) FIRST. The stdio handshake
+  // has no external dependency and must come up immediately: when
+  // socket.start() was awaited before mcp.connect(), any Slack-side
+  // Socket Mode slowness (throttled reconnects after connection churn,
+  // flaky WebSocket pongs) blew Claude Code's 30s MCP handshake window,
+  // and the client logged a connection timeout and gave up without
+  // retrying — the whole channel stayed dead. Outbound tools
+  // (reply/react/...) use the HTTPS WebClient and work regardless of
+  // Socket Mode state; only inbound events wait on the socket.
   const transport = new StdioServerTransport()
   transport.onclose = () => void shutdown('stdio transport closed')
   await mcp.connect(transport)
   console.error('[slack] MCP server running on stdio')
+
+  // Connect Socket Mode (Slack ↔ local WebSocket) asynchronously with
+  // bounded-backoff retries. The @slack/socket-mode client auto-reconnects
+  // once started; this loop only guards the initial start() call.
+  void (async () => {
+    let delayMs = 2_000
+    while (true) {
+      try {
+        await socket.start()
+        console.error('[slack] Socket Mode connected')
+        return
+      } catch (err) {
+        console.error(
+          `[slack] Socket Mode start failed (retrying in ${Math.round(delayMs / 1000)}s):`,
+          err instanceof Error ? err.message : err,
+        )
+        await new Promise((r) => setTimeout(r, delayMs))
+        delayMs = Math.min(delayMs * 2, 60_000)
+      }
+    }
+  })()
 
   // Belt-and-suspenders: the SDK's StdioServerTransport doesn't listen for
   // stdin end/close, so transport.onclose never fires on its own. Hook stdin
