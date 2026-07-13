@@ -3784,24 +3784,11 @@ async function main(): Promise<void> {
   deliveryTimer = setInterval(drainOutboxOnce, deliveryPollMs)
   if (typeof deliveryTimer.unref === 'function') deliveryTimer.unref()
 
-  // Resolve bot identity (user ID, bot ID, app ID) for mention detection
-  // and self-echo filtering across payload variants and multi-workspace setups
-  try {
-    const auth = await web.auth.test()
-    botUserId = (auth.user_id as string) || ''
-    selfBotId = (auth.bot_id as string) || ''
-    // app_id may not be present in all auth.test responses; fall back to empty
-    selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
-    console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
-  } catch (err) {
-    console.error('[slack] Failed to resolve bot identity:', err)
-  }
-
   // Connect MCP stdio (server ↔ Claude Code) FIRST. The stdio handshake
   // has no external dependency and must come up immediately: when
-  // socket.start() was awaited before mcp.connect(), any Slack-side
-  // Socket Mode slowness (throttled reconnects after connection churn,
-  // flaky WebSocket pongs) blew Claude Code's 30s MCP handshake window,
+  // socket.start() (and the web.auth.test() identity call, whose WebClient
+  // defaults to ~30 minutes of internal retries) ran before mcp.connect(),
+  // any Slack-side slowness blew Claude Code's 30s MCP handshake window,
   // and the client logged a connection timeout and gave up without
   // retrying — the whole channel stayed dead. Outbound tools
   // (reply/react/...) use the HTTPS WebClient and work regardless of
@@ -3811,20 +3798,55 @@ async function main(): Promise<void> {
   await mcp.connect(transport)
   console.error('[slack] MCP server running on stdio')
 
-  // Connect Socket Mode (Slack ↔ local WebSocket) asynchronously with
-  // bounded-backoff retries. The @slack/socket-mode client auto-reconnects
-  // once started; this loop only guards the initial start() call.
+  // Bring up the Slack side asynchronously: resolve bot identity, then
+  // connect Socket Mode with bounded-backoff retries. Identity resolution
+  // runs here (not before mcp.connect) because it is only consumed by
+  // inbound-event processing — mention detection and self-echo filtering —
+  // and no inbound event can arrive until socket.start() succeeds below.
+  //
+  // The retry loop only guards the initial start(): the @slack/socket-mode
+  // client auto-reconnects once started. Two deliberate exits:
+  //   - shuttingDown → stop retrying; a post-shutdown start() would
+  //     resurrect a socket in a process about to exit (zombie instance
+  //     stealing round-robined events).
+  //   - unrecoverable auth/config errors (revoked or wrong xapp token) →
+  //     fail loud and exit non-zero so the operator sees it at boot,
+  //     instead of retrying a permanently-fatal error forever.
   void (async () => {
+    // Resolve bot identity (user ID, bot ID, app ID) for mention detection
+    // and self-echo filtering across payload variants and multi-workspace setups
+    try {
+      const auth = await web.auth.test()
+      botUserId = (auth.user_id as string) || ''
+      selfBotId = (auth.bot_id as string) || ''
+      // app_id may not be present in all auth.test responses; fall back to empty
+      selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
+      console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
+    } catch (err) {
+      console.error('[slack] Failed to resolve bot identity:', err)
+    }
+
+    // Slack marks these Socket Mode start errors unrecoverable (thrown out of
+    // retrieveWSSURL rather than internally reconnected) — retrying them
+    // forever would silently mask a dead channel.
+    const UNRECOVERABLE_START_RE =
+      /not_authed|invalid_auth|account_inactive|user_removed_from_team|team_disabled/
     let delayMs = 2_000
-    while (true) {
+    while (!shuttingDown) {
       try {
         await socket.start()
         console.error('[slack] Socket Mode connected')
         return
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (UNRECOVERABLE_START_RE.test(msg)) {
+          console.error('[slack] Socket Mode start failed with unrecoverable error:', msg)
+          await shutdown('unrecoverable Socket Mode start error', 1)
+          return
+        }
         console.error(
           `[slack] Socket Mode start failed (retrying in ${Math.round(delayMs / 1000)}s):`,
-          err instanceof Error ? err.message : err,
+          msg,
         )
         await new Promise((r) => setTimeout(r, delayMs))
         delayMs = Math.min(delayMs * 2, 60_000)
