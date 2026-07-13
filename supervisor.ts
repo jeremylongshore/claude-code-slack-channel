@@ -603,15 +603,21 @@ export function resolveMaxConcurrentSessions(
 }
 
 /** Default structured log writer: one newline-delimited JSON object per
- *  call, written to stdout. Matches the format the journal sink will
- *  tail. Keeping this internal means callers who want a different sink
- *  just pass their own `log` — no global config. */
+ *  call, written to STDERR. Keeping this internal means callers who want
+ *  a different sink just pass their own `log` — no global config.
+ *
+ *  This must NOT write to stdout: the server speaks MCP over stdio, so
+ *  stdout is the protocol channel. A structured log line there arrives
+ *  at the client as an invalid JSON-RPC message (no jsonrpc/method/id
+ *  keys) and Claude Code drops the whole connection — in practice every
+ *  `session.activate` (one per inbound message) and every boot-time
+ *  recovery-sweep line killed the transport. */
 function defaultLog(event: string, fields: Record<string, unknown>): void {
   const line = JSON.stringify({ event, ...fields })
-  // process.stdout.write is sync for TTYs, async for pipes; either way
+  // process.stderr.write is sync for TTYs, async for pipes; either way
   // the supervisor does not await the flush. Structured logs are best-
   // effort; loss of a line is not a correctness issue.
-  process.stdout.write(`${line}\n`)
+  process.stderr.write(`${line}\n`)
 }
 
 /** Construct a SessionSupervisor bound to a state directory.
