@@ -2611,6 +2611,56 @@ export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
   return null
 }
 
+/** Parse `--min-events N` (ccsc-x0t.9). Returns the non-negative integer floor
+ *  when the flag is present with a valid value, or null when the flag is
+ *  ABSENT. **Throws** when the flag is present but its value is missing or
+ *  malformed — this is deliberately fail-closed (Gemini review, PR #277):
+ *  silently returning null on a typo like `--min-events 1OO` (letter O) would
+ *  disable the very tamper-check the flag exists for, so a wiped log could pass.
+ *  A present-but-broken flag must be loud, never a silent no-op.
+ *
+ *  Why this exists: `verifyJournal` of a wiped-to-empty `audit.log` returns
+ *  `{ ok: true, eventsVerified: 0 }`, which `formatVerifyResult` prints as
+ *  `OK: 0 event(s) verified` with exit 0 — so a MONITORING SCRIPT reads a
+ *  destroyed log as "verified clean". An operator who knows the log should
+ *  contain at least N events passes `--min-events N`; if it's been wiped below
+ *  that, `formatVerifyResult` fails the check (exit 1). A first-boot empty log
+ *  is still legitimately valid, so the floor is operator-supplied — the flag is
+ *  optional, but if supplied it must be valid.
+ *
+ *  Forms: `--min-events N` (space) / `--min-events=N` (equals). Rejects
+ *  negatives, non-integers, and empty values by throwing. */
+export function parseMinEventsArg(argv: ReadonlyArray<string>): number | null {
+  const accept = (raw: string): number => {
+    if (!/^\d+$/.test(raw)) {
+      throw new Error(
+        `invalid --min-events value ${JSON.stringify(raw)}: must be a non-negative integer`,
+      )
+    }
+    const n = Number.parseInt(raw, 10)
+    if (!Number.isSafeInteger(n)) {
+      throw new Error(
+        `invalid --min-events value ${JSON.stringify(raw)}: exceeds safe integer range`,
+      )
+    }
+    return n
+  }
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === '--min-events') {
+      const next = argv[i + 1]
+      // A following token that is itself a flag (or no token) is a missing
+      // value — fail closed rather than swallow the next flag as the count.
+      if (typeof next === 'string' && !next.startsWith('-')) return accept(next)
+      throw new Error('missing value for --min-events (expected a non-negative integer)')
+    }
+    if (arg.startsWith('--min-events=')) {
+      return accept(arg.slice('--min-events='.length))
+    }
+  }
+  return null
+}
+
 /** Shape mirror of `VerifyResult` from journal.ts, repeated here so
  *  lib.ts stays framework-free (no journal.ts import — avoids a cycle
  *  and keeps lib.ts pure). Discriminated on `ok`. */
@@ -2643,8 +2693,22 @@ export type VerifyResultShape =
 export function formatVerifyResult(
   result: VerifyResultShape,
   path: string,
+  minEvents?: number,
 ): { text: string; exitCode: 0 | 1 } {
   if (result.ok) {
+    // eventsVerified floor (ccsc-x0t.9): a hash-clean chain that verifies fewer
+    // events than the operator expects is treated as a FAILURE — this is how a
+    // wiped/truncated-to-empty log stops reading as "verified clean" to a
+    // monitoring script. Absent floor → unchanged behavior.
+    if (minEvents !== undefined && result.eventsVerified < minEvents) {
+      return {
+        text:
+          `FAIL: audit journal too short at ${path}\n` +
+          `  reason:   verified ${result.eventsVerified} event(s), expected at least ${minEvents} ` +
+          `(--min-events) — the log may have been truncated or wiped`,
+        exitCode: 1,
+      }
+    }
     return {
       text: `OK: ${result.eventsVerified} event(s) verified in ${path}`,
       exitCode: 0,

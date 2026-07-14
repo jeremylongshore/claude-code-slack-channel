@@ -508,6 +508,8 @@ verify it from anywhere the repo is checked out.
 
 ```bash
 bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log
+# Fail if the log has fewer than N events (catches a wiped/truncated log):
+bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log --min-events 100
 ```
 
 Output contract (stable — operators may grep):
@@ -516,12 +518,26 @@ Output contract (stable — operators may grep):
 - Break: multi-line `FAIL:` block on stderr with `line:`, `seq:`, `ts:`,
   `reason:`, plus `expected:` / `actual:` when applicable and an
   `events verified before break:` tail for truncation forensics.
+- Too short: `FAIL: audit journal too short …` on stderr when `--min-events N`
+  is set and fewer than `N` events verified.
+
+**`--min-events N` — the eventsVerified floor (ccsc-x0t.9).** A hash-clean chain
+that verifies *zero* events (a wiped-to-empty `audit.log`) returns
+`{ ok: true, eventsVerified: 0 }` and would otherwise print `OK: 0 event(s)
+verified` with exit `0` — so a monitoring cron reads a **destroyed log as
+"verified clean."** An operator who knows the log should hold at least `N`
+events passes `--min-events N`; if it has been truncated below that, verification
+**fails** (exit 1). The floor is operator-supplied, not a hard "empty = fail",
+because a first-boot log legitimately has zero events. This is a *lower-bound*
+liveness check on top of the hash-chain integrity check — it does not detect a
+full-file forge (see § Signed events for that), only a shrink.
 
 Exit codes:
 
-- `0` — chain intact end-to-end.
+- `0` — chain intact end-to-end (and ≥ `--min-events` when set).
 - `1` — chain break (hash mismatch, `prevHash` mismatch, `seq` gap,
-  schema violation, version skew, or parse error).
+  schema violation, version skew, or parse error) **or** fewer events than
+  `--min-events`.
 - `2` — unexpected error in the verifier itself (should not happen in
   production; surfaced for operator visibility over a silent success).
 
