@@ -134,9 +134,16 @@ export interface Access {
  *  exploitable today (Slack channel ids are `[CD][A-Z0-9]+`, never those
  *  forms), but routing all lookups through one `Object.hasOwn` accessor
  *  removes the footgun class and the six scattered ad-hoc guards. Returns
- *  `undefined` for a missing id OR a non-own (prototype) key. */
+ *  `undefined` for a missing id OR a non-own (prototype) key.
+ *
+ *  `access.channels` is typed as always-present, but a loaded-from-disk Access
+ *  can lack it (the pre-x0t.8 admin-command site used `channels?.[id]`), and
+ *  `Object.hasOwn(undefined, …)` throws — so the missing-channels case is
+ *  guarded and fails closed (returns `undefined`), never a `TypeError`
+ *  (Gemini review, PR #275). */
 export function getChannelPolicy(access: Access, channelId: string): ChannelPolicy | undefined {
-  return Object.hasOwn(access.channels, channelId) ? access.channels[channelId] : undefined
+  const channels = access.channels
+  return channels && Object.hasOwn(channels, channelId) ? channels[channelId] : undefined
 }
 
 export type GateAction = 'deliver' | 'drop' | 'pair'

@@ -6934,6 +6934,16 @@ describe('getChannelPolicy (ccsc-x0t.8)', () => {
       expect(getChannelPolicy(access, key)).toBeUndefined()
     }
   })
+
+  test('fails closed (does not throw) when access.channels is absent', async () => {
+    const { getChannelPolicy } = await import('./lib.ts')
+    // Loaded-from-disk Access can lack `channels` (the pre-x0t.8 admin site
+    // used `channels?.[id]`). Object.hasOwn(undefined, …) would throw — the
+    // helper must return undefined instead (Gemini review, PR #275).
+    const access = { ...makeAccess(), channels: undefined } as unknown as Access
+    expect(() => getChannelPolicy(access, 'C_ANY')).not.toThrow()
+    expect(getChannelPolicy(access, 'C_ANY')).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------
