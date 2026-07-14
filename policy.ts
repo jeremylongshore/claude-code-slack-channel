@@ -756,6 +756,15 @@ export function detectShadowing(rules: readonly PolicyRule[]): ShadowWarning[] {
 function matchSubsetOrEqual(outer: MatchSpec, inner: MatchSpec): boolean {
   if (outer.tool !== undefined && outer.tool !== inner.tool) return false
   if (outer.channel !== undefined && outer.channel !== inner.channel) return false
+  // thread_ts (ccsc-x0t.1): mirror matchesIntersect, which already honors it.
+  // Without this, a thread-scoped `outer` was treated as covering EVERY thread,
+  // so detectShadowing / checkMonotonicity false-flagged thread-disjoint rules
+  // (e.g. warned that a rule scoped to thread B is shadowed by one scoped to
+  // thread A, or refused a reload adding a thread-B auto_approve alongside a
+  // thread-A deny). A thread-scoped outer only subsets an inner in the SAME
+  // thread. Enforcement in evaluate() (matchApplies) already compared thread_ts;
+  // this closes the same gap in the subset/monotonicity linters.
+  if (outer.thread_ts !== undefined && outer.thread_ts !== inner.thread_ts) return false
   if (outer.actor !== undefined && outer.actor !== inner.actor) return false
 
   if (outer.pathPrefix !== undefined) {
