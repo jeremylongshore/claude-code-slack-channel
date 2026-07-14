@@ -43,6 +43,7 @@ import {
   EVENT_DEDUP_TTL_MS,
   enforceAuditReceiptCap,
   escMrkdwn,
+  extractSlackErrorCode,
   formatVerifyResult,
   type GateResult,
   isDuplicateEvent,
@@ -55,6 +56,7 @@ import {
   gate as libGate,
   listSessions as libListSessions,
   makeIdempotentSend,
+  NON_RETRYABLE_SLACK_ERRORS,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -260,6 +262,14 @@ const web = new WebClient(botToken)
 const socket = new SocketModeClient({ appToken })
 
 let botUserId = ''
+// Settles once the boot-time web.auth.test() attempt completes (success OR
+// failure) — MCP connects before identity resolves, so tools that consume
+// identity (publish_manifest's replace-sweep) bounded-await this latch instead
+// of silently operating with '' identity during the window.
+let settleIdentity: () => void = () => {}
+const identitySettled = new Promise<void>((r) => {
+  settleIdentity = r
+})
 let selfBotId = ''
 let selfAppId = ''
 
@@ -1991,6 +2001,25 @@ async function executePublishManifest(
 
   // Gate 2: channel must be opted in, same as any outbound write.
   executePublishManifestGate2(channel, callerUserId, ctx)
+
+  // Identity guard: MCP connects before web.auth.test() resolves, so there is
+  // a window (sub-second happy path; up to ~30 min while Slack auth degrades
+  // and the WebClient retries) where tools are live but botUserId is still ''.
+  // findOurPriorManifestPins fails closed on '' and the replace-sweep would
+  // silently no-op, leaving duplicate pinned manifests. Bounded-await the
+  // identity latch; if identity is still unresolved, fail the call loudly as
+  // retryable rather than publish with a silent sweep skip.
+  if (ctx.botUserId === '') {
+    await Promise.race([identitySettled, new Promise((r) => setTimeout(r, 5_000))])
+    // Refresh from module state — this ctx was built before the latch settled.
+    ctx.botUserId = botUserId
+    ctx.selfBotId = selfBotId
+    if (ctx.botUserId === '') {
+      throw new Error(
+        'publish_manifest: bot identity not yet resolved (Slack auth still connecting); retry shortly',
+      )
+    }
+  }
 
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
@@ -3784,28 +3813,101 @@ async function main(): Promise<void> {
   deliveryTimer = setInterval(drainOutboxOnce, deliveryPollMs)
   if (typeof deliveryTimer.unref === 'function') deliveryTimer.unref()
 
-  // Resolve bot identity (user ID, bot ID, app ID) for mention detection
-  // and self-echo filtering across payload variants and multi-workspace setups
-  try {
-    const auth = await web.auth.test()
-    botUserId = (auth.user_id as string) || ''
-    selfBotId = (auth.bot_id as string) || ''
-    // app_id may not be present in all auth.test responses; fall back to empty
-    selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
-    console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
-  } catch (err) {
-    console.error('[slack] Failed to resolve bot identity:', err)
-  }
-
-  // Connect Socket Mode (Slack ↔ local WebSocket)
-  await socket.start()
-  console.error('[slack] Socket Mode connected')
-
-  // Connect MCP stdio (server ↔ Claude Code)
+  // Connect MCP stdio (server ↔ Claude Code) FIRST. The stdio handshake
+  // has no external dependency and must come up immediately: when
+  // socket.start() (and the web.auth.test() identity call, whose WebClient
+  // defaults to ~30 minutes of internal retries) ran before mcp.connect(),
+  // any Slack-side slowness blew Claude Code's 30s MCP handshake window,
+  // and the client logged a connection timeout and gave up without
+  // retrying — the whole channel stayed dead. Outbound tools
+  // (reply/react/...) use the HTTPS WebClient and work regardless of
+  // Socket Mode state; only inbound events wait on the socket.
   const transport = new StdioServerTransport()
   transport.onclose = () => void shutdown('stdio transport closed')
   await mcp.connect(transport)
   console.error('[slack] MCP server running on stdio')
+
+  // Bring up the Slack side asynchronously: resolve bot identity, then
+  // connect Socket Mode with bounded-backoff retries. Identity resolution
+  // runs here (not before mcp.connect) because it is only consumed by
+  // inbound-event processing — mention detection and self-echo filtering —
+  // and no inbound event can arrive until socket.start() succeeds below.
+  //
+  // The retry loop only guards the initial start(): the @slack/socket-mode
+  // client auto-reconnects once started. Two deliberate exits:
+  //   - shuttingDown → stop retrying; a post-shutdown start() would
+  //     resurrect a socket in a process about to exit (zombie instance
+  //     stealing round-robined events).
+  //   - unrecoverable auth/config errors (revoked or wrong xapp token) →
+  //     fail loud and exit non-zero so the operator sees it at boot,
+  //     instead of retrying a permanently-fatal error forever.
+  void (async () => {
+    // Resolve bot identity (user ID, bot ID, app ID) for mention detection
+    // and self-echo filtering across payload variants and multi-workspace setups
+    try {
+      const auth = await web.auth.test()
+      botUserId = (auth.user_id as string) || ''
+      selfBotId = (auth.bot_id as string) || ''
+      // app_id may not be present in all auth.test responses; fall back to empty
+      selfAppId = ((auth as unknown as Record<string, unknown>).app_id as string) || ''
+      console.error('[slack] bot identity:', { botUserId, selfBotId, selfAppId })
+    } catch (err) {
+      console.error('[slack] Failed to resolve bot identity:', err)
+    } finally {
+      settleIdentity()
+    }
+
+    // Slack marks these Socket Mode start errors unrecoverable (thrown out of
+    // retrieveWSSURL rather than internally reconnected) — retrying them
+    // forever would silently mask a dead channel.
+    const UNRECOVERABLE_START_RE =
+      /not_authed|invalid_auth|account_inactive|user_removed_from_team|team_disabled|token_revoked|token_expired/
+    // Bounded retry: the loop exists to survive a TRANSIENT outage, not to
+    // mask a permanently-dead channel. Auth/config-fatal errors shut down
+    // immediately; anything else (persistent 5xx, proxy blackhole, DNS/TLS
+    // failure — the SDK throws these out of retrieveWSSURL as
+    // RequestError/HTTPError rather than reconnecting internally) gets
+    // MAX_SOCKET_START_ATTEMPTS tries (~5 minutes with the backoff below),
+    // then fails loud the same way.
+    const MAX_SOCKET_START_ATTEMPTS = 10
+    let attempt = 0
+    let delayMs = 2_000
+    while (!shuttingDown) {
+      try {
+        await socket.start()
+        console.error('[slack] Socket Mode connected')
+        return
+      } catch (err) {
+        attempt += 1
+        // Prefer the structured Slack error code (err.data.error) over message
+        // matching; the regex is the fallback for wrapped/stringified errors.
+        const code = extractSlackErrorCode(err)
+        const msg = err instanceof Error ? err.message : String(err)
+        if (
+          (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) ||
+          UNRECOVERABLE_START_RE.test(msg)
+        ) {
+          console.error('[slack] Socket Mode start failed with unrecoverable error:', code ?? msg)
+          await shutdown('unrecoverable Socket Mode start error', 1)
+          return
+        }
+        if (attempt >= MAX_SOCKET_START_ATTEMPTS) {
+          console.error(
+            `[slack] Socket Mode start failed ${attempt} consecutive times; giving up:`,
+            msg,
+          )
+          await shutdown('Socket Mode start exhausted retries', 1)
+          return
+        }
+        console.error(
+          `[slack] Socket Mode start failed (attempt ${attempt}/${MAX_SOCKET_START_ATTEMPTS}, retrying in ${Math.round(delayMs / 1000)}s):`,
+          msg,
+        )
+        await new Promise((r) => setTimeout(r, delayMs))
+        delayMs = Math.min(delayMs * 2, 60_000)
+      }
+    }
+  })()
 
   // Belt-and-suspenders: the SDK's StdioServerTransport doesn't listen for
   // stdin end/close, so transport.onclose never fires on its own. Hook stdin
