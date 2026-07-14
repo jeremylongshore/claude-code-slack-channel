@@ -10696,6 +10696,35 @@ describe('parseMinEventsArg (ccsc-x0t.9)', () => {
   })
 })
 
+describe('parseV2FloorSeqArg + parseExpectedGenesisArg (ccsc-x0t.7)', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('parseV2FloorSeqArg: valid, absent, and fail-closed on malformed', async () => {
+    const { parseV2FloorSeqArg } = await loadLib()
+    expect(parseV2FloorSeqArg(['--v2-floor-seq', '42'])).toBe(42)
+    expect(parseV2FloorSeqArg(['--v2-floor-seq=7'])).toBe(7)
+    expect(parseV2FloorSeqArg([])).toBeNull()
+    expect(() => parseV2FloorSeqArg(['--v2-floor-seq', 'abc'])).toThrow(/invalid --v2-floor-seq/)
+    expect(() => parseV2FloorSeqArg(['--v2-floor-seq'])).toThrow(/missing value/)
+  })
+
+  test('parseExpectedGenesisArg: accepts a 64-hex value, absent → null, malformed → throw', async () => {
+    const { parseExpectedGenesisArg } = await loadLib()
+    const hex = 'a'.repeat(64)
+    expect(parseExpectedGenesisArg(['--expected-genesis-hash', hex])).toBe(hex)
+    expect(parseExpectedGenesisArg([`--expected-genesis-hash=${hex}`])).toBe(hex)
+    expect(parseExpectedGenesisArg([])).toBeNull()
+    // Too short / non-hex / uppercase all fail closed rather than disable the anchor.
+    expect(() => parseExpectedGenesisArg(['--expected-genesis-hash', 'abc'])).toThrow(
+      /invalid --expected-genesis-hash/,
+    )
+    expect(() => parseExpectedGenesisArg(['--expected-genesis-hash', 'A'.repeat(64)])).toThrow(
+      /invalid --expected-genesis-hash/,
+    )
+    expect(() => parseExpectedGenesisArg(['--expected-genesis-hash'])).toThrow(/missing value/)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // decidePermissionRoute — ccsc-me6.1 / me6.2 / me6.3, Epic 29-B Phase 1
 //
@@ -12247,6 +12276,79 @@ describe('verifyJournal', () => {
     // the exact attack the v1 chain fell to.
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.break.reason).toMatch(/signature verification failed/)
+  })
+
+  // ── Verification anchors (ccsc-x0t.7) — close the x0t.2 residuals ────────
+
+  test('pinnedGenesisHash: a clean chain verifies with the correct anchor', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3) // genesis prevHash === stableAnchor (writeN's initialPrevHash)
+    expect((await verifyJournal(logPath, { pinnedGenesisHash: stableAnchor })).ok).toBe(true)
+  })
+
+  test('pinnedGenesisHash: a wrong anchor fails at genesis', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3)
+    const result = await verifyJournal(logPath, { pinnedGenesisHash: 'b'.repeat(64) })
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.break.reason).toMatch(/genesis prevHash does not match/)
+  })
+
+  test('pinnedGenesisHash: DEFEATS the v1 renumber+rechain that x0t.2 documented as residual', async () => {
+    const { verifyJournal, canonicalJson, sha256Hex } = await import('./journal.ts')
+    await writeN(4)
+    const events = readFileSync(logPath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+    expect(events.length).toBe(4)
+    // The exact x0t.2 forgery: shear the genesis, renumber survivors, rechain.
+    const survivors = events.slice(1)
+    let prevHash = survivors[0].prevHash as string // = original events[0].hash, NOT stableAnchor
+    const forged = survivors.map((ev, i) => {
+      const { hash: _drop, ...rest } = ev
+      const updated = { ...rest, seq: i + 1, prevHash }
+      const hash = sha256Hex(prevHash + canonicalJson(updated))
+      prevHash = hash
+      return { ...updated, hash }
+    })
+    writeFileSync(logPath, `${forged.map((e) => JSON.stringify(e)).join('\n')}\n`, { mode: 0o600 })
+    // Unanchored: verifies clean (the documented x0t.2 residual).
+    expect((await verifyJournal(logPath)).ok).toBe(true)
+    // Anchored to the TRUE genesis: the forged genesis prevHash ≠ anchor → break.
+    const anchored = await verifyJournal(logPath, { pinnedGenesisHash: stableAnchor })
+    expect(anchored.ok).toBe(false)
+    if (!anchored.ok) expect(anchored.break.reason).toMatch(/genesis prevHash does not match/)
+  })
+
+  test('v2FloorSeq: a v1 event at/after the floor is a downgrade break', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3) // unsigned v1 events, seq 1..3
+    const result = await verifyJournal(logPath, { v2FloorSeq: 2 })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.break.seq).toBe(2)
+      expect(result.break.reason).toMatch(/downgrade below v2 floor/)
+    }
+  })
+
+  test('v2FloorSeq: a floor above every seq leaves a v1 chain valid', async () => {
+    const { verifyJournal } = await import('./journal.ts')
+    await writeN(3)
+    expect((await verifyJournal(logPath, { v2FloorSeq: 10 })).ok).toBe(true)
+  })
+
+  test('v2FloorSeq: a fully-signed v2 chain passes its floor', async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const w = await JournalWriter.open({ path: logPath, signingKey: kp, now: () => fixedNow })
+    for (let i = 0; i < 3; i++)
+      await w.writeEvent({ kind: 'session.activate', correlationId: `r${i}` })
+    await w.close()
+    expect(
+      (await verifyJournal(logPath, { initialPublicKey: kp.publicKey, v2FloorSeq: 1 })).ok,
+    ).toBe(true)
   })
 
   test('parse error: invalid JSON on a middle line is reported with line number', async () => {
