@@ -33,7 +33,7 @@ enough to read in an afternoon and verify.
 | **Cost control** | First-party token-spend caps (real metering) | Lower-bound *advisory* cap as ordinary policy rules (no model key → can't meter dollars); journaled as exactly advisory | **Tag** for precise dollar caps; CCSC for *governing the decision* around cost |
 | **Scope model** | Per-channel | Per-channel + per-thread + per-actor + per-tool + per-arg policy, tiered (admin > user > workspace > default) | CCSC for fine-grained governance |
 | **Learning / memory** | "Learns your company" (adaptive) | **None by design** — a learned gate can't be replayed to prove which rules were in force (see the yun520-1 / #247 thread) | Tag for convenience; CCSC for auditability |
-| **Surface area** | Large, first-party, opaque | ~17 source files, ~13k LoC, MIT-readable, one afternoon to audit | CCSC when "I can read and trust the whole thing" is the requirement |
+| **Surface area** | Large, first-party, opaque | ~17 source files, ~13k LoC, Apache-2.0, one afternoon to audit | CCSC when "I can read and trust the whole thing" is the requirement |
 
 ## Decision 1 — Positioning
 
