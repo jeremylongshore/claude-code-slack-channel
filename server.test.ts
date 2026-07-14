@@ -6906,6 +6906,37 @@ describe('boot-path testability seams (ccsc-x0t.10)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// getChannelPolicy — one fail-closed channel-policy accessor (ccsc-x0t.8).
+// Every gate/read routes through it; a bare access.channels[id] index would
+// read inherited Object.prototype members for prototype-key ids.
+// ---------------------------------------------------------------------------
+
+describe('getChannelPolicy (ccsc-x0t.8)', () => {
+  test('returns the policy for an own channel id', async () => {
+    const { getChannelPolicy } = await import('./lib.ts')
+    const policy = { requireMention: false, allowFrom: [] }
+    const access = makeAccess({ channels: { C_OPT: policy } })
+    expect(getChannelPolicy(access, 'C_OPT')).toBe(policy)
+  })
+
+  test('returns undefined for a missing channel id', async () => {
+    const { getChannelPolicy } = await import('./lib.ts')
+    const access = makeAccess({ channels: { C_OPT: { requireMention: false, allowFrom: [] } } })
+    expect(getChannelPolicy(access, 'C_MISSING')).toBeUndefined()
+  })
+
+  test('fails closed on prototype-key ids (never reads off the prototype chain)', async () => {
+    const { getChannelPolicy } = await import('./lib.ts')
+    const access = makeAccess({ channels: {} })
+    // A bare access.channels['constructor'] would return Object's constructor
+    // (a truthy function) and could slip past a truthiness gate. hasOwn refuses.
+    for (const key of ['constructor', 'toString', 'hasOwnProperty', '__proto__', 'valueOf']) {
+      expect(getChannelPolicy(access, key)).toBeUndefined()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Delivery poller — drainOutbox (ccsc-o7x.2.2)
 // ---------------------------------------------------------------------------
 

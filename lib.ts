@@ -124,6 +124,21 @@ export interface Access {
   policy?: readonly unknown[]
 }
 
+/** Fail-closed channel-policy lookup (ccsc-x0t.8). The single accessor for
+ *  `access.channels[id]` — every gate and read routes through here.
+ *
+ *  A bare `access.channels[id]` index reads inherited `Object.prototype`
+ *  members off the prototype chain for ids like `'constructor'` / `'toString'`
+ *  / `'__proto__'`, so a channel id equal to a prototype key could read a
+ *  truthy value (a function) and slip past a truthiness-based gate. Not
+ *  exploitable today (Slack channel ids are `[CD][A-Z0-9]+`, never those
+ *  forms), but routing all lookups through one `Object.hasOwn` accessor
+ *  removes the footgun class and the six scattered ad-hoc guards. Returns
+ *  `undefined` for a missing id OR a non-own (prototype) key. */
+export function getChannelPolicy(access: Access, channelId: string): ChannelPolicy | undefined {
+  return Object.hasOwn(access.channels, channelId) ? access.channels[channelId] : undefined
+}
+
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
 /** Structured reason for a drop. As of ccsc-apj.2 EVERY inbound gate
@@ -1655,7 +1670,7 @@ export function assertOutboundAllowed(
   access: Access,
   deliveredThreads: ReadonlySet<string>,
 ): void {
-  if (Object.hasOwn(access.channels, chatId) && access.channels[chatId]) return
+  if (getChannelPolicy(access, chatId)) return
   if (deliveredThreads.has(deliveredThreadKey(chatId, threadTs))) return
   throw new Error(
     `Outbound gate: (channel ${chatId}, thread ${threadTs ?? '<top-level>'}) is not in the allowlist or delivered-threads set.`,
@@ -1850,7 +1865,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   // Per-channel opt-in: only deliver if the channel explicitly lists this
   // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
   const channel = ev.channel as string
-  const policy = opts.access.channels[channel]
+  const policy = getChannelPolicy(opts.access, channel)
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
     return { action: 'drop', dropReason: 'bot.not_allowlisted' }
@@ -1972,7 +1987,7 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
 function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): GateResult {
   const { access, botUserId } = opts
   const channel = ev.channel as string
-  const policy = Object.hasOwn(access.channels, channel) ? access.channels[channel] : undefined
+  const policy = getChannelPolicy(access, channel)
   if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
 
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
