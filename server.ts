@@ -62,8 +62,10 @@ import {
   nextSocketStartBackoffMs,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
+  parseExpectedGenesisArg,
   parseMinEventsArg,
   parseSendableRoots,
+  parseV2FloorSeqArg,
   parseVerifyArg,
   permissionPairingKey as permKey,
   pruneExpired,
@@ -145,7 +147,17 @@ if (_verifyPath !== null) {
     // exits non-zero with a clear message rather than silently disabling the
     // floor or crashing at module load.
     const _minEvents = parseMinEventsArg(process.argv.slice(2))
-    const result = await verifyJournal(absPath)
+    // Optional tamper anchors (ccsc-x0t.7): `--expected-genesis-hash HEX` pins
+    // the genesis prevHash (defeats head-shear+rechain) and `--v2-floor-seq N`
+    // requires every event at/after N to be signed v2 (defeats uniform
+    // downgrade-to-v1). Both parse fail-closed (throw on malformed → caught
+    // below). Absent → prior verify behavior.
+    const _genesis = parseExpectedGenesisArg(process.argv.slice(2))
+    const _v2Floor = parseV2FloorSeqArg(process.argv.slice(2))
+    const result = await verifyJournal(absPath, {
+      pinnedGenesisHash: _genesis ?? undefined,
+      v2FloorSeq: _v2Floor ?? undefined,
+    })
     const { text, exitCode } = formatVerifyResult(result, absPath, _minEvents ?? undefined)
     if (exitCode === 0) {
       console.log(text)

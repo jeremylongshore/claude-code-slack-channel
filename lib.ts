@@ -2630,32 +2630,90 @@ export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
  *
  *  Forms: `--min-events N` (space) / `--min-events=N` (equals). Rejects
  *  negatives, non-integers, and empty values by throwing. */
-export function parseMinEventsArg(argv: ReadonlyArray<string>): number | null {
+/** Shared fail-closed parser for a `--flag N` non-negative-integer CLI option
+ *  (ccsc-x0t.9 / ccsc-x0t.7). Returns the integer when the flag is present with
+ *  a valid value, null when the flag is ABSENT, and THROWS when the flag is
+ *  present but its value is missing or malformed — a present-but-broken
+ *  security flag must be loud, never a silent no-op that disables the check it
+ *  configures. Accepts `--flag N` (space) and `--flag=N` (equals). */
+function parseNonNegIntFlag(argv: ReadonlyArray<string>, flag: string): number | null {
   const accept = (raw: string): number => {
     if (!/^\d+$/.test(raw)) {
       throw new Error(
-        `invalid --min-events value ${JSON.stringify(raw)}: must be a non-negative integer`,
+        `invalid ${flag} value ${JSON.stringify(raw)}: must be a non-negative integer`,
       )
     }
     const n = Number.parseInt(raw, 10)
     if (!Number.isSafeInteger(n)) {
-      throw new Error(
-        `invalid --min-events value ${JSON.stringify(raw)}: exceeds safe integer range`,
-      )
+      throw new Error(`invalid ${flag} value ${JSON.stringify(raw)}: exceeds safe integer range`)
     }
     return n
   }
+  const eq = `${flag}=`
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!
-    if (arg === '--min-events') {
+    if (arg === flag) {
       const next = argv[i + 1]
       // A following token that is itself a flag (or no token) is a missing
       // value — fail closed rather than swallow the next flag as the count.
-      if (typeof next === 'string' && !next.startsWith('-')) return accept(next)
-      throw new Error('missing value for --min-events (expected a non-negative integer)')
+      // A `-`-prefixed token is treated as the NEXT flag (missing value) — but a
+      // negative number (`-5`) is routed to `accept()` so it throws the accurate
+      // "invalid value" error instead of a misleading "missing value" (Gemini
+      // review, PR #278). Both still fail closed; only the message differs.
+      if (typeof next === 'string' && (!next.startsWith('-') || /^-\d/.test(next))) {
+        return accept(next)
+      }
+      throw new Error(`missing value for ${flag} (expected a non-negative integer)`)
     }
-    if (arg.startsWith('--min-events=')) {
-      return accept(arg.slice('--min-events='.length))
+    if (arg.startsWith(eq)) {
+      return accept(arg.slice(eq.length))
+    }
+  }
+  return null
+}
+
+export function parseMinEventsArg(argv: ReadonlyArray<string>): number | null {
+  return parseNonNegIntFlag(argv, '--min-events')
+}
+
+/** Parse `--v2-floor-seq N` (ccsc-x0t.7). The `seq` at/after which every event
+ *  must be v2 (signed) — passed to `verifyJournal` as `v2FloorSeq` to defeat a
+ *  uniform downgrade-to-v1. Same fail-closed discipline as `--min-events`. */
+export function parseV2FloorSeqArg(argv: ReadonlyArray<string>): number | null {
+  return parseNonNegIntFlag(argv, '--v2-floor-seq')
+}
+
+/** Parse `--expected-genesis-hash HEX` (ccsc-x0t.7). The pinned genesis anchor
+ *  (the writer's `initialPrevHash`, captured out-of-band) passed to
+ *  `verifyJournal` as `pinnedGenesisHash`. Must be a 64-char lowercase-hex
+ *  SHA-256. Returns null when absent; THROWS when present but malformed (a
+ *  typo'd anchor would otherwise silently disable head-truncation detection). */
+export function parseExpectedGenesisArg(argv: ReadonlyArray<string>): string | null {
+  const accept = (raw: string): string => {
+    if (!/^[0-9a-f]{64}$/.test(raw)) {
+      throw new Error(
+        `invalid --expected-genesis-hash ${JSON.stringify(raw)}: must be 64 lowercase hex chars (a SHA-256)`,
+      )
+    }
+    return raw
+  }
+  const flag = '--expected-genesis-hash'
+  const eq = `${flag}=`
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === flag) {
+      const next = argv[i + 1]
+      // A `-`-prefixed token is treated as the NEXT flag (missing value) — but a
+      // negative number (`-5`) is routed to `accept()` so it throws the accurate
+      // "invalid value" error instead of a misleading "missing value" (Gemini
+      // review, PR #278). Both still fail closed; only the message differs.
+      if (typeof next === 'string' && (!next.startsWith('-') || /^-\d/.test(next))) {
+        return accept(next)
+      }
+      throw new Error(`missing value for ${flag} (expected a 64-char hex SHA-256)`)
+    }
+    if (arg.startsWith(eq)) {
+      return accept(arg.slice(eq.length))
     }
   }
   return null
