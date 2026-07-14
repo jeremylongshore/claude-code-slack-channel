@@ -10618,6 +10618,75 @@ describe('formatVerifyResult', () => {
     expect(out.text).not.toContain('expected:')
     expect(out.text).not.toContain('actual:')
   })
+
+  // ── eventsVerified floor (ccsc-x0t.9) ──────────────────────────────────
+  test('minEvents floor: a hash-clean log below the floor FAILS (wiped log ≠ clean)', async () => {
+    const { formatVerifyResult } = await loadLib()
+    // The x0t.9 case: verifyJournal(empty log) → { ok:true, eventsVerified:0 }.
+    const out = formatVerifyResult({ ok: true, eventsVerified: 0 }, '/tmp/audit.log', 5)
+    expect(out.exitCode).toBe(1)
+    expect(out.text).toContain('FAIL: audit journal too short')
+    expect(out.text).toContain('verified 0 event(s), expected at least 5')
+  })
+
+  test('minEvents floor: at or above the floor is OK', async () => {
+    const { formatVerifyResult } = await loadLib()
+    expect(formatVerifyResult({ ok: true, eventsVerified: 5 }, '/tmp/audit.log', 5).exitCode).toBe(
+      0,
+    )
+    expect(formatVerifyResult({ ok: true, eventsVerified: 9 }, '/tmp/audit.log', 5).exitCode).toBe(
+      0,
+    )
+  })
+
+  test('minEvents floor: omitting it preserves the prior behavior (0 events → OK exit 0)', async () => {
+    const { formatVerifyResult } = await loadLib()
+    const out = formatVerifyResult({ ok: true, eventsVerified: 0 }, '/tmp/audit.log')
+    expect(out.exitCode).toBe(0)
+    expect(out.text).toBe('OK: 0 event(s) verified in /tmp/audit.log')
+  })
+
+  test('minEvents floor: a genuinely-broken log still reports the break, not the floor', async () => {
+    const { formatVerifyResult } = await loadLib()
+    const out = formatVerifyResult(
+      {
+        ok: false,
+        eventsVerified: 2,
+        break: { lineNumber: 3, seq: 3, ts: null, reason: 'hash mismatch' },
+      },
+      '/tmp/audit.log',
+      10,
+    )
+    expect(out.exitCode).toBe(1)
+    expect(out.text).toContain('FAIL: audit journal broken') // the break wins over the floor message
+  })
+})
+
+describe('parseMinEventsArg (ccsc-x0t.9)', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('space form and equals form parse the integer', async () => {
+    const { parseMinEventsArg } = await loadLib()
+    expect(parseMinEventsArg(['--min-events', '5'])).toBe(5)
+    expect(parseMinEventsArg(['--min-events=12'])).toBe(12)
+    expect(parseMinEventsArg(['--min-events', '0'])).toBe(0)
+  })
+
+  test('absent flag → null', async () => {
+    const { parseMinEventsArg } = await loadLib()
+    expect(parseMinEventsArg(['--verify-audit-log', '/x'])).toBeNull()
+    expect(parseMinEventsArg([])).toBeNull()
+  })
+
+  test('malformed values → null (negative, non-integer, empty, flag-shaped)', async () => {
+    const { parseMinEventsArg } = await loadLib()
+    expect(parseMinEventsArg(['--min-events', '-3'])).toBeNull()
+    expect(parseMinEventsArg(['--min-events', '1.5'])).toBeNull()
+    expect(parseMinEventsArg(['--min-events', 'abc'])).toBeNull()
+    expect(parseMinEventsArg(['--min-events', ''])).toBeNull()
+    expect(parseMinEventsArg(['--min-events', '--verify-audit-log'])).toBeNull()
+    expect(parseMinEventsArg(['--min-events='])).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------

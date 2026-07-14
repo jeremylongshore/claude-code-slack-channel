@@ -2611,6 +2611,41 @@ export function parseVerifyArg(argv: ReadonlyArray<string>): string | null {
   return null
 }
 
+/** Parse `--min-events N` (ccsc-x0t.9). Returns the non-negative integer floor,
+ *  or null when the flag is absent or malformed. Same accept/reject discipline
+ *  as `parseVerifyArg`. Pure.
+ *
+ *  Why this exists: `verifyJournal` of a wiped-to-empty `audit.log` returns
+ *  `{ ok: true, eventsVerified: 0 }`, which `formatVerifyResult` prints as
+ *  `OK: 0 event(s) verified` with exit 0 — so a MONITORING SCRIPT reads a
+ *  destroyed log as "verified clean". An operator who knows the log should
+ *  contain at least N events passes `--min-events N`; if it's been wiped below
+ *  that, `formatVerifyResult` fails the check (exit 1). A first-boot empty log
+ *  is still legitimately valid, so the floor is operator-supplied, not a hard
+ *  "empty = fail".
+ *
+ *  Forms: `--min-events N` (space) / `--min-events=N` (equals). Rejects
+ *  negatives, non-integers, and empty/flag-shaped values. */
+export function parseMinEventsArg(argv: ReadonlyArray<string>): number | null {
+  const accept = (raw: string): number | null => {
+    if (!/^\d+$/.test(raw)) return null
+    const n = Number.parseInt(raw, 10)
+    return Number.isSafeInteger(n) ? n : null
+  }
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === '--min-events') {
+      const next = argv[i + 1]
+      if (typeof next === 'string') return accept(next)
+      continue
+    }
+    if (arg.startsWith('--min-events=')) {
+      return accept(arg.slice('--min-events='.length))
+    }
+  }
+  return null
+}
+
 /** Shape mirror of `VerifyResult` from journal.ts, repeated here so
  *  lib.ts stays framework-free (no journal.ts import — avoids a cycle
  *  and keeps lib.ts pure). Discriminated on `ok`. */
@@ -2643,8 +2678,22 @@ export type VerifyResultShape =
 export function formatVerifyResult(
   result: VerifyResultShape,
   path: string,
+  minEvents?: number,
 ): { text: string; exitCode: 0 | 1 } {
   if (result.ok) {
+    // eventsVerified floor (ccsc-x0t.9): a hash-clean chain that verifies fewer
+    // events than the operator expects is treated as a FAILURE — this is how a
+    // wiped/truncated-to-empty log stops reading as "verified clean" to a
+    // monitoring script. Absent floor → unchanged behavior.
+    if (minEvents !== undefined && result.eventsVerified < minEvents) {
+      return {
+        text:
+          `FAIL: audit journal too short at ${path}\n` +
+          `  reason:   verified ${result.eventsVerified} event(s), expected at least ${minEvents} ` +
+          `(--min-events) — the log may have been truncated or wiped`,
+        exitCode: 1,
+      }
+    }
     return {
       text: `OK: ${result.eventsVerified} event(s) verified in ${path}`,
       exitCode: 0,

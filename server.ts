@@ -62,6 +62,7 @@ import {
   nextSocketStartBackoffMs,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
+  parseMinEventsArg,
   parseSendableRoots,
   parseVerifyArg,
   permissionPairingKey as permKey,
@@ -136,9 +137,13 @@ import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 const _verifyPath = parseVerifyArg(process.argv.slice(2))
 if (_verifyPath !== null) {
   const absPath = resolve(_verifyPath)
+  // Optional eventsVerified floor (ccsc-x0t.9): `--min-events N` makes a
+  // hash-clean-but-too-short log (e.g. wiped to empty) fail instead of
+  // reading as "verified clean" to a monitoring script.
+  const _minEvents = parseMinEventsArg(process.argv.slice(2))
   try {
     const result = await verifyJournal(absPath)
-    const { text, exitCode } = formatVerifyResult(result, absPath)
+    const { text, exitCode } = formatVerifyResult(result, absPath, _minEvents ?? undefined)
     if (exitCode === 0) {
       console.log(text)
     } else {
