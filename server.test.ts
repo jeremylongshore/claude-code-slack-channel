@@ -6863,6 +6863,10 @@ describe('boot-path testability seams (ccsc-x0t.10)', () => {
       'fatal',
     )
     expect(classifySocketStartError(new Error('team_disabled'))).toBe('fatal')
+    // A plain error-like object (not an Error instance) carrying the fatal code
+    // only in its .message must still classify fatal, not "[object Object]" →
+    // retryable (Gemini review, PR #274).
+    expect(classifySocketStartError({ message: 'token_revoked' })).toBe('fatal')
   })
 
   test('#268: classifySocketStartError → retryable on transient errors (loop keeps trying)', async () => {
@@ -6880,11 +6884,19 @@ describe('boot-path testability seams (ccsc-x0t.10)', () => {
     expect(SOCKET_START_BACKOFF_CAP_MS).toBe(60_000)
   })
 
-  test('ccsc-x0t.3: assertManifestIdentityResolved throws the retryable message on empty identity', async () => {
+  test('ccsc-x0t.3: assertManifestIdentityResolved fails closed on every invalid identity', async () => {
     const { assertManifestIdentityResolved, MANIFEST_IDENTITY_UNRESOLVED_MSG } = await import(
       './lib.ts'
     )
+    // Empty, nullable, and whitespace-only identities are all invalid — a
+    // security guard must fail closed on each, not just the exact '' (Gemini
+    // review, PR #274).
     expect(() => assertManifestIdentityResolved('')).toThrow(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+    expect(() => assertManifestIdentityResolved(null)).toThrow(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+    expect(() => assertManifestIdentityResolved(undefined)).toThrow(
+      MANIFEST_IDENTITY_UNRESOLVED_MSG,
+    )
+    expect(() => assertManifestIdentityResolved('   ')).toThrow(MANIFEST_IDENTITY_UNRESOLVED_MSG)
   })
 
   test('ccsc-x0t.3: assertManifestIdentityResolved does not throw once identity is resolved', async () => {

@@ -419,9 +419,22 @@ export const UNRECOVERABLE_SOCKET_START_RE =
 export function classifySocketStartError(err: unknown): 'fatal' | 'retryable' {
   const code = extractSlackErrorCode(err)
   if (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) return 'fatal'
-  const msg = err instanceof Error ? err.message : String(err)
-  if (UNRECOVERABLE_SOCKET_START_RE.test(msg)) return 'fatal'
+  if (UNRECOVERABLE_SOCKET_START_RE.test(errorMessage(err))) return 'fatal'
   return 'retryable'
+}
+
+/** Best-effort message extraction from an unknown throw. Handles Error
+ *  instances AND plain error-like objects carrying a string `message` (Gemini
+ *  review, PR #274): a serialized/wrapped Slack error thrown as a plain object
+ *  would otherwise `String()` to "[object Object]" and slip past the regex,
+ *  misclassifying a fatal auth error as retryable. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (typeof err === 'object' && err !== null && 'message' in err) {
+    const m = (err as Record<string, unknown>).message
+    if (typeof m === 'string') return m
+  }
+  return String(err)
 }
 
 /** Cap on a single Socket Mode start() retry backoff. */
@@ -453,11 +466,14 @@ export const MANIFEST_IDENTITY_UNRESOLVED_MSG =
   'publish_manifest: bot identity not yet resolved (Slack auth still connecting); retry shortly'
 
 /** Fail publish_manifest loudly (retryable) when bot identity is still
- *  unresolved after the identity-latch await. Publishing with an empty
+ *  unresolved after the identity-latch await. Publishing with an unresolved
  *  botUserId would make the replace-sweep silently no-op (findOurPriorManifestPins
- *  fails closed on ''), leaving duplicate pinned manifests. Pure (ccsc-x0t.3). */
-export function assertManifestIdentityResolved(botUserId: string): void {
-  if (botUserId === '') throw new Error(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+ *  fails closed on ''), leaving duplicate pinned manifests. Accepts nullable and
+ *  rejects any falsy or whitespace-only identity — a security guard fails closed
+ *  on every invalid identity, not just the exact empty string (Gemini review,
+ *  PR #274). Pure (ccsc-x0t.3). */
+export function assertManifestIdentityResolved(botUserId: string | null | undefined): void {
+  if (!botUserId || botUserId.trim() === '') throw new Error(MANIFEST_IDENTITY_UNRESOLVED_MSG)
 }
 
 /** Slack message-metadata `event_type` marking a message as a CCSC reply
