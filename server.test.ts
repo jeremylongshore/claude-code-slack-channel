@@ -11959,6 +11959,82 @@ describe('verifyJournal', () => {
     }
   })
 
+  // ── ccsc-x0t.2 — known-limitation + scope proof ─────────────────────────
+  // The genesis-seq pin (above) catches a NAIVE head-shear (drop seq=1, leave
+  // survivors at seq=2..). But it defeats head-truncation only for SIGNED (v2)
+  // chains. On an UNSIGNED v1 chain the hash chain is a bare keyless SHA-256,
+  // so a writer-capable attacker shears the head, renumbers survivors to
+  // seq=1.., and recomputes the whole chain with no secret — verifying clean.
+  // These two tests bind that scope (the wording in journal.ts + the #264
+  // CHANGELOG entry now says "signed chains"; the full fix is a v2-floor
+  // anchor, ccsc-x0t.7).
+
+  test('KNOWN LIMITATION (ccsc-x0t.2): v1 head-truncation + renumber + rechain verifies clean (no secret needed)', async () => {
+    const { verifyJournal, canonicalJson, sha256Hex } = await import('./journal.ts')
+    await writeN(4) // keyless writer → unsigned v1 events, seq 1..4
+    const events = readFileSync(logPath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+    // Shear the genesis event, then renumber survivors to seq 1.. and recompute
+    // the keyless chain exactly as the writer/verifier does. The first
+    // survivor's prevHash is trusted as the genesis anchor by the verifier.
+    const survivors = events.slice(1)
+    let prevHash = survivors[0]!.prevHash as string
+    const forged = survivors.map((ev, i) => {
+      const { hash: _drop, ...rest } = ev
+      rest.seq = i + 1
+      rest.prevHash = prevHash
+      const hash = sha256Hex(prevHash + canonicalJson(rest))
+      prevHash = hash
+      return { ...rest, hash }
+    })
+    writeFileSync(logPath, `${forged.map((e) => JSON.stringify(e)).join('\n')}\n`, { mode: 0o600 })
+
+    const result = await verifyJournal(logPath)
+    // THE LIMITATION: an unsigned v1 chain has no signatures, so the rechained
+    // sheared file verifies clean. This is why the pin is scoped to signed
+    // chains; the residual full fix is a pinned v2-floor anchor (ccsc-x0t.7).
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.eventsVerified).toBe(3)
+  })
+
+  test("SCOPE PROOF (ccsc-x0t.2): the SAME rechain on a SIGNED v2 chain is rejected (signatures can't be reforged)", async () => {
+    const { generateKeyPair } = await import('./crypto.ts')
+    const { JournalWriter, verifyJournal, canonicalJson, sha256Hex } = await import('./journal.ts')
+    const kp = generateKeyPair()
+    const w = await JournalWriter.open({ path: logPath, signingKey: kp, now: () => fixedNow })
+    for (let i = 0; i < 4; i++)
+      await w.writeEvent({ kind: 'session.activate', correlationId: `req-${i}` })
+    await w.close()
+
+    const events = readFileSync(logPath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+    // Same shear + renumber + rechain — but the attacker holds no signing key,
+    // so it can only keep each survivor's ORIGINAL signature (over the old seq).
+    const survivors = events.slice(1)
+    let prevHash = survivors[0]!.prevHash as string
+    const forged = survivors.map((ev, i) => {
+      const { hash: _drop, signature, ...rest } = ev
+      rest.seq = i + 1
+      rest.prevHash = prevHash
+      // Recompute the hash over the same bytes verify strips (no hash, no sig).
+      const hash = sha256Hex(prevHash + canonicalJson(rest))
+      prevHash = hash
+      return { ...rest, hash, signature } // stale signature over the old bytes
+    })
+    writeFileSync(logPath, `${forged.map((e) => JSON.stringify(e)).join('\n')}\n`, { mode: 0o600 })
+
+    const result = await verifyJournal(logPath, { initialPublicKey: kp.publicKey })
+    // The hash check passes (attacker recomputed it), but the Ed25519 signature
+    // was over the pre-renumber bytes → verification fails. Signed chains resist
+    // the exact attack the v1 chain fell to.
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.break.reason).toMatch(/signature verification failed/)
+  })
+
   test('parse error: invalid JSON on a middle line is reported with line number', async () => {
     const { verifyJournal } = await import('./journal.ts')
     await writeN(3)

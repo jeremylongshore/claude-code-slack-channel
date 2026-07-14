@@ -1257,13 +1257,22 @@ function checkSeqContinuity(
  *      the anchor is a caller concern for now).
  *    - `seq` is strictly monotonic by +1 with no gaps, AND the first
  *      accepted event has `seq === 1`. The genesis-seq pin defeats
- *      head-truncation (shearing lines off the top): the surviving
- *      prefix would otherwise verify cleanly because its new first
- *      event's `prevHash` is trusted as genesis. Tail-truncation and a
- *      full-file rewrite that downgrades every event to unsigned v1
- *      (stripping Ed25519 signatures) remain residual — defeating the
- *      latter needs a pinned "signing began at seq N" anchor (deferred;
- *      tracked in the Fable-5-review follow-ups, see PR).
+ *      head-truncation (shearing lines off the top) **only for signed,
+ *      key-verified (v2) chains**: the surviving prefix would otherwise
+ *      verify cleanly because its new first event's `prevHash` is trusted
+ *      as genesis, but on a v2 chain the attacker cannot renumber the
+ *      survivors' `seq` and recompute the chain without also reforging
+ *      every Ed25519 signature (checked against `opts.initialPublicKey`),
+ *      which requires the signing key. **On an unsigned v1 chain the pin
+ *      adds nothing**: the hash chain is a bare keyless SHA-256, so a
+ *      writer-capable attacker renumbers survivors to `seq === 1` and
+ *      recomputes `hash = sha256(prevHash + canonicalJson(event))` with no
+ *      secret — the sheared file verifies clean (encoded as a
+ *      known-limitation test in server.test.ts, ccsc-x0t.2). Tail-
+ *      truncation and a uniform full-file downgrade of a signed chain to
+ *      unsigned v1 (stripping every Ed25519 signature) likewise remain
+ *      residual — defeating them needs a pinned "signing began at seq N"
+ *      v2-floor anchor (deferred; tracked as ccsc-x0t.7 under epic #269).
  *
  *  The function never modifies the file (read-only contract).
  *  Returns on the first break; a second broken event after a fixed
