@@ -576,6 +576,23 @@ Catalogued here so they appear in every later design review:
   must be added to the *Outbound primitives* table above in the same PR,
   with its `assertOutboundAllowed` / `assertSendable` call sites shown in
   the diff.
+- **R7. Thread misattribution under concurrent multi-thread tool-calling**
+  (`ccsc-x0t.6`, [`ADR-003`](ADR-003-permission-request-thread-correlation.md)).
+  The MCP `permission_request` notification carries no thread/session
+  correlation, so `evaluate()` reads the tool call's `(channel, thread)` from
+  the module-global `lastActiveThread`/`targetChannel` (the most-recent inbound
+  message), not the call's true origin. Under genuinely concurrent multi-thread
+  tool-calling this can misattribute a call: a thread-scoped `auto_approve` may
+  fire for the wrong thread (over-grant) or a thread-scoped `deny`/`require` may
+  miss (under-enforcement). Channel-, tool-, actor-, and arg-scoped rules are
+  unaffected, and the human still sees every `require` prompt in *some* thread.
+  **Accepted operating assumption:** single-active-thread (precise for the common
+  single-operator case); the signed journal records the (possibly-wrong)
+  `sessionKey` faithfully so misattribution is auditable. The precise fix needs
+  an upstream notification-shape change (a correlation field); the interim
+  mitigation (fail-safe thread-scoped rules to a human when >1 thread is active,
+  reusing the `ccsc-x0t.5` `indeterminate` path) is designed and deferred pending
+  evidence. Full analysis + decision: ADR-003.
 
 ---
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+
+- **ADR-003 — thread correlation for policy evaluation of MCP permission requests** (cold-contributor review follow-up `ccsc-x0t.6`, epic #269). The bead asked to propagate the tool call's *own* thread into `evaluate()` instead of the racy `lastActiveThread` global. Investigation found this is **not achievable within CCSC** at the current MCP surface: the `permission_request` notification carries no thread/session correlation, `pendingPermissions` is keyed by the same global, and there is no prior `request_id → thread` map — the causal link lives only in Claude Code's process context. ADR-003 records that finding, **accepts the single-active-thread operating assumption** (precise for the common single-operator case), **specifies the fail-safe mitigation** (route thread-scoped rules to a human when >1 thread is active, reusing the `ccsc-x0t.5` `indeterminate` path) and defers it pending evidence, and names the **upstream ask** (a correlation field on the notification) as the durable fix. Chose "document + defer" over shipping a speculative heuristic that trades false HITL prompts for protection against an unobserved failure mode. Added as residual risk **R7** in `THREAT-MODEL.md`.
+
 ### Changed
 
 - **Docs**: True up `CLAUDE.md` + `README.md` to the current codebase — test count `~1,033`/`1,237` → `~1,251` (authoritative `bun test` count; noted the `it`/`test` grep undercounts at ~1,120 because it misses `test.each` expansions and the Gherkin runner), refreshed the module LoC table (`server.ts` 3820 / `lib.ts` 2552 / `supervisor.ts` 1810 / `journal.ts` 1461), and dropped the stale "thin adapter" label on `slack-delivery.ts` (738 LoC). Reconciles `CLAUDE.md` ↔ `README.md` ↔ `AGENTS.md`. (#257)
