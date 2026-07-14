@@ -2150,6 +2150,11 @@ export type PolicyDecisionShape =
       approver: 'human_approver'
       ttlMs: number
       approvers: number
+      /** Mirror of `PolicyDecision`'s require-variant `reason` (policy.ts):
+       *  set only on the input-unavailable fail-safe path (ccsc-x0t.5).
+       *  Kept in lock-step by the bidirectional `satisfies` guard in
+       *  policy.ts — drift breaks the build. */
+      reason?: string
     }
 
 /** What the server handler should do with a policy decision. Four

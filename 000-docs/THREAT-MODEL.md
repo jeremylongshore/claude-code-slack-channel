@@ -451,6 +451,69 @@ surfaces — exactly where admin commands live.
 - OpenClaw security analysis (2026) — argv-mode `execFileSync` as the floor
   against shell-injection on CLI agent surfaces.
 
+### T12. Policy fail-open at the input-unavailable gate (CC → action) — `ccsc-x0t.5`
+
+> A `deny` or `require_approval` rule scoped by an input-dependent predicate
+> (`pathPrefix` / `argEquals`) silently fails to fire at the production
+> permission gate — because that gate carries no structured tool args — and a
+> later broad `auto_approve` rule swallows the call. The operator authored a
+> guardrail; the guardrail was never evaluated; the call was silently allowed
+> with no human in the loop.
+
+The sole production caller of `policy.evaluate()` is the MCP
+`permission_request` notification handler. That notification carries only an
+`input_preview` **string**, never the structured args, so the handler builds
+the `ToolCall` with `input: {}`. The `pathPrefix` predicate reads
+`call.input.path` and `argEquals` reads `call.input[key]` — both empty. Before
+`ccsc-x0t.5`, `matchApplies` returned **no-match** for an unevaluable predicate,
+so the rule was skipped entirely.
+
+- **Worked exploit** (both cold-contributor reviewers reproduced it):
+  ```json
+  [
+    { "id": "deny-etc",   "effect": "deny",        "match": { "pathPrefix": "/etc" }, "reason": "no /etc" },
+    { "id": "trust-bash", "effect": "auto_approve", "match": { "tool": "Bash" } }
+  ]
+  ```
+  A `Bash` call to `/etc/shadow` returned `{ allow, rule: 'trust-bash' }`. The
+  `/etc` deny was skipped (empty input → no-match) and the broad auto_approve
+  granted the call.
+- **Why the existing linters missed it**: `detectBroadAutoApprove` does not
+  flag `trust-bash` because it *is* scoped (by `tool`), so it isn't "broad" by
+  that heuristic. `detectShadowing` compares match specs statically and does
+  not model the empty-input runtime condition. The fail-open lived only at the
+  gate, at runtime, on a specific call shape.
+- **Mitigation** (`ccsc-x0t.5`, this fix):
+  1. **Tri-state matching.** `matchApplies` returns `indeterminate` (not
+     `no_match`) when every enforceable field (`tool`/`channel`/`thread_ts`/
+     `actor`) matches but an input-dependent predicate can't be evaluated
+     (`inputAvailable === false`).
+  2. **Fail-safe, not fail-open.** On `indeterminate`, `evaluate()` routes a
+     `deny`/`require_approval` rule to a human (`require`), preempting any later
+     `auto_approve`; an `auto_approve` with an unconfirmable predicate is
+     skipped. Never a silent allow.
+  3. **Honest journaling.** The fail-safe `require` decision carries
+     `reason: 'predicate unevaluable at gate → routed to human'`, written into
+     the `policy.require` event's input echo as `failsafeReason`. The signed
+     audit chain records that the human was asked *because* the gate could not
+     evaluate the rule — it never claims the predicate was evaluated. No
+     `policy.allow` is written for the call.
+  4. **Boot linter.** `detectUnenforceablePredicates()` (warn-not-block) names
+     every rule whose `pathPrefix`/`argEquals` predicate the gate cannot
+     enforce, and states the effective behavior per effect, so the coarser
+     runtime semantics are never a surprise.
+- **Residual risk**: the fail-safe is coarser than a true evaluation — a
+  `deny` on `/etc` becomes "ask a human about this `Bash` call" rather than
+  "block calls whose path is under `/etc`." A human could approve a call the
+  precise predicate would have blocked. This is an honest limitation of the
+  current MCP surface (no structured args at the gate), journaled as such, and
+  strictly safer than the silent allow it replaces. It resolves fully when the
+  permission_request notification carries structured input (`inputAvailable`
+  becomes `true` at that site, the predicates evaluate precisely, and the
+  fail-safe path is never taken). See
+  [`policy-evaluation-flow.md`](policy-evaluation-flow.md) § Input-unavailable
+  fail-safe.
+
 ---
 
 ## Invariants later epics must preserve
@@ -484,6 +547,11 @@ review enforce them; PRs that would break one do not merge.
    from importing `manifest.ts` (mirrors 31-A.4) and is reachable only
    through the `gate() → policy.evaluate() → journal.write() → dispatch`
    pipeline.
+8. **The policy gate never fails open.** A rule whose predicate cannot be
+   evaluated at the gate (input unavailable) is `indeterminate`, never
+   silently no-match: a `deny`/`require_approval` fails safe to a human, an
+   `auto_approve` is skipped. An unevaluable guardrail must degrade to "ask a
+   human," never to "allow." (T12, `ccsc-x0t.5`.)
 
 ---
 
