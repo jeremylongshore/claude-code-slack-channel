@@ -37,10 +37,10 @@ import { canonicalJson } from './journal.ts'
  *  - `channel`    — Slack channel ID, e.g. "C0123456789".
  *  - `thread_ts`  — Slack thread timestamp, e.g. "1712345678.001100".
  *                   Scopes a rule to a single thread within a channel.
- *                   Schema-only in v0.5.x: reserved for Epic 29-B's
- *                   evaluate() wiring so operators can ship thread-
- *                   scoped rules against a stable v1 schema without a
- *                   migration edit once enforcement lands.
+ *                   Enforced by evaluate() via matchApplies(): compared
+ *                   against `call.sessionKey.thread`. (Previously schema-
+ *                   only; wiring landed in Epic 29-B — before that a
+ *                   thread_ts-only rule silently matched every thread.)
  *  - `actor`      — who is calling the tool. Approvers arrive on a
  *                   later turn so they are not a valid `actor` here.
  *  - `argEquals`  — subset equality on validated MCP input args. Keys
@@ -454,6 +454,7 @@ export function evaluate(
 function matchApplies(match: MatchSpec, call: ToolCall): boolean {
   if (match.tool !== undefined && match.tool !== call.tool) return false
   if (match.channel !== undefined && match.channel !== call.sessionKey.channel) return false
+  if (match.thread_ts !== undefined && match.thread_ts !== call.sessionKey.thread) return false
   if (match.actor !== undefined && match.actor !== call.actor) return false
 
   if (match.pathPrefix !== undefined) {

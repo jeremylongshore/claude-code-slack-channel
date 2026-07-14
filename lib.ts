@@ -1569,7 +1569,7 @@ export function assertOutboundAllowed(
   access: Access,
   deliveredThreads: ReadonlySet<string>,
 ): void {
-  if (access.channels[chatId]) return
+  if (Object.hasOwn(access.channels, chatId) && access.channels[chatId]) return
   if (deliveredThreads.has(deliveredThreadKey(chatId, threadTs))) return
   throw new Error(
     `Outbound gate: (channel ${chatId}, thread ${threadTs ?? '<top-level>'}) is not in the allowlist or delivered-threads set.`,
@@ -1886,7 +1886,7 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
 function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): GateResult {
   const { access, botUserId } = opts
   const channel = ev.channel as string
-  const policy = access.channels[channel]
+  const policy = Object.hasOwn(access.channels, channel) ? access.channels[channel] : undefined
   if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
 
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
