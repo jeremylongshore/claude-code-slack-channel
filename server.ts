@@ -31,11 +31,13 @@ import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
   AUDIT_RECEIPTS_MAX,
+  assertManifestIdentityResolved,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
   buildSecretPlaceholderMap,
   buildSecretValueSet,
   chunkText,
+  classifySocketStartError,
   type DeliveryObligation,
   decidePermissionRoute,
   defaultAccess,
@@ -56,7 +58,7 @@ import {
   gate as libGate,
   listSessions as libListSessions,
   makeIdempotentSend,
-  NON_RETRYABLE_SLACK_ERRORS,
+  nextSocketStartBackoffMs,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -2026,11 +2028,8 @@ async function executePublishManifest(
     // Refresh from module state — this ctx was built before the latch settled.
     ctx.botUserId = botUserId
     ctx.selfBotId = selfBotId
-    if (ctx.botUserId === '') {
-      throw new Error(
-        'publish_manifest: bot identity not yet resolved (Slack auth still connecting); retry shortly',
-      )
-    }
+    // Pure guard in lib.ts (ccsc-x0t.3) — testable without importing server.ts.
+    assertManifestIdentityResolved(ctx.botUserId)
   }
 
   ctx.journalWrite({
@@ -3888,18 +3887,16 @@ async function main(): Promise<void> {
       settleIdentity()
     }
 
-    // Slack marks these Socket Mode start errors unrecoverable (thrown out of
-    // retrieveWSSURL rather than internally reconnected) — retrying them
-    // forever would silently mask a dead channel.
-    const UNRECOVERABLE_START_RE =
-      /not_authed|invalid_auth|account_inactive|user_removed_from_team|team_disabled|token_revoked|token_expired/
     // Bounded retry: the loop exists to survive a TRANSIENT outage, not to
     // mask a permanently-dead channel. Auth/config-fatal errors shut down
     // immediately; anything else (persistent 5xx, proxy blackhole, DNS/TLS
     // failure — the SDK throws these out of retrieveWSSURL as
     // RequestError/HTTPError rather than reconnecting internally) gets
     // MAX_SOCKET_START_ATTEMPTS tries (~5 minutes with the backoff below),
-    // then fails loud the same way.
+    // then fails loud the same way. The fatal-vs-retryable decision and the
+    // backoff schedule are pure functions in lib.ts (classifySocketStartError /
+    // nextSocketStartBackoffMs) so the boot-path classification is unit-tested
+    // without importing this module (ccsc-x0t.4 / ccsc-x0t.10).
     const MAX_SOCKET_START_ATTEMPTS = 10
     let attempt = 0
     let delayMs = 2_000
@@ -3910,15 +3907,12 @@ async function main(): Promise<void> {
         return
       } catch (err) {
         attempt += 1
-        // Prefer the structured Slack error code (err.data.error) over message
-        // matching; the regex is the fallback for wrapped/stringified errors.
-        const code = extractSlackErrorCode(err)
         const msg = err instanceof Error ? err.message : String(err)
-        if (
-          (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) ||
-          UNRECOVERABLE_START_RE.test(msg)
-        ) {
-          console.error('[slack] Socket Mode start failed with unrecoverable error:', code ?? msg)
+        if (classifySocketStartError(err) === 'fatal') {
+          console.error(
+            '[slack] Socket Mode start failed with unrecoverable error:',
+            extractSlackErrorCode(err) ?? msg,
+          )
           await shutdown('unrecoverable Socket Mode start error', 1)
           return
         }
@@ -3935,7 +3929,7 @@ async function main(): Promise<void> {
           msg,
         )
         await new Promise((r) => setTimeout(r, delayMs))
-        delayMs = Math.min(delayMs * 2, 60_000)
+        delayMs = nextSocketStartBackoffMs(delayMs)
       }
     }
   })()

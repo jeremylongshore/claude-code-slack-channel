@@ -390,6 +390,92 @@ export function computeBackoffMs(attempt: number, opts: BackoffOptions = {}): nu
   return Math.min(baseMs * factor ** (attempt - 1), maxMs)
 }
 
+// ---------------------------------------------------------------------------
+// Socket Mode start() classification + backoff (ccsc-x0t.4 / ccsc-x0t.10)
+//
+// The @slack/socket-mode client auto-reconnects ONCE started; the retry loop
+// in server.ts only guards the initial start(). Slack throws a small set of
+// auth/config errors out of retrieveWSSURL as permanently fatal (retrying them
+// forever masks a dead channel). Everything else — persistent 5xx, proxy
+// blackhole, DNS/TLS failure (thrown as RequestError/HTTPError) — is transient:
+// bounded-retry then fail loud. #268 implemented this loop inline; extracting
+// the classification + backoff here makes the DECISION logic unit-testable
+// without importing server.ts (which runs main() on import).
+// ---------------------------------------------------------------------------
+
+/** Socket Mode start() errors Slack throws out of `retrieveWSSURL` as
+ *  permanently fatal (auth/config), rather than reconnecting internally. The
+ *  message-regex fallback catches wrapped/stringified errors that carry no
+ *  structured `data.error` code. */
+export const UNRECOVERABLE_SOCKET_START_RE =
+  /not_authed|invalid_auth|account_inactive|user_removed_from_team|team_disabled|token_revoked|token_expired/
+
+/** Classify a Socket Mode `start()` failure. `'fatal'` → shut down loud and
+ *  non-zero (retrying a revoked/wrong token masks a permanently-dead channel);
+ *  `'retryable'` → transient, back off and retry up to a bounded cap. Prefers
+ *  the structured Slack code (`NON_RETRYABLE_SLACK_ERRORS` via
+ *  `extractSlackErrorCode`) and falls back to the message regex. Pure so the
+ *  boot-path decision is testable without importing server.ts (ccsc-x0t.10). */
+export function classifySocketStartError(err: unknown): 'fatal' | 'retryable' {
+  const code = extractSlackErrorCode(err)
+  if (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) return 'fatal'
+  if (UNRECOVERABLE_SOCKET_START_RE.test(errorMessage(err))) return 'fatal'
+  return 'retryable'
+}
+
+/** Best-effort message extraction from an unknown throw. Handles Error
+ *  instances AND plain error-like objects carrying a string `message` (Gemini
+ *  review, PR #274): a serialized/wrapped Slack error thrown as a plain object
+ *  would otherwise `String()` to "[object Object]" and slip past the regex,
+ *  misclassifying a fatal auth error as retryable. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (typeof err === 'object' && err !== null && 'message' in err) {
+    const m = (err as Record<string, unknown>).message
+    if (typeof m === 'string') return m
+  }
+  return String(err)
+}
+
+/** Cap on a single Socket Mode start() retry backoff. */
+export const SOCKET_START_BACKOFF_CAP_MS = 60_000
+
+/** Next exponential backoff for the socket-start retry loop, doubling and
+ *  clamped to `SOCKET_START_BACKOFF_CAP_MS`. Pure (ccsc-x0t.10). */
+export function nextSocketStartBackoffMs(prevMs: number): number {
+  return Math.min(prevMs * 2, SOCKET_START_BACKOFF_CAP_MS)
+}
+
+// ---------------------------------------------------------------------------
+// publish_manifest identity guard (ccsc-x0t.3)
+//
+// server.ts connects the MCP transport before web.auth.test() resolves, so
+// there is a window (sub-second happy path; up to ~30 min while Slack auth
+// degrades and the WebClient retries) where tools are live but botUserId is
+// still ''. findOurPriorManifestPins fails closed on '', so the manifest
+// replace-sweep would silently no-op and leave DUPLICATE pinned manifests.
+// #268 added a bounded-await on an identity latch, then fails the call loudly
+// (retryable) if identity is still unresolved. This guard is the pure decision
+// at the end of that await — extracted so it's testable without importing
+// server.ts.
+// ---------------------------------------------------------------------------
+
+/** Message thrown when publish_manifest is attempted before Slack auth resolves
+ *  bot identity. Exported so the test asserts against one string, not a copy. */
+export const MANIFEST_IDENTITY_UNRESOLVED_MSG =
+  'publish_manifest: bot identity not yet resolved (Slack auth still connecting); retry shortly'
+
+/** Fail publish_manifest loudly (retryable) when bot identity is still
+ *  unresolved after the identity-latch await. Publishing with an unresolved
+ *  botUserId would make the replace-sweep silently no-op (findOurPriorManifestPins
+ *  fails closed on ''), leaving duplicate pinned manifests. Accepts nullable and
+ *  rejects any falsy or whitespace-only identity — a security guard fails closed
+ *  on every invalid identity, not just the exact empty string (Gemini review,
+ *  PR #274). Pure (ccsc-x0t.3). */
+export function assertManifestIdentityResolved(botUserId: string | null | undefined): void {
+  if (!botUserId || botUserId.trim() === '') throw new Error(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+}
+
 /** Slack message-metadata `event_type` marking a message as a CCSC reply
  *  delivery. The production send stamps it (alongside the idempotency key) so a
  *  redelivery's `findDelivered` can recognize our own prior post. (ccsc-o7x.2.3) */

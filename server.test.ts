@@ -6812,6 +6812,100 @@ describe('computeBackoffMs (ccsc-o7x.2.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Boot-path testability seams (ccsc-x0t.10, binding #267 + #268; also closes
+// the code-ACs of ccsc-x0t.3 and ccsc-x0t.4, which #268 shipped without tests).
+// These are the pure decisions extracted out of server.ts's main()-scope boot
+// wiring (which runs on import and so can't be unit-tested directly). A later
+// refactor that silently reverted #267/#268 now reddens a test.
+// ---------------------------------------------------------------------------
+
+describe('boot-path testability seams (ccsc-x0t.10)', () => {
+  test('#267: defaultLog writes to STDERR, never STDOUT (stdout is the MCP channel)', async () => {
+    const { defaultLog } = await import('./supervisor.ts')
+    const errChunks: string[] = []
+    const outChunks: string[] = []
+    const origErr = process.stderr.write
+    const origOut = process.stdout.write
+    process.stderr.write = ((chunk: unknown) => {
+      errChunks.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write
+    process.stdout.write = ((chunk: unknown) => {
+      outChunks.push(String(chunk))
+      return true
+    }) as typeof process.stdout.write
+    try {
+      defaultLog('session.activate', { channel: 'C1', thread: 'T1' })
+    } finally {
+      process.stderr.write = origErr
+      process.stdout.write = origOut
+    }
+    // A structured log on stdout arrives as an invalid JSON-RPC frame and kills
+    // the transport — the exact #267 regression. stdout MUST stay clean.
+    expect(outChunks).toEqual([])
+    expect(errChunks).toHaveLength(1)
+    expect(JSON.parse(errChunks[0]!.trim())).toEqual({
+      event: 'session.activate',
+      channel: 'C1',
+      thread: 'T1',
+    })
+  })
+
+  test('#268: classifySocketStartError → fatal on a structured non-retryable code', async () => {
+    const { classifySocketStartError } = await import('./lib.ts')
+    expect(classifySocketStartError({ data: { error: 'invalid_auth' } })).toBe('fatal')
+    expect(classifySocketStartError({ data: { error: 'account_inactive' } })).toBe('fatal')
+  })
+
+  test('#268: classifySocketStartError → fatal on a message-regex match (wrapped error)', async () => {
+    const { classifySocketStartError } = await import('./lib.ts')
+    expect(classifySocketStartError(new Error('An API error occurred: token_revoked'))).toBe(
+      'fatal',
+    )
+    expect(classifySocketStartError(new Error('team_disabled'))).toBe('fatal')
+    // A plain error-like object (not an Error instance) carrying the fatal code
+    // only in its .message must still classify fatal, not "[object Object]" →
+    // retryable (Gemini review, PR #274).
+    expect(classifySocketStartError({ message: 'token_revoked' })).toBe('fatal')
+  })
+
+  test('#268: classifySocketStartError → retryable on transient errors (loop keeps trying)', async () => {
+    const { classifySocketStartError } = await import('./lib.ts')
+    expect(classifySocketStartError(new Error('ECONNRESET'))).toBe('retryable')
+    expect(classifySocketStartError({ data: { error: 'service_unavailable' } })).toBe('retryable')
+    expect(classifySocketStartError('a bare string')).toBe('retryable')
+  })
+
+  test('#268: nextSocketStartBackoffMs doubles then caps at 60s', async () => {
+    const { nextSocketStartBackoffMs, SOCKET_START_BACKOFF_CAP_MS } = await import('./lib.ts')
+    expect(nextSocketStartBackoffMs(2_000)).toBe(4_000)
+    expect(nextSocketStartBackoffMs(30_000)).toBe(60_000)
+    expect(nextSocketStartBackoffMs(40_000)).toBe(60_000) // min(80k, cap)
+    expect(SOCKET_START_BACKOFF_CAP_MS).toBe(60_000)
+  })
+
+  test('ccsc-x0t.3: assertManifestIdentityResolved fails closed on every invalid identity', async () => {
+    const { assertManifestIdentityResolved, MANIFEST_IDENTITY_UNRESOLVED_MSG } = await import(
+      './lib.ts'
+    )
+    // Empty, nullable, and whitespace-only identities are all invalid — a
+    // security guard must fail closed on each, not just the exact '' (Gemini
+    // review, PR #274).
+    expect(() => assertManifestIdentityResolved('')).toThrow(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+    expect(() => assertManifestIdentityResolved(null)).toThrow(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+    expect(() => assertManifestIdentityResolved(undefined)).toThrow(
+      MANIFEST_IDENTITY_UNRESOLVED_MSG,
+    )
+    expect(() => assertManifestIdentityResolved('   ')).toThrow(MANIFEST_IDENTITY_UNRESOLVED_MSG)
+  })
+
+  test('ccsc-x0t.3: assertManifestIdentityResolved does not throw once identity is resolved', async () => {
+    const { assertManifestIdentityResolved } = await import('./lib.ts')
+    expect(() => assertManifestIdentityResolved('U0BOT')).not.toThrow()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Delivery poller — drainOutbox (ccsc-o7x.2.2)
 // ---------------------------------------------------------------------------
 

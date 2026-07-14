@@ -612,7 +612,9 @@ export function resolveMaxConcurrentSessions(
  *  keys) and Claude Code drops the whole connection — in practice every
  *  `session.activate` (one per inbound message) and every boot-time
  *  recovery-sweep line killed the transport. */
-function defaultLog(event: string, fields: Record<string, unknown>): void {
+// Exported (ccsc-x0t.10) so a regression test can assert it writes to STDERR,
+// never STDOUT — the stdout-is-the-MCP-protocol-channel invariant #267 fixed.
+export function defaultLog(event: string, fields: Record<string, unknown>): void {
   const line = JSON.stringify({ event, ...fields })
   // process.stderr.write is sync for TTYs, async for pipes; either way
   // the supervisor does not await the flush. Structured logs are best-
