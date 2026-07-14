@@ -48,6 +48,7 @@ import {
   extractSlackErrorCode,
   formatVerifyResult,
   type GateResult,
+  getChannelPolicy,
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
@@ -434,7 +435,7 @@ async function postAuditReceiptIfEnabled(
     channel,
     thread,
     tool,
-    accessSnapshot.channels[channel],
+    getChannelPolicy(accessSnapshot, channel),
     (ctx) => console.error('[slack] audit receipt post failed (non-blocking):', ctx),
   )
   if (!result) return undefined
@@ -636,7 +637,7 @@ function inboundSessionKey(
   // invalid empty-userId key (Gemini, PR #248).
   const senderId = (ev.user ?? ev.bot_id) as unknown
   if (
-    access.channels[channelId]?.perUserSessions === true &&
+    getChannelPolicy(access, channelId)?.perUserSessions === true &&
     typeof senderId === 'string' &&
     senderId !== ''
   ) {
@@ -3389,7 +3390,7 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
 
   const deps = {
     isAllowed: (cId: string, uId: string): boolean => {
-      const policy = access.channels[cId]
+      const policy = getChannelPolicy(access, cId)
       return policy?.adminCommands?.allowFrom?.includes(uId) ?? false
     },
     journalWrite: async (input: Parameters<JournalWriter['writeEvent']>[0]): Promise<unknown> => {
@@ -3443,7 +3444,7 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
     muteStore: adminMuteStore,
     // ccsc-yl6k9 — effective rate-limit view for the read-only !rate-limit verb.
     getChannelRateLimits: (chId: string) => {
-      const chPolicy = getAccess().channels?.[chId]
+      const chPolicy = getChannelPolicy(getAccess(), chId)
       return {
         peerBot: chPolicy?.peerBotRateLimit ?? DEFAULT_PEER_BOT_RATE_LIMIT,
         channel: chPolicy?.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER,
