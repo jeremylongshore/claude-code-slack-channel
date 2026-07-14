@@ -22,12 +22,18 @@ interface ToolCall {
   sessionKey: SessionKey             // see 000-docs/session-state-machine.md
   actor:    Principal                // 'session_owner' | 'claude_process'
                                      //   approvers come in via a later turn
+  inputAvailable?: boolean           // default TRUE. FALSE at a call site that
+                                     //   carries no structured args (the MCP
+                                     //   permission_request notification) — see
+                                     //   § Input-unavailable fail-safe below.
 }
 
 type PolicyDecision =
   | { kind: 'allow';   rule?: string }            // ID of the matching rule, if any
   | { kind: 'deny';    rule: string; reason: string }
-  | { kind: 'require'; rule: string; approver: 'human_approver'; ttlMs: number }
+  | { kind: 'require'; rule: string; approver: 'human_approver'; ttlMs: number
+    ; approvers: number; reason?: string }        // reason set only on the
+                                                  //   input-unavailable fail-safe
 
 function evaluate(
   call: ToolCall,
@@ -155,6 +161,102 @@ pragmatic split: tools whose *only* reason to exist is mutation of
 external state (upload, post, delete) demand an authored rule; read-only
 tools do not. The full list is in `policy.ts` next to the evaluator, not
 in this doc (it changes with tool surface).
+
+---
+
+## Input-unavailable fail-safe (ccsc-x0t.5)
+
+### The fail-open this closes
+
+The *sole* production caller of `evaluate()` is the MCP `permission_request`
+notification handler (`server.ts`). That notification carries only a
+human-readable `input_preview` **string** — never the structured tool args.
+So the production `ToolCall` is built with `input: {}`. Two `MatchSpec`
+predicates read the structured input:
+
+- `pathPrefix` reads `call.input.path`
+- `argEquals` reads `call.input[key]`
+
+Against an empty `input`, the pre-ccsc-x0t.5 `matchApplies` returned **`false`
+(no-match)** for both. That is a **fail-open**: a `deny` or `require_approval`
+rule that scopes itself with `pathPrefix`/`argEquals` silently never fires at
+the gate, and a later broad `auto_approve` swallows the call. Worked exploit:
+
+```json
+[
+  { "id": "deny-etc",   "effect": "deny",         "match": { "pathPrefix": "/etc" }, "reason": "no /etc" },
+  { "id": "trust-bash", "effect": "auto_approve",  "match": { "tool": "Bash" } }
+]
+```
+
+A `Bash` call to `/etc/shadow` **returned `{ allow, rule: 'trust-bash' }`** —
+the operator's `/etc` deny was skipped (empty input → no-match) and the broad
+auto_approve granted the call with no human in the loop. `detectBroadAutoApprove`
+does **not** catch this (the auto_approve is `tool`-scoped, so it isn't "broad").
+
+### Tri-state `matchApplies` + fail-safe
+
+`matchApplies` becomes **tri-state**: `match` | `no_match` | `indeterminate`.
+
+1. **Enforceable fields first.** `tool`, `channel`, `thread_ts`, `actor` are
+   evaluable regardless of input availability. Any mismatch → `no_match`
+   (short-circuits — the rule genuinely does not apply).
+2. **Input-dependent predicates.** When all enforceable fields match *and* the
+   rule constrains `pathPrefix`/`argEquals` *and* `inputAvailable === false`,
+   the predicate cannot be evaluated → **`indeterminate`** (NOT `no_match`).
+   When `inputAvailable !== false` (the default), the predicate is evaluated
+   exactly as before.
+
+`evaluate()` acts on `indeterminate` by rule effect:
+
+| Indeterminate rule effect | Action | Rationale |
+|---|---|---|
+| `deny` | **fail-safe → `require`** (route to human) | Can't confirm the call is safe → don't silently allow; ask a human. Preempts any later `auto_approve`. |
+| `require_approval` | **→ `require`** (honors approval window) | Identical to a genuine `require_approval` match — the predicate would only have narrowed it further. |
+| `auto_approve` | **skip** (continue) | Never auto-approve on an unconfirmable predicate. Same net effect as the old no-match, but now *explicit*. |
+
+A fail-safed `deny` has no `ttlMs`/`approvers` of its own, so the `require`
+decision uses conservative defaults (5-minute window, single approver — the
+`require_approval` schema defaults) so one operator can clear the hold and it
+doesn't linger. A fail-safed `require_approval` uses the rule's own `ttlMs`/
+`approvers`. Both honor a fresh `(rule.id, sessionKey)` approval in the window,
+exactly like a matched `require_approval`.
+
+Because the enforceable fields are checked **first** and short-circuit to
+`no_match`, a rule whose `tool`/`channel`/`thread_ts`/`actor` genuinely
+mismatches never reaches the indeterminate branch — it just doesn't apply.
+Only a rule that matches *every* enforceable field but has an unevaluable
+predicate goes indeterminate.
+
+### Honest journaling
+
+The fail-safe `require` decision carries `reason: 'predicate unevaluable at
+gate → routed to human'`. `server.ts` writes it into the `policy.require`
+event's input echo as `failsafeReason`. No `policy.allow` is ever written for
+the call, so the signed audit chain **never claims the predicate was
+evaluated** — it records that the call was held for a human *because* the gate
+could not evaluate the rule. The record is honest about the limitation.
+
+### Load-time linter — `detectUnenforceablePredicates()`
+
+A warn-not-block linter (sibling of `detectShadowing` / `detectBroadAutoApprove`)
+runs at boot. It names every rule whose `match` constrains `pathPrefix` or
+`argEquals` — because at the current MCP `permission_request` gate those
+predicates cannot be enforced. The warning states the *effective* behavior at
+that gate (`deny`/`require_approval` → human; `auto_approve` → skipped) so an
+operator is never surprised that a path-scoped rule behaves more coarsely than
+its JSON reads. Warn-not-block: an operator running against a future MCP
+surface that *does* carry structured args (or exercising the rule in a test
+harness where input is available) shouldn't be blocked from booting.
+
+### Backward compatibility
+
+`inputAvailable` defaults to `true`. Every existing call site and every test
+that omits it evaluates `pathPrefix`/`argEquals` exactly as before — the
+tri-state collapses to the old boolean (`match`≡true, `no_match`≡false, and
+`indeterminate` is unreachable when input is available). Only the production
+permission-request site sets `inputAvailable: false`, opting into the
+fail-safe. The change is additive.
 
 ---
 
@@ -507,6 +609,10 @@ Every 29-A PR is checked against these.
 6. Approvals are scoped to `(rule.id, sessionKey)`, never workspace-wide.
 7. Default is allow unless the tool is in `requireAuthoredPolicy`.
 8. The evaluator is never the sole gate; outbound gate runs after.
+9. When `inputAvailable === false`, an input-dependent predicate
+   (`pathPrefix`/`argEquals`) is **indeterminate**, never silently no-match:
+   a `deny`/`require_approval` rule fails safe to `require`; an `auto_approve`
+   rule is skipped. Never fail-open at the gate.
 
 ---
 

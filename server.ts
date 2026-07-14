@@ -93,6 +93,7 @@ import {
   assertUniqueRuleIds,
   detectBroadAutoApprove,
   detectShadowing,
+  detectUnenforceablePredicates,
   type PolicyRule,
   type ToolCall as PolicyToolCall,
   parsePolicyRules,
@@ -549,9 +550,20 @@ function loadPolicyRulesAtBoot(): readonly PolicyRule[] {
   for (const warning of broads) {
     console.error(`[slack] policy footgun warning: ${warning.message}`)
   }
+  // detectUnenforceablePredicates (ccsc-x0t.5) — the MCP permission_request
+  // gate carries no structured args, so pathPrefix/argEquals predicates can't
+  // be evaluated there; the evaluator fail-safes such deny/require rules to a
+  // human and skips such auto_approve rules. Warn loud at boot so the operator
+  // knows the rule behaves more coarsely at the gate than its JSON reads.
+  // Warn-not-block for the same reasons as the other two linters.
+  const unenforceable = detectUnenforceablePredicates(parsed)
+  for (const warning of unenforceable) {
+    console.error(`[slack] policy unenforceable-predicate warning: ${warning.message}`)
+  }
   console.error(
     `[slack] policy: loaded ${parsed.length} rule(s), ` +
-      `${shadows.length} shadow warning(s), ${broads.length} footgun warning(s)`,
+      `${shadows.length} shadow warning(s), ${broads.length} footgun warning(s), ` +
+      `${unenforceable.length} unenforceable-predicate warning(s)`,
   )
   return parsed
 }
@@ -2427,14 +2439,22 @@ mcp.setNotificationHandler(
     //
     // The permission_request notification carries `input_preview` (string)
     // rather than structured args, so `argEquals` and `pathPrefix`
-    // predicates cannot match from this notification alone. Rules can
-    // still match on `tool`, `channel`, `thread_ts`, and `actor`. Filed
-    // for future work when the MCP surface carries structured input.
+    // predicates cannot be evaluated from this notification alone. We mark
+    // the call `inputAvailable: false` so the evaluator applies the
+    // input-unavailable FAIL-SAFE (ccsc-x0t.5) instead of the old fail-open:
+    // a `deny`/`require_approval` rule whose only unmet field is such a
+    // predicate is routed to a human (never silently skipped), preempting any
+    // later broad `auto_approve`; an `auto_approve` with such a predicate is
+    // skipped. Rules still match fully on `tool`, `channel`, `thread_ts`, and
+    // `actor`. See 000-docs/policy-evaluation-flow.md § Input-unavailable
+    // fail-safe; the boot linter `detectUnenforceablePredicates` names every
+    // affected rule.
     // ---------------------------------------------------------------------
     const sessionThread = lastActiveThread ?? ''
     const policyCall: PolicyToolCall = {
       tool: params.tool_name,
       input: {},
+      inputAvailable: false,
       sessionKey: { channel: targetChannel, thread: sessionThread },
       actor: 'claude_process',
     }
@@ -2554,13 +2574,24 @@ mcp.setNotificationHandler(
     // for the no-opinion case — see release-plan R2).
     let pendingPolicy: PendingPolicyApproval | undefined
     if (route.type === 'require_human' && decision.kind === 'require') {
+      // Honest journaling for the input-unavailable fail-safe (ccsc-x0t.5):
+      // when `evaluate()` routed a deny/require_approval rule to a human
+      // because its pathPrefix/argEquals predicate was unevaluable at this
+      // gate, `decision.reason` is set. Stamp it into the `policy.require`
+      // event's input echo so the signed audit chain records WHY the human
+      // was asked and never implies the predicate was evaluated. A genuine
+      // require_approval match leaves `reason` undefined → echo unchanged.
+      const requireInput =
+        decision.reason !== undefined
+          ? { ...policyInput, failsafeReason: decision.reason }
+          : policyInput
       // Same exhaustive contract as auto_allow above (ccsc-175):
       // require_human → exactly [policy.require], approversNeeded merged
       // into the trace input by the builder.
       for (const ev of permissionRouteJournalEvents(route, {
         sessionKey: policySessionKey,
         toolName: params.tool_name,
-        input: policyInput,
+        input: requireInput,
         approversNeeded: decision.approvers,
       })) {
         journalWrite(ev)

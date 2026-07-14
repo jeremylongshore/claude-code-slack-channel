@@ -10735,6 +10735,34 @@ describe('permission-route journal builders bind production code (ccsc-175)', ()
     }
   })
 
+  test('honest journaling (ccsc-x0t.5): a fail-safe failsafeReason survives into the policy.require event', async () => {
+    // server.ts merges decision.reason into the require input echo as
+    // `failsafeReason` when evaluate() fail-safed an indeterminate rule to a
+    // human. This binds that the builder preserves it — the audit chain must
+    // record WHY the human was asked, without a policy.allow ever being written.
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    const { INDETERMINATE_PREDICATE_REASON } = await import('./policy.ts')
+    const [ev] = permissionRouteJournalEvents(
+      { type: 'require_human', ruleId: 'deny-etc' },
+      {
+        sessionKey: { channel: 'C1', thread: 'T1' },
+        toolName: 'Bash',
+        input: {
+          tool: 'Bash',
+          channel: 'C1',
+          thread_ts: 'T1',
+          failsafeReason: INDETERMINATE_PREDICATE_REASON,
+        },
+        approversNeeded: 1,
+      },
+    )
+    expect(ev!.kind).toBe('policy.require')
+    expect(ev!.outcome).toBe('require')
+    expect((ev!.input as Record<string, unknown>).failsafeReason).toBe(
+      INDETERMINATE_PREDICATE_REASON,
+    )
+  })
+
   test('auto_allow events carry the route ruleId and the ctx correlationId', async () => {
     const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
     const [ev] = permissionRouteJournalEvents(
@@ -11134,6 +11162,278 @@ describe('detectBroadAutoApprove', () => {
       { id: 'bad-2', effect: 'auto_approve', match: { actor: 'session_owner' } },
     ])
     const warnings = detectBroadAutoApprove(rules)
+    expect(warnings.map((w) => w.ruleId).sort()).toEqual(['bad-1', 'bad-2'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Input-unavailable fail-safe (ccsc-x0t.5) — the crown-jewel fail-open fix.
+//
+// The sole production caller of evaluate() is the MCP permission_request
+// handler, which carries only a preview STRING (no structured args), so it
+// builds the ToolCall with input:{} and inputAvailable:false. Before this fix
+// a deny/require rule scoped by pathPrefix/argEquals silently NEVER FIRED at
+// that gate (empty input → no-match), and a later broad auto_approve swallowed
+// the call — a silent allow with no human in the loop. These tests bind the
+// fail-safe: revert policy.ts and every test in this block goes red.
+//
+// Design: 000-docs/policy-evaluation-flow.md § Input-unavailable fail-safe.
+// ---------------------------------------------------------------------------
+
+describe('input-unavailable fail-safe — evaluate() (ccsc-x0t.5)', () => {
+  const loadPolicy = async () => await import('./policy.ts')
+
+  const gateCall = (
+    tool: string,
+    overrides: Partial<import('./policy.ts').ToolCall> = {},
+  ): import('./policy.ts').ToolCall => ({
+    tool,
+    input: {},
+    inputAvailable: false, // the production permission_request condition
+    sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+    actor: 'claude_process',
+    ...overrides,
+  })
+
+  test('CROWN JEWEL: {deny, pathPrefix:/etc} under {auto_approve, tool:Bash} → require, NOT silent allow', async () => {
+    const {
+      evaluate,
+      parsePolicyRules,
+      INDETERMINATE_PREDICATE_REASON,
+      FAILSAFE_APPROVAL_TTL_MS,
+      FAILSAFE_APPROVAL_QUORUM,
+    } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'deny-etc', effect: 'deny', match: { pathPrefix: '/etc' }, reason: 'no /etc' },
+      { id: 'trust-bash', effect: 'auto_approve', match: { tool: 'Bash' } },
+    ])
+    // The exact exploit from the risk ledger: a Bash call to /etc/shadow.
+    const decision = evaluate(gateCall('Bash'), rules, 0)
+    // Pre-fix this returned { kind: 'allow', rule: 'trust-bash' } — the
+    // fail-open. The indeterminate deny now preempts the broad auto_approve.
+    expect(decision).toEqual({
+      kind: 'require',
+      rule: 'deny-etc',
+      approver: 'human_approver',
+      ttlMs: FAILSAFE_APPROVAL_TTL_MS,
+      approvers: FAILSAFE_APPROVAL_QUORUM,
+      reason: INDETERMINATE_PREDICATE_REASON,
+    })
+  })
+
+  test('argEquals is also unevaluable at the gate → deny fails safe to require', async () => {
+    const { evaluate, parsePolicyRules, INDETERMINATE_PREDICATE_REASON } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'deny-rm-rf',
+        effect: 'deny',
+        match: { tool: 'Bash', argEquals: { command: 'rm -rf /' } },
+        reason: 'no rm -rf',
+      },
+      { id: 'trust-bash', effect: 'auto_approve', match: { tool: 'Bash' } },
+    ])
+    const decision = evaluate(gateCall('Bash'), rules, 0)
+    expect(decision.kind).toBe('require')
+    if (decision.kind === 'require') {
+      expect(decision.rule).toBe('deny-rm-rf')
+      expect(decision.reason).toBe(INDETERMINATE_PREDICATE_REASON)
+    }
+  })
+
+  test("indeterminate require_approval uses the RULE's own ttlMs/approvers (not the deny defaults)", async () => {
+    const { evaluate, parsePolicyRules, INDETERMINATE_PREDICATE_REASON } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'gate-secret',
+        effect: 'require_approval',
+        match: { pathPrefix: '/secret' },
+        ttlMs: 123_456,
+        approvers: 2,
+      },
+    ])
+    const decision = evaluate(gateCall('upload_file'), rules, 0)
+    expect(decision).toEqual({
+      kind: 'require',
+      rule: 'gate-secret',
+      approver: 'human_approver',
+      ttlMs: 123_456,
+      approvers: 2,
+      reason: INDETERMINATE_PREDICATE_REASON,
+    })
+  })
+
+  test('indeterminate auto_approve is SKIPPED — a later genuine deny still wins', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'trust-safe-dir', effect: 'auto_approve', match: { pathPrefix: '/safe' } },
+      { id: 'deny-bash', effect: 'deny', match: { tool: 'Bash' }, reason: 'blocked' },
+    ])
+    // The auto_approve can't be confirmed (pathPrefix unevaluable) so it is
+    // skipped; evaluation continues to the deny, which fully matches on tool.
+    const decision = evaluate(gateCall('Bash'), rules, 0)
+    expect(decision).toEqual({ kind: 'deny', rule: 'deny-bash', reason: 'blocked' })
+  })
+
+  test('indeterminate auto_approve alone → falls through to default (rule did NOT fire)', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'trust-safe-dir', effect: 'auto_approve', match: { pathPrefix: '/safe' } },
+    ])
+    // 'reply' is not in requireAuthoredPolicy → default allow with NO rule id,
+    // proving the auto_approve did not silently fire on an unconfirmable path.
+    const decision = evaluate(gateCall('reply'), rules, 0)
+    expect(decision).toEqual({ kind: 'allow' })
+  })
+
+  test('precise: a deny scoped to a DIFFERENT tool does NOT spuriously fail-safe', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      // pathPrefix present, but tool is 'Write' — an enforceable mismatch for
+      // a 'Bash' call short-circuits to no_match BEFORE the indeterminate path.
+      {
+        id: 'deny-write-etc',
+        effect: 'deny',
+        match: { tool: 'Write', pathPrefix: '/etc' },
+        reason: 'no writes to /etc',
+      },
+      { id: 'trust-bash', effect: 'auto_approve', match: { tool: 'Bash' } },
+    ])
+    const decision = evaluate(gateCall('Bash'), rules, 0)
+    // The deny genuinely does not apply to a Bash call, so the auto_approve
+    // legitimately wins — the fail-safe is precise, not a blanket block.
+    expect(decision).toEqual({ kind: 'allow', rule: 'trust-bash' })
+  })
+
+  test('a fresh (rule, session) approval flips an indeterminate deny to allow', async () => {
+    const { evaluate, parsePolicyRules, approvalKey } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'deny-etc', effect: 'deny', match: { pathPrefix: '/etc' }, reason: 'no /etc' },
+    ])
+    const sessionKey = { channel: 'C_CHAN', thread: 'T1.0' }
+    const approvals = new Map([[approvalKey('deny-etc', sessionKey), { ttlExpires: 10_000 }]])
+    const decision = evaluate(gateCall('Bash', { sessionKey }), rules, 0, { approvals })
+    // Human already cleared this hold within the window → not re-prompted.
+    expect(decision).toEqual({ kind: 'allow', rule: 'deny-etc' })
+  })
+
+  // ── Backward compatibility: inputAvailable defaults true ────────────────
+
+  test('BACKWARD-COMPAT: omitting inputAvailable defaults true → argEquals evaluated normally', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'deny-danger',
+        effect: 'deny',
+        match: { tool: 'Bash', argEquals: { danger: true } },
+        reason: 'dangerous',
+      },
+      { id: 'trust-bash', effect: 'auto_approve', match: { tool: 'Bash' } },
+    ])
+    const base = {
+      tool: 'Bash',
+      sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+      actor: 'claude_process' as const,
+      // inputAvailable intentionally OMITTED → defaults to true.
+    }
+    // danger:true → deny fires exactly as authored.
+    expect(evaluate({ ...base, input: { danger: true } }, rules, 0)).toEqual({
+      kind: 'deny',
+      rule: 'deny-danger',
+      reason: 'dangerous',
+    })
+    // danger:false → deny no-match, auto_approve allows. Unchanged pre/post fix.
+    expect(evaluate({ ...base, input: { danger: false } }, rules, 0)).toEqual({
+      kind: 'allow',
+      rule: 'trust-bash',
+    })
+  })
+
+  test('explicit inputAvailable:true behaves identically to omitting it', async () => {
+    const { evaluate, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'deny-danger',
+        effect: 'deny',
+        match: { tool: 'Bash', argEquals: { danger: true } },
+        reason: 'dangerous',
+      },
+    ])
+    const call = {
+      tool: 'Bash',
+      input: { danger: true },
+      inputAvailable: true,
+      sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+      actor: 'claude_process' as const,
+    }
+    expect(evaluate(call, rules, 0)).toEqual({
+      kind: 'deny',
+      rule: 'deny-danger',
+      reason: 'dangerous',
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// detectUnenforceablePredicates() — boot honesty linter (ccsc-x0t.5)
+// ---------------------------------------------------------------------------
+
+describe('detectUnenforceablePredicates (ccsc-x0t.5)', () => {
+  const loadPolicy = async () => await import('./policy.ts')
+
+  test('warns on a deny+pathPrefix rule, naming FAIL-SAFE behavior', async () => {
+    const { detectUnenforceablePredicates, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'deny-etc', effect: 'deny', match: { pathPrefix: '/etc' }, reason: 'no /etc' },
+    ])
+    const warnings = detectUnenforceablePredicates(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.ruleId).toBe('deny-etc')
+    expect(warnings[0]!.predicates).toEqual(['pathPrefix'])
+    expect(warnings[0]!.message).toMatch(/FAILS SAFE to human approval/)
+  })
+
+  test('warns on an auto_approve+pathPrefix rule, naming SKIPPED behavior', async () => {
+    const { detectUnenforceablePredicates, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'trust-safe', effect: 'auto_approve', match: { pathPrefix: '/safe' } },
+    ])
+    const warnings = detectUnenforceablePredicates(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toMatch(/is SKIPPED/)
+  })
+
+  test('warns on argEquals, and lists BOTH predicates when a rule has both', async () => {
+    const { detectUnenforceablePredicates, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      {
+        id: 'both',
+        effect: 'require_approval',
+        match: { pathPrefix: '/x', argEquals: { k: 'v' } },
+      },
+    ])
+    const warnings = detectUnenforceablePredicates(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.predicates.sort()).toEqual(['argEquals', 'pathPrefix'])
+  })
+
+  test('no warning for rules constrained only by enforceable fields', async () => {
+    const { detectUnenforceablePredicates, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'r1', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'r2', effect: 'deny', match: { channel: 'C0000000000' }, reason: 'x' },
+      { id: 'r3', effect: 'require_approval', match: { actor: 'claude_process' } },
+    ])
+    expect(detectUnenforceablePredicates(rules)).toEqual([])
+  })
+
+  test('flags every offender in one pass', async () => {
+    const { detectUnenforceablePredicates, parsePolicyRules } = await loadPolicy()
+    const rules = parsePolicyRules([
+      { id: 'ok', effect: 'auto_approve', match: { tool: 'reply' } },
+      { id: 'bad-1', effect: 'deny', match: { pathPrefix: '/etc' }, reason: 'x' },
+      { id: 'bad-2', effect: 'require_approval', match: { argEquals: { k: 'v' } } },
+    ])
+    const warnings = detectUnenforceablePredicates(rules)
     expect(warnings.map((w) => w.ruleId).sort()).toEqual(['bad-1', 'bad-2'])
   })
 })
