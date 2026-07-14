@@ -137,11 +137,14 @@ import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 const _verifyPath = parseVerifyArg(process.argv.slice(2))
 if (_verifyPath !== null) {
   const absPath = resolve(_verifyPath)
-  // Optional eventsVerified floor (ccsc-x0t.9): `--min-events N` makes a
-  // hash-clean-but-too-short log (e.g. wiped to empty) fail instead of
-  // reading as "verified clean" to a monitoring script.
-  const _minEvents = parseMinEventsArg(process.argv.slice(2))
   try {
+    // Optional eventsVerified floor (ccsc-x0t.9): `--min-events N` makes a
+    // hash-clean-but-too-short log (e.g. wiped to empty) fail instead of
+    // reading as "verified clean" to a monitoring script. Parsed inside the
+    // try so a present-but-malformed flag (which throws — fail-closed, PR #277)
+    // exits non-zero with a clear message rather than silently disabling the
+    // floor or crashing at module load.
+    const _minEvents = parseMinEventsArg(process.argv.slice(2))
     const result = await verifyJournal(absPath)
     const { text, exitCode } = formatVerifyResult(result, absPath, _minEvents ?? undefined)
     if (exitCode === 0) {

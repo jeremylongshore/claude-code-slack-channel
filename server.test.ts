@@ -10672,20 +10672,27 @@ describe('parseMinEventsArg (ccsc-x0t.9)', () => {
     expect(parseMinEventsArg(['--min-events', '0'])).toBe(0)
   })
 
-  test('absent flag → null', async () => {
+  test('absent flag → null (the floor is optional)', async () => {
     const { parseMinEventsArg } = await loadLib()
     expect(parseMinEventsArg(['--verify-audit-log', '/x'])).toBeNull()
     expect(parseMinEventsArg([])).toBeNull()
   })
 
-  test('malformed values → null (negative, non-integer, empty, flag-shaped)', async () => {
+  test('present-but-malformed values THROW (fail closed — never silently disable the floor)', async () => {
+    // A typo like `--min-events 1OO` (letter O) must not silently no-op the very
+    // tamper-check the flag exists for (Gemini review, PR #277). The invariant
+    // that matters: a present-but-broken flag always throws, never returns null.
     const { parseMinEventsArg } = await loadLib()
-    expect(parseMinEventsArg(['--min-events', '-3'])).toBeNull()
-    expect(parseMinEventsArg(['--min-events', '1.5'])).toBeNull()
-    expect(parseMinEventsArg(['--min-events', 'abc'])).toBeNull()
-    expect(parseMinEventsArg(['--min-events', ''])).toBeNull()
-    expect(parseMinEventsArg(['--min-events', '--verify-audit-log'])).toBeNull()
-    expect(parseMinEventsArg(['--min-events='])).toBeNull()
+    // Non-flag-shaped garbage → "invalid value".
+    expect(() => parseMinEventsArg(['--min-events', '1.5'])).toThrow(/invalid --min-events/)
+    expect(() => parseMinEventsArg(['--min-events', '1OO'])).toThrow(/invalid --min-events/)
+    expect(() => parseMinEventsArg(['--min-events', 'abc'])).toThrow(/invalid --min-events/)
+    expect(() => parseMinEventsArg(['--min-events='])).toThrow(/invalid --min-events/)
+    // Flag-shaped token or no token → "missing value" (a negative `-3` reads as
+    // a flag, which is also fine: a floor is non-negative by definition).
+    expect(() => parseMinEventsArg(['--min-events', '-3'])).toThrow(/missing value/)
+    expect(() => parseMinEventsArg(['--min-events'])).toThrow(/missing value/)
+    expect(() => parseMinEventsArg(['--min-events', '--verify-audit-log'])).toThrow(/missing value/)
   })
 })
 
