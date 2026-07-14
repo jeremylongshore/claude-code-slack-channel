@@ -38,7 +38,9 @@ import {
   buildSecretValueSet,
   chunkText,
   classifySocketStartError,
+  createConsumedClickStore,
   type DeliveryObligation,
+  decideInteractionRoute,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -46,6 +48,7 @@ import {
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
+  findReservedActionId,
   formatVerifyResult,
   type GateResult,
   getChannelPolicy,
@@ -71,6 +74,7 @@ import {
   pruneExpired,
   recordApprovalVote,
   redactSecretValues,
+  replaceClickedActionsBlock,
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
@@ -625,6 +629,9 @@ const deliveredThreads = new Set<string>()
 // bots are never added here as sticky — the inbound gate refuses to make
 // ev.bot_id messages sticky regardless. Session-lifetime cache.
 const engagedThreads = new Set<string>()
+// Option-button first-click registry (see handleButtonClick): one relay per
+// (channel, message, action) even when the post-delivery Block Kit swap fails.
+const consumedClicks = createConsumedClickStore()
 // Bound the engaged-thread cache so it can't grow without limit over a long
 // process lifetime (CodeRabbit, PR #244). At capacity the oldest entry is
 // evicted; a human in an evicted thread simply re-mentions to re-engage.
@@ -872,6 +879,10 @@ const ReplyInput = z
      *  Backward-compatible — existing callers without `stream` get
      *  unchanged behavior. */
     stream: z.boolean().optional(),
+    /** Slack Block Kit blocks for a rich-layout reply. Sent as a single
+     *  message with `text` as the notification fallback; never streams or
+     *  chunks. Rides the durable-delivery outbox like a text reply. */
+    blocks: z.array(z.record(z.string(), z.unknown())).optional(),
   })
   .strict()
 
@@ -958,12 +969,22 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Send a message to a Slack channel or DM. Auto-chunks long text. Supports file attachments.',
+        'Send a message to a Slack channel or DM. Auto-chunks long text. Supports file attachments and Block Kit rich layouts with live buttons.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           chat_id: { type: 'string', description: 'Slack channel or DM ID' },
-          text: { type: 'string', description: 'Message text (mrkdwn supported)' },
+          text: {
+            type: 'string',
+            description:
+              'Message text (mrkdwn supported). When blocks is also set, text is the notification fallback only.',
+          },
+          blocks: {
+            type: 'array',
+            items: { type: 'object' },
+            description:
+              'Slack Block Kit blocks for rich layouts (optional). Sent as a single message. Buttons in an actions block are LIVE: a user click is delivered back to you as an inbound message of the form [button click] "<label>" (value: <value>) with structured meta, so you can offer tappable choices and react to them. Give each button a distinct action_id (any string not starting with "perm:") and a value.',
+          },
           thread_ts: {
             type: 'string',
             description: 'Thread timestamp to reply in-thread (optional)',
@@ -1376,14 +1397,21 @@ async function executeReplyDurablePath(opts: {
   chatId: string
   threadTs: string
   text: string
+  blocks?: Array<Record<string, unknown>>
   ctx: ToolContext
 }): Promise<ToolResult> {
-  const { chatId, threadTs, text, ctx } = opts
+  const { chatId, threadTs, text, blocks, ctx } = opts
   if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
 
   const result = await deliverReplyDurably(
     { supervisor, post: createReplyPoster(ctx.web) },
-    { id: randomUUID(), channel: chatId, thread: threadTs, text },
+    {
+      id: randomUUID(),
+      channel: chatId,
+      thread: threadTs,
+      text,
+      ...(blocks !== undefined ? { blocks } : {}),
+    },
   )
 
   if (result.status === 'delivered') {
@@ -1465,9 +1493,10 @@ async function executeReplyFileDurablePath(opts: {
   threadTs: string
   chunks: string[]
   files: string[]
+  blocks?: Array<Record<string, unknown>>
   ctx: ToolContext
 }): Promise<ToolResult> {
-  const { chatId, threadTs, chunks, files, ctx } = opts
+  const { chatId, threadTs, chunks, files, blocks, ctx } = opts
   if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
 
   const fileDeps = createFileSendDeps({
@@ -1493,6 +1522,7 @@ async function executeReplyFileDurablePath(opts: {
       thread: threadTs,
       chunks: textChunks,
       files: fileDescriptors,
+      ...(blocks !== undefined ? { blocks } : {}),
     },
   )
 
@@ -1523,6 +1553,8 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const threadTs: string | undefined = args.thread_ts
   const files: string[] | undefined = args.files
   const stream: boolean = args.stream === true
+  const blocks: Array<Record<string, unknown>> | undefined =
+    Array.isArray(args.blocks) && args.blocks.length > 0 ? args.blocks : undefined
 
   try {
     ctx.assertOutboundAllowed(chatId, threadTs)
@@ -1542,6 +1574,31 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // streaming/non-streaming branch (so both paths are covered) and before the
   // gate.outbound.allow event (a blocked send was never allowed).
   guardOutboundSecretValues(text, 'reply', ctx)
+  // The value-exfiltration guard must also cover Block Kit content: a secret
+  // pasted into a section block would otherwise bypass the text guard. Blocks
+  // are immutable once recorded on the obligation, so this record-time guard
+  // covers poller redelivery too (matching text semantics; files re-guard
+  // per-upload because bytes on disk can change).
+  if (blocks !== undefined) {
+    guardOutboundSecretValues(JSON.stringify(blocks), 'reply', ctx)
+    // Reserved-namespace enforcement: a perm:-prefixed action_id on an
+    // agent-authored button would let a prompt-injected turn disguise a
+    // policy-approval vote as an innocuous option button and convert the
+    // owner's click into a tool-call approval. Reject before record/send.
+    const reserved = findReservedActionId(blocks)
+    if (reserved !== null) {
+      ctx.journalWrite({
+        kind: 'gate.outbound.deny',
+        outcome: 'deny',
+        toolName: 'reply',
+        input: { channel: chatId, thread_ts: threadTs },
+        reason: `blocks action_id uses the reserved perm: namespace: ${reserved}`,
+      })
+      throw new Error(
+        `reply: blocks may not use the reserved "perm:" action_id namespace (got "${reserved}") — it is the policy-approval button namespace`,
+      )
+    }
+  }
 
   const access = ctx.getAccess()
   const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
@@ -1549,7 +1606,8 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
 
   // ccsc-h1h — streaming branch. Extracted to executeReplyStreamingPath
   // to keep executeReply's CRAP score under the 30 threshold.
-  if (stream && text.length > limit) {
+  // Blocks replies never stream: a Block Kit payload is one message.
+  if (stream && blocks === undefined && text.length > limit) {
     return executeReplyStreamingPath({ chatId, threadTs, text, files, limit, ctx })
   }
 
@@ -1574,16 +1632,18 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   // durable (DurableUnavailableError). Streaming replies are handled above
   // (ccsc-o7x.6). An ExfilBlockedError from the file path propagates to the agent
   // (a blocked file surfaces, exactly as the best-effort path did).
-  const chunks = chunkText(text, limit, mode)
+  // A blocks reply is a single message: text is the notification fallback and
+  // is never chunked (Slack renders the blocks, not the text).
+  const chunks = blocks !== undefined ? [text] : chunkText(text, limit, mode)
   const hasFiles = files !== undefined && files.length > 0
 
   if (!stream && threadTs !== undefined && supervisor !== null) {
     try {
       if (hasFiles) {
-        return await executeReplyFileDurablePath({ chatId, threadTs, chunks, files, ctx })
+        return await executeReplyFileDurablePath({ chatId, threadTs, chunks, files, blocks, ctx })
       }
       return chunks.length <= 1
-        ? await executeReplyDurablePath({ chatId, threadTs, text, ctx })
+        ? await executeReplyDurablePath({ chatId, threadTs, text, blocks, ctx })
         : await executeReplyChunkedDurablePath({ chatId, threadTs, chunks, ctx })
     } catch (durableErr) {
       if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
@@ -1597,6 +1657,9 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     const res = await ctx.web.chat.postMessage({
       channel: chatId,
       text: chunk,
+      // chunks is [text] whenever blocks are set, so this spreads onto exactly
+      // one message.
+      ...(blocks !== undefined ? { blocks: blocks as any } : {}),
       thread_ts: threadTs,
       unfurl_links: false,
       unfurl_media: false,
@@ -2916,7 +2979,12 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
     const action = body.actions[0]
     const actionId: string = action.action_id || ''
     const match = actionId.match(/^perm:(allow|deny|more):(.+)$/)
-    if (!match) return
+    if (!match) {
+      // Any button click outside the perm: namespace is an agent-authored
+      // option button — relay it to the session as a first-class gated event.
+      await handleButtonClick(body, action)
+      return
+    }
 
     const [, verb, requestId] = match
     const userId: string = body.user?.id || ''
@@ -2966,6 +3034,213 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
     console.error('[slack] Error handling interactive event:', err)
   }
 })
+
+// ---------------------------------------------------------------------------
+// Option-button click relay
+// ---------------------------------------------------------------------------
+//
+// A click on any button the agent sent (action_id outside the perm: namespace)
+// is delivered back to the Claude session as an inbound event, so the agent can
+// offer tappable choices (approve/deny, pick an option) on any reply and react
+// to the click. Routing is decided by the pure `decideInteractionRoute` in
+// lib.ts, which mirrors the inbound message gate (channel opt-in, per-channel
+// allowFrom, DM pairing); drops are journaled like message-gate drops. The
+// clicked message's actions block is then swapped for a confirmation context
+// line (pure `replaceClickedActionsBlock`) so the choice is visible and the
+// buttons cannot double-fire.
+async function handleButtonClick(body: any, action: any): Promise<void> {
+  const userId: string = body.user?.id || ''
+  const channelId: string = body.channel?.id || ''
+  // action_ts is unique per click; Slack redeliveries of the same click share
+  // it, so the standard event dedup absorbs retries.
+  const actionTs: string = action?.action_ts || body.action_ts || ''
+
+  // Shares the message dedup store: keyspace is channel+ts, where ts here is
+  // the click's action_ts. A collision with a message ts is astronomically
+  // unlikely (both are microsecond epoch stamps) and merely drops one event.
+  if (
+    isDuplicateEvent(
+      { channel: channelId, ts: actionTs },
+      seenEvents,
+      Date.now(),
+      EVENT_DEDUP_TTL_MS,
+    )
+  ) {
+    return
+  }
+
+  const label = String(action.text?.text ?? '').slice(0, 200)
+  const value = String(action.value ?? action.action_id ?? '').slice(0, 500)
+  const messageTs: string = body.message?.ts || ''
+  const threadTs: string | undefined = (body.message?.thread_ts as string | undefined) || undefined
+
+  const access = getAccess()
+  const route = decideInteractionRoute(
+    { actionType: String(action?.type ?? ''), userId, channelId, actionTs, messageTs, threadTs },
+    access,
+    engagedThreads,
+  )
+  if (route.action === 'drop') {
+    journalWrite({
+      kind: 'gate.inbound.drop',
+      outcome: 'drop',
+      actor: 'session_owner',
+      input: { channel: channelId, user: userId, source: 'block_actions' },
+      reason: route.dropReason,
+    })
+    return
+  }
+
+  // Consumed-once enforcement, server-side: the post-delivery Block Kit swap
+  // is best-effort, so it alone cannot guarantee single-fire (a failed
+  // chat.update leaves the buttons visually live). Consume AFTER the route
+  // check passed, so a dropped click from a non-allowlisted user does not
+  // burn the button for the owner. Keyed per message + action; a second
+  // click is journaled and ignored.
+  if (!consumedClicks.consume(`${channelId}:${messageTs}:${String(action.action_id ?? '')}`)) {
+    journalWrite({
+      kind: 'gate.inbound.drop',
+      outcome: 'drop',
+      actor: 'session_owner',
+      input: { channel: channelId, user: userId, source: 'block_actions' },
+      reason: 'interaction.already_consumed',
+    })
+    return
+  }
+
+  await deliverButtonClick(body, action, {
+    userId,
+    channelId,
+    actionTs,
+    label,
+    value,
+    messageTs,
+    threadTs,
+    access,
+  })
+}
+
+/** Post-gate delivery of a routed, consumed-once button click: engagement,
+ *  session accounting, journal, supervisor activation, MCP notification, and
+ *  the confirmation swap. Split from handleButtonClick to keep both under the
+ *  Wall-5 CRAP gate; handleButtonClick owns the gates, this owns delivery. */
+async function deliverButtonClick(
+  body: any,
+  action: any,
+  click: {
+    userId: string
+    channelId: string
+    actionTs: string
+    label: string
+    value: string
+    messageTs: string
+    threadTs: string | undefined
+    access: Access
+  },
+): Promise<void> {
+  const { userId, channelId, actionTs, label, value, messageTs, threadTs, access } = click
+  const userName = await resolveUserName(userId)
+
+  // A DELIVERED click marks its thread engaged exactly as a delivered human
+  // message does (deliverEvent) — no lenient parallel rule (#270 review,
+  // design call 1): on a requireMention channel a click only delivers when
+  // the thread was ALREADY engaged by a human mention, so a click can never
+  // open a thread for mention-free follow-ups; this call is then a no-op
+  // refresh. Dropped clicks never reach here.
+  recordEngagedThread(libDeliveredThreadKey(channelId, threadTs ?? messageTs))
+
+  // Same session accounting as a delivered message (#270 review, design call
+  // 2 — recorded in session-state-machine.md § "Interactive inbound: button
+  // clicks"): thread key = thread_ts ?? message ts (§39), session key honors
+  // per-user isolation, the deliver journal event carries it, and the
+  // supervisor activates + touches the session — so a click-only thread is
+  // not idle-reaped mid-interaction and per-user isolation sees clicks.
+  // Ephemeral-button clicks (no body.message) have no thread identity, so
+  // they carry no session key and skip activation.
+  const threadKey = threadTs ?? messageTs
+  const sessionKey =
+    threadKey !== '' ? inboundSessionKey(channelId, threadKey, access, { user: userId }) : undefined
+
+  const meta: Record<string, string> = {
+    kind: 'button_click',
+    chat_id: channelId,
+    message_id: messageTs,
+    user_id: /^[A-Z0-9]{1,32}$/.test(userId) ? userId : 'invalid',
+    user: userName,
+    ts: actionTs,
+    action_id: String(action.action_id ?? '').slice(0, 255),
+    action_value: value,
+    action_label: label,
+  }
+  if (threadTs !== undefined) meta.thread_ts = threadTs
+
+  // Delivered clicks are journaled like delivered messages: a click is a
+  // security-relevant inbound event that can trigger agent action, so it must
+  // leave a chain record, not just its drops.
+  journalWrite({
+    kind: 'gate.inbound.deliver',
+    outcome: 'allow',
+    actor: 'session_owner',
+    sessionKey,
+    input: {
+      channel: channelId,
+      user: userId,
+      source: 'block_actions',
+      action_id: String(action.action_id ?? '').slice(0, 255),
+    },
+  })
+
+  if (supervisor !== null && sessionKey !== undefined) {
+    await activateAndTouch(supervisor, sessionKey, userId)
+  }
+
+  // Track last active channel/thread for the permission relay, mirroring
+  // deliverEvent — a tool call triggered by a click must route its permission
+  // prompt to the click's thread, not whatever message came before it.
+  lastActiveChannel = channelId
+  lastActiveThread = threadTs
+
+  // Await the delivery: if the MCP transport is down the click is LOST, and
+  // painting the ✅ confirmation would tell the operator their choice was
+  // received when it wasn't. On failure, leave the buttons visually intact.
+  // (The consumed-once record stands — a re-click journals as
+  // interaction.already_consumed — so the operator re-issues the prompt; a
+  // consumed click must never fire twice even across transport failures.)
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        // messageTs is empty for ephemeral-message buttons (no body.message).
+        content: `[button click] "${label}" (value: ${value})${messageTs ? ` on your message ${messageTs}` : ''}`,
+        meta,
+      },
+    })
+  } catch (err) {
+    console.error('[slack] button-click notification failed — click not delivered:', err)
+    return
+  }
+
+  // Best-effort UX ack: swap the consumed actions block for a confirmation
+  // context line. Failure is non-critical — the click was already delivered.
+  try {
+    const blocks = Array.isArray(body.message?.blocks) ? body.message.blocks : []
+    if (messageTs && blocks.length) {
+      await web.chat.update({
+        channel: channelId,
+        ts: messageTs,
+        text: (body.message?.text as string) || label,
+        blocks: replaceClickedActionsBlock(
+          blocks,
+          String(action.action_id ?? ''),
+          label,
+          userId,
+        ) as any,
+      })
+    }
+  } catch (err) {
+    console.error('[slack] button-click message update failed (non-critical):', err)
+  }
+}
 
 // Regex for text-based permission replies: "yes abcde" or "no abcde"
 // PERMISSION_REPLY_RE imported from lib.ts — shared with gate() for

@@ -33,10 +33,13 @@ import {
   chunkText,
   classifyDeliveryError,
   computeBackoffMs,
+  createConsumedClickStore,
   DELIVERY_METADATA_EVENT_TYPE,
   type DeliveryObligation,
+  decideInteractionRoute,
   declaredSecretNames,
   defaultAccess,
+  deliveredThreadKey,
   deliveryIdempotencyKey,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
@@ -44,6 +47,7 @@ import {
   enforceAuditReceiptCap,
   escMrkdwn,
   extractSlackErrorCode,
+  findReservedActionId,
   findSecretDeclaration,
   type GateOptions,
   gate,
@@ -65,6 +69,7 @@ import {
   parseSendableRoots,
   pruneExpired,
   redactSecretValues,
+  replaceClickedActionsBlock,
   resolveJournalPath,
   SECRET_DECLARATIONS,
   type SecretDeclaration,
@@ -2841,6 +2846,46 @@ describe('loadSession', () => {
     await writeFile(p, JSON.stringify(extraKey), { mode: 0o600 })
 
     await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('S4: unknown OBLIGATION key loads and is preserved — tolerant reader (#270 condition 3, ccsc-ngn Option B)', async () => {
+    // Obligation records grow by additive optional fields. A strict reader
+    // makes every addition a downgrade landmine: a session file written by a
+    // newer version would fail here, quarantining the WHOLE file and silently
+    // stopping redelivery of every pending obligation in it. The tolerant
+    // reader loads it, ignores the unknown field, and preserves it on
+    // round-trip (must-ignore, must-preserve). The top-level session object
+    // stays strict (previous test).
+    const key = { channel: 'C_S4_TOL', thread: 'T1.0' }
+    const p = sessionPath(tmpRoot, key)
+    const fromNewerVersion = {
+      v: 1,
+      key,
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_001_000,
+      ownerId: 'U_OWNER',
+      data: {},
+      outbox: [
+        {
+          id: 'ob-1',
+          channel: key.channel,
+          thread: key.thread,
+          payload: 'pending reply',
+          attempts: 0,
+          state: 'pending',
+          createdAt: 1_700_000_000_500,
+          futureField: { added: 'by a newer version' }, // unknown obligation key
+        },
+      ],
+    }
+    await writeFile(p, JSON.stringify(fromNewerVersion), { mode: 0o600 })
+
+    const loaded = await loadSession(tmpRoot, p)
+    expect(loaded.outbox?.length).toBe(1)
+    expect(loaded.outbox?.[0]?.payload).toBe('pending reply')
+    expect((loaded.outbox?.[0] as unknown as Record<string, unknown>).futureField).toEqual({
+      added: 'by a newer version',
+    })
   })
 
   test('S4: non-JSON bytes throw before Zod validation (JSON.parse fires first)', async () => {
@@ -7865,6 +7910,29 @@ describe('deliverReplyDurably (ccsc-o7x.3 pt2)', () => {
   }
 
   const reply = { id: 'r-1', channel: 'C_DUR', thread: 'T1', text: 'hello' }
+
+  test('blocks ride the obligation: recorded before send and handed to the poster', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const theBlocks = [{ type: 'section', text: { type: 'mrkdwn', text: '*pick*' } }]
+    const seen: Array<Record<string, unknown>[] | undefined> = []
+    const poster: ReplyPoster = async (obligation, _key) => {
+      seen.push(obligation.blocks)
+      return 'ts-b'
+    }
+
+    const result = await deliverReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...reply, id: 'r-blocks', blocks: theBlocks },
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-b' })
+    expect(seen).toEqual([theBlocks])
+    // The persisted obligation carries the blocks, so poller redelivery after
+    // a crash re-sends the same rich message.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-blocks', blocks: theBlocks })
+  })
 
   test('success: posts under the obligation key, marks delivered, returns the ts', async () => {
     await seedSession()
@@ -12910,6 +12978,7 @@ describe('MCP tool input schemas (S5)', () => {
       text: z.string().min(1),
       thread_ts: z.string().optional(),
       files: z.array(z.string()).optional(),
+      blocks: z.array(z.record(z.string(), z.unknown())).optional(),
     })
     .strict()
 
@@ -13029,6 +13098,36 @@ describe('MCP tool input schemas (S5)', () => {
         chat_id: 'C123',
         text: 'hello',
         files: '/tmp/a.txt',
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('accepts optional blocks array of objects', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*hi*' } }],
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.blocks?.length).toBe(1)
+      }
+    })
+
+    test('rejects non-array blocks', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: { type: 'section' },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects non-object element in blocks array', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: ['not-a-block'],
       })
       expect(result.success).toBe(false)
     })
@@ -19237,5 +19336,296 @@ describe('ccsc-l1f — runAuditKeyCli (dispatch + defaults)', () => {
     if (result.kind !== 'error') throw new Error('expected error')
     expect(result.message).toContain('Unknown subcommand')
     expect(errs.some((m) => m.toLowerCase().includes('usage'))).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Option-button click relay — pure pieces
+// ---------------------------------------------------------------------------
+
+describe('decideInteractionRoute', () => {
+  const access = (over: Partial<Access> = {}): Access => ({
+    dmPolicy: 'pairing',
+    allowFrom: [],
+    channels: {},
+    pending: {},
+    ...over,
+  })
+  const click = { actionType: 'button', userId: 'U_HUMAN', channelId: 'C_OPS', actionTs: '1.23' }
+
+  test('delivers a button click in an opted-in channel with open allowFrom', () => {
+    const a = access({ channels: { C_OPS: { requireMention: false, allowFrom: [] } } })
+    expect(decideInteractionRoute(click, a)).toEqual({ action: 'deliver' })
+  })
+
+  test('requireMention channel DROPS a click on an unengaged thread (same gate as messages — #270 design call 1)', () => {
+    const a = access({ channels: { C_OPS: { requireMention: true, allowFrom: [] } } })
+    expect(decideInteractionRoute({ ...click, messageTs: '9.99' }, a, new Set())).toEqual({
+      action: 'drop',
+      dropReason: 'channel.require_mention',
+    })
+    // No engagedThreads set supplied at all → still fail closed.
+    expect(decideInteractionRoute({ ...click, messageTs: '9.99' }, a)).toEqual({
+      action: 'drop',
+      dropReason: 'channel.require_mention',
+    })
+  })
+
+  test('requireMention channel delivers a click on an ENGAGED thread (mention-stickiness, keyed thread_ts ?? messageTs)', () => {
+    const a = access({ channels: { C_OPS: { requireMention: true, allowFrom: [] } } })
+    // Top-level message: engagement keyed by the message ts.
+    const topLevel = new Set([deliveredThreadKey('C_OPS', '9.99')])
+    expect(decideInteractionRoute({ ...click, messageTs: '9.99' }, a, topLevel)).toEqual({
+      action: 'deliver',
+    })
+    // Threaded message: engagement keyed by the thread ts, not the message ts.
+    const threaded = new Set([deliveredThreadKey('C_OPS', '5.55')])
+    expect(
+      decideInteractionRoute({ ...click, messageTs: '9.99', threadTs: '5.55' }, a, threaded),
+    ).toEqual({ action: 'deliver' })
+  })
+
+  test('requireMention drops an ephemeral-button click (no message ts → no thread identity → fail closed)', () => {
+    const a = access({ channels: { C_OPS: { requireMention: true, allowFrom: [] } } })
+    const engaged = new Set([deliveredThreadKey('C_OPS', undefined)])
+    expect(decideInteractionRoute(click, a, engaged)).toEqual({
+      action: 'deliver', // key channel\0'' matches only an explicit undefined-thread engagement
+    })
+    expect(decideInteractionRoute(click, a, new Set())).toEqual({
+      action: 'drop',
+      dropReason: 'channel.require_mention',
+    })
+  })
+
+  test('drops when the channel is not opted in', () => {
+    expect(decideInteractionRoute(click, access())).toEqual({
+      action: 'drop',
+      dropReason: 'channel.not_opted',
+    })
+  })
+
+  test('drops a clicker missing from a non-empty channel allowFrom', () => {
+    const a = access({ channels: { C_OPS: { requireMention: false, allowFrom: ['U_OTHER'] } } })
+    expect(decideInteractionRoute(click, a)).toEqual({
+      action: 'drop',
+      dropReason: 'channel.allowfrom_miss',
+    })
+  })
+
+  test('DM click delivers only for a paired user', () => {
+    const dmClick = { ...click, channelId: 'D_DM1' }
+    expect(decideInteractionRoute(dmClick, access({ allowFrom: ['U_HUMAN'] }))).toEqual({
+      action: 'deliver',
+    })
+    expect(decideInteractionRoute(dmClick, access())).toEqual({
+      action: 'drop',
+      dropReason: 'dm.not_paired',
+    })
+  })
+
+  test('DM click honors dmPolicy for the drop reason (closed policy journals dm.policy_closed, as the message gate does)', () => {
+    const dmClick = { ...click, channelId: 'D_DM1' }
+    for (const dmPolicy of ['allowlist', 'disabled'] as const) {
+      expect(decideInteractionRoute(dmClick, access({ dmPolicy }))).toEqual({
+        action: 'drop',
+        dropReason: 'dm.policy_closed',
+      })
+      // A paired user still delivers under a closed policy, same as DM text.
+      expect(decideInteractionRoute(dmClick, access({ dmPolicy, allowFrom: ['U_HUMAN'] }))).toEqual(
+        { action: 'deliver' },
+      )
+    }
+  })
+
+  test('legacy access.json without a channels key DROPS (journaled) instead of throwing — #270 condition 2', () => {
+    // A loaded-from-disk Access can lack `channels` entirely (pre-x0t.8 files).
+    // A bare Object.hasOwn(undefined, …) would THROW, and the throw would beat
+    // the gate.inbound.drop journal write — routing through getChannelPolicy
+    // fails closed instead (#275).
+    const { channels: _dropped, ...legacy } = access()
+    expect(decideInteractionRoute(click, legacy as unknown as Access)).toEqual({
+      action: 'drop',
+      dropReason: 'channel.not_opted',
+    })
+  })
+
+  test('drops non-button action types', () => {
+    const a = access({ channels: { C_OPS: { requireMention: false, allowFrom: [] } } })
+    expect(decideInteractionRoute({ ...click, actionType: 'static_select' }, a)).toEqual({
+      action: 'drop',
+      dropReason: 'interaction.unsupported_type',
+    })
+  })
+
+  test('drops malformed payloads (missing user / channel / action_ts)', () => {
+    const a = access({ channels: { C_OPS: { requireMention: false, allowFrom: [] } } })
+    expect(decideInteractionRoute({ ...click, userId: '' }, a)).toEqual({
+      action: 'drop',
+      dropReason: 'interaction.malformed',
+    })
+    expect(decideInteractionRoute({ ...click, actionTs: '' }, a)).toEqual({
+      action: 'drop',
+      dropReason: 'interaction.malformed',
+    })
+  })
+})
+
+describe('replaceClickedActionsBlock', () => {
+  const section = { type: 'section', text: { type: 'mrkdwn', text: 'Pick one:' } }
+  const actions = {
+    type: 'actions',
+    elements: [
+      { type: 'button', action_id: 'opt_a', text: { type: 'plain_text', text: 'A' } },
+      { type: 'button', action_id: 'opt_b', text: { type: 'plain_text', text: 'B' } },
+    ],
+  }
+
+  test('replaces only the actions block containing the clicked action_id', () => {
+    const out = replaceClickedActionsBlock([section, actions], 'opt_a', 'A', 'U123')
+    expect(out.length).toBe(2)
+    expect((out[0] as { type: string }).type).toBe('section')
+    const ctxBlock = out[1] as { type: string; elements: Array<{ text: string }> }
+    expect(ctxBlock.type).toBe('context')
+    expect(ctxBlock.elements[0]!.text).toContain('*A*')
+    expect(ctxBlock.elements[0]!.text).toContain('<@U123>')
+  })
+
+  test('leaves unrelated actions blocks untouched', () => {
+    const other = {
+      type: 'actions',
+      elements: [{ type: 'button', action_id: 'other', text: { type: 'plain_text', text: 'X' } }],
+    }
+    const out = replaceClickedActionsBlock([actions, other], 'opt_b', 'B', 'U123')
+    expect((out[0] as { type: string }).type).toBe('context')
+    expect((out[1] as { type: string }).type).toBe('actions')
+  })
+
+  test('no-op when the action_id matches nothing', () => {
+    const out = replaceClickedActionsBlock([section, actions], 'missing', 'X', 'U123')
+    expect((out[0] as { type: string }).type).toBe('section')
+    expect((out[1] as { type: string }).type).toBe('actions')
+  })
+})
+
+describe('findReservedActionId (perm-namespace forgery guard)', () => {
+  test('null for a clean blocks payload', () => {
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: 'pick' } },
+      {
+        type: 'actions',
+        elements: [{ type: 'button', action_id: 'opt_a', text: { type: 'plain_text', text: 'A' } }],
+      },
+    ]
+    expect(findReservedActionId(blocks)).toBeNull()
+  })
+
+  test('finds a perm: action_id in any actions block', () => {
+    const blocks = [
+      {
+        type: 'actions',
+        elements: [{ type: 'button', action_id: 'opt_a', text: { type: 'plain_text', text: 'A' } }],
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            action_id: 'perm:allow:abc12',
+            text: { type: 'plain_text', text: 'Show details' },
+          },
+        ],
+      },
+    ]
+    expect(findReservedActionId(blocks)).toBe('perm:allow:abc12')
+  })
+
+  test('finds a perm: action_id in a section accessory — the disguise the guard exists to reject (#270 condition 1)', () => {
+    // Slack routes block_actions clicks from section accessories too, and the
+    // interactive handler is container-agnostic — so the guard must be.
+    const blocks = [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: 'Deployment summary' },
+        accessory: {
+          type: 'button',
+          action_id: 'perm:allow:abc12',
+          text: { type: 'plain_text', text: 'Show details' },
+        },
+      },
+    ]
+    expect(findReservedActionId(blocks)).toBe('perm:allow:abc12')
+  })
+
+  test('finds a perm: action_id in an input element and in an overflow accessory', () => {
+    expect(
+      findReservedActionId([
+        {
+          type: 'input',
+          label: { type: 'plain_text', text: 'Pick' },
+          element: { type: 'static_select', action_id: 'perm:deny:zzz99' },
+        },
+      ]),
+    ).toBe('perm:deny:zzz99')
+    expect(
+      findReservedActionId([
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: 'row' },
+          accessory: { type: 'overflow', action_id: 'perm:more:qq111', options: [] },
+        },
+      ]),
+    ).toBe('perm:more:qq111')
+  })
+
+  test('perm: as text content or a non-string action_id stays clean (only action_id KEYS are inspected)', () => {
+    const blocks = [
+      { type: 'section', text: { type: 'mrkdwn', text: 'perm:allow:decoy in text is fine' } },
+      { type: 'actions', elements: [{ type: 'button', action_id: 42 }] },
+      { type: 'context', elements: [{ type: 'plain_text', text: 'perm:deny:decoy' }] },
+    ]
+    expect(findReservedActionId(blocks)).toBeNull()
+  })
+})
+
+describe('createConsumedClickStore', () => {
+  test('consume returns true exactly once per key', () => {
+    const store = createConsumedClickStore()
+    expect(store.consume('C1:ts1:opt_a')).toBe(true)
+    expect(store.consume('C1:ts1:opt_a')).toBe(false)
+    expect(store.consume('C1:ts1:opt_b')).toBe(true)
+  })
+
+  test('evicts the oldest key at capacity', () => {
+    const store = createConsumedClickStore(2)
+    expect(store.consume('k1')).toBe(true)
+    expect(store.consume('k2')).toBe(true)
+    expect(store.consume('k3')).toBe(true) // evicts k1
+    expect(store.consume('k1')).toBe(true) // k1 forgotten, consumable again
+    expect(store.consume('k3')).toBe(false) // k3 still remembered
+  })
+})
+
+describe('button-relay hardening details', () => {
+  test('replaceClickedActionsBlock escapes the label before echoing into live mrkdwn', () => {
+    const actions = {
+      type: 'actions',
+      elements: [
+        { type: 'button', action_id: 'opt_x', text: { type: 'plain_text', text: '<!channel>' } },
+      ],
+    }
+    const out = replaceClickedActionsBlock([actions], 'opt_x', '<!channel>', 'U123')
+    const ctxBlock = out[0] as { type: string; elements: Array<{ text: string }> }
+    expect(ctxBlock.type).toBe('context')
+    expect(ctxBlock.elements[0]!.text).not.toContain('<!channel>')
+    expect(ctxBlock.elements[0]!.text).toContain('&lt;!channel&gt;')
+  })
+
+  test('invalid_blocks is a non-retryable delivery error (no poison obligations)', () => {
+    // Assert through the classifier the poller actually calls, not just set
+    // membership (#270 review cleanup) — binds the behavior, not the constant.
+    expect(classifyDeliveryError('invalid_blocks')).toBe('non-retryable')
+    expect(classifyDeliveryError('invalid_blocks_format')).toBe('non-retryable')
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('invalid_blocks')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('invalid_blocks_format')).toBe(true)
   })
 })

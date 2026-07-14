@@ -253,7 +253,13 @@ export interface SessionHandle {
    *  (`pending`), and `createdAt` are stamped here. */
   recordTerminalDelivery(
     token: number,
-    reply: { id: string; channel: string; thread: string; payload: string },
+    reply: {
+      id: string
+      channel: string
+      thread: string
+      payload: string
+      blocks?: Array<Record<string, unknown>>
+    },
   ): Promise<void>
 
   /** Batch sibling of `recordTerminalDelivery` for a chunked reply (ccsc-o7x.4):
@@ -277,6 +283,7 @@ export interface SessionHandle {
       channel: string
       thread: string
       payload: string
+      blocks?: Array<Record<string, unknown>>
       upload?: { path: string; filename: string; comment?: string }
     }[],
   ): Promise<void>
@@ -1501,13 +1508,20 @@ class ConcreteHandle implements SessionHandle {
 
   recordTerminalDelivery(
     token: number,
-    reply: { id: string; channel: string; thread: string; payload: string },
+    reply: {
+      id: string
+      channel: string
+      thread: string
+      payload: string
+      blocks?: Array<Record<string, unknown>>
+    },
   ): Promise<void> {
     const obligation: DeliveryObligation = {
       id: reply.id,
       channel: reply.channel,
       thread: reply.thread,
       payload: reply.payload,
+      ...(reply.blocks !== undefined ? { blocks: reply.blocks } : {}),
       attempts: 0,
       state: 'pending',
       createdAt: this.clock(),
@@ -1528,6 +1542,7 @@ class ConcreteHandle implements SessionHandle {
       channel: string
       thread: string
       payload: string
+      blocks?: Array<Record<string, unknown>>
       // ccsc-o7x.5 — when present, this is a durable FILE-upload obligation.
       upload?: { path: string; filename: string; comment?: string }
     }[],
@@ -1541,6 +1556,7 @@ class ConcreteHandle implements SessionHandle {
       attempts: 0,
       state: 'pending',
       createdAt: now,
+      ...(reply.blocks !== undefined ? { blocks: reply.blocks } : {}),
       ...(reply.upload !== undefined ? { upload: reply.upload } : {}),
     }))
     // One atomic save appends ALL obligations AND clears the in-flight marker:

@@ -618,6 +618,17 @@ Exit codes:
 - **Inbound gate** calls `writeEvent({kind: 'gate.inbound.drop', ...})`
   on every rejected event. Drops are journaled even though they never
   reach Claude — this is how we see attack attempts.
+- **Button-click relay** (`block_actions`, inbound primitive #9 in
+  `THREAT-MODEL.md`) journals through the same two kinds with
+  `input.source: 'block_actions'`: every routed-out click is a
+  `gate.inbound.drop` (gate miss, duplicate `action_ts`, or
+  `interaction.already_consumed`), and every delivered click is a
+  `gate.inbound.deliver` carrying the clicked `action_id` and the
+  session key it activated — a click is a security-relevant inbound
+  event that can trigger agent action, so it leaves a chain record on
+  both outcomes. The outbound side journals `gate.outbound.deny` when
+  a reply's blocks payload is rejected for a reserved `perm:`
+  `action_id`.
 - **Outbound gate** journals every reply attempt, allowed or refused.
 - **Policy evaluator** has no journal dependency; the caller emits the
   decision event.

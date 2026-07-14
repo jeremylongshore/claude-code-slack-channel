@@ -433,6 +433,71 @@ per external dialect.
 
 ---
 
+## Obligation schema contract
+
+Decision `ccsc-ngn` (maintainer, 2026-07-29, #270 condition 3): **tolerant
+reader** (Option B), following the journal's pinned-genesis / v2-floor
+precedent (#278). The contract has two layers with different postures:
+
+- **Session file top level: strict.** The top-level key set is a
+  deliberate tamper canary — an unknown top-level key fails validation and
+  quarantines the file. Adding a top-level field is rare and takes an
+  explicit versioning decision each time.
+- **Obligation records (`outbox[]`): tolerant.** Obligations grow by
+  additive optional fields (`lastError`, `upload`, `blocks`, …). The
+  reader MUST ignore unknown obligation fields (load succeeds, the field
+  is invisible to this version) and MUST preserve them on rewrite (a
+  save does not strip what a newer version wrote). Implemented as
+  `.passthrough()` on the obligation object in `SessionSchema`.
+
+**Downgrade contract.** From any version shipping this contract onward, a
+session file written by a newer version (extra obligation fields) loads
+cleanly on an older reader; a `blocks` reply whose field the reader does
+not know degrades to its `text` fallback — cosmetic loss only. Rolling
+back **across the tolerance boundary** (to a strict-reader version that
+predates this contract) remains the original #270 finding: the strict
+schema fails on the unknown field and the loader quarantines the whole
+file, halting redelivery of every pending obligation in it. The
+durable-delivery outbox journals every obligation independently before
+write, so the journal is the recovery source in that case. Follow-up
+hardening: `ccsc-wib`.
+
+---
+
+## Interactive inbound: button clicks
+
+Decision `ccsc-83u` (maintainer, 2026-07-29, #270 design calls 1–2):
+clicks are wired through the supervisor, and `requireMention` applies to
+clicks strictly — the same gate as messages, no parallel lenient-click
+rule.
+
+- **Routing** is the pure `decideInteractionRoute` (lib.ts), mirroring
+  the message gate: channel opt-in via `getChannelPolicy`, per-channel
+  `allowFrom`, `requireMention` via the engaged-threads set, DM pairing +
+  `dmPolicy`. A click cannot carry a mention, so on a `requireMention`
+  channel it delivers only in an already-engaged thread and can never
+  *open* one; a delivered click then refreshes engagement exactly as a
+  delivered human message does.
+- **Session accounting** matches a delivered message: thread key is
+  `thread_ts ?? message ts` (§39 rule), the session key honors per-user
+  isolation, the `gate.inbound.deliver` journal event carries it, and the
+  supervisor `activateAndTouch`es the session — a click-only thread is a
+  live session, not an idle-reap candidate, and per-user isolation sees
+  clicks. The click also updates the active channel/thread used by the
+  permission relay, so a click-triggered tool call attributes to the
+  click's thread (inheriting the R7 single-active-thread assumption, no
+  new misattribution channel).
+- **Ephemeral-button clicks** (no `body.message`) have no thread
+  identity: no session key, no supervisor activation, and fail-closed
+  under `requireMention`.
+- **Delivery is awaited.** The confirmation swap (buttons → ✅ context
+  line) paints only after the MCP notification succeeds; on transport
+  failure the buttons stay visually intact and the consumed-once record
+  stands (a click never fires twice, even across failures — the operator
+  re-issues the prompt).
+
+---
+
 ## Invariants
 
 Every 32-A PR is checked against these. Drift is a review block.
