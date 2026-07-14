@@ -4330,6 +4330,78 @@ describe('checkMonotonicity() — hot-reload invariant (29-A.6)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// thread_ts in matchSubsetOrEqual (ccsc-x0t.1) — detectShadowing and
+// checkMonotonicity must stop false-flagging thread-DISJOINT rules.
+//
+// matchSubsetOrEqual (the subset check both linters use) omitted thread_ts,
+// so a thread-scoped rule was treated as covering EVERY thread: a rule scoped
+// to thread B looked "shadowed" by one scoped to thread A, and a reload adding
+// a thread-B auto_approve alongside a thread-A deny was refused as weakening.
+// matchesIntersect already honored thread_ts; this binds the mirror fix.
+// (evaluate()/matchApplies already compared thread_ts — this is the linter gap.)
+// ---------------------------------------------------------------------------
+
+describe('thread_ts in the subset linters (ccsc-x0t.1)', () => {
+  const THREAD_A = '1712345678.001100'
+  const THREAD_B = '1712999999.002200'
+  const rule = (
+    id: string,
+    effect: string,
+    match: Record<string, unknown> = {},
+    extras: Record<string, unknown> = {},
+  ): import('./policy.ts').PolicyRule =>
+    ({ id, effect, match, priority: 100, ...extras }) as import('./policy.ts').PolicyRule
+
+  test('checkMonotonicity: thread-disjoint auto_approve does NOT weaken a thread-A deny', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [rule('deny-a', 'deny', { tool: 'Bash', thread_ts: THREAD_A }, { reason: 'x' })]
+    const next = [
+      rule('deny-a', 'deny', { tool: 'Bash', thread_ts: THREAD_A }, { reason: 'x' }),
+      rule('allow-b', 'auto_approve', { tool: 'Bash', thread_ts: THREAD_B }),
+    ]
+    // Pre-fix: the deny's match was treated as thread-agnostic, so allow-b
+    // looked like a subset → false "reload refused" violation.
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('checkMonotonicity: SAME-thread auto_approve under a deny still violates (no over-suppression)', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [rule('deny-a', 'deny', { tool: 'Bash', thread_ts: THREAD_A }, { reason: 'x' })]
+    const next = [
+      rule('deny-a', 'deny', { tool: 'Bash', thread_ts: THREAD_A }, { reason: 'x' }),
+      rule('allow-a', 'auto_approve', { tool: 'Bash', thread_ts: THREAD_A }),
+    ]
+    const violations = checkMonotonicity(prev, next)
+    expect(violations).toHaveLength(1)
+    expect(violations[0]!.newRule).toBe('allow-a')
+  })
+
+  test('detectShadowing: two thread-disjoint rules do NOT shadow each other', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    // Same tier, same tool, disjoint threads: the earlier rule cannot cover the
+    // later rule's thread, so there is no within-tier subset shadow.
+    const rules = [
+      rule('a', 'auto_approve', { tool: 'Bash', thread_ts: THREAD_A }),
+      rule('b', 'deny', { tool: 'Bash', thread_ts: THREAD_B }, { reason: 'x' }),
+    ]
+    expect(detectShadowing(rules)).toEqual([])
+  })
+
+  test('detectShadowing: SAME-thread broad-then-narrow still shadows (no over-suppression)', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    // Earlier {thread A} (tool wildcard) covers later {thread A, tool Bash}.
+    const rules = [
+      rule('broad-a', 'auto_approve', { thread_ts: THREAD_A }),
+      rule('narrow-a', 'deny', { thread_ts: THREAD_A, tool: 'Bash' }, { reason: 'x' }),
+    ]
+    const warnings = detectShadowing(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.later).toBe('narrow-a')
+    expect(warnings[0]!.earlier).toBe('broad-a')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 31-A.4 invariant — manifest data NEVER passed to evaluate()
 //
 // Design: 000-docs/bot-manifest-protocol.md §91-109 ("The binding invariant").
