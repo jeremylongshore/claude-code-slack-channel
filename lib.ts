@@ -2656,7 +2656,13 @@ function parseNonNegIntFlag(argv: ReadonlyArray<string>, flag: string): number |
       const next = argv[i + 1]
       // A following token that is itself a flag (or no token) is a missing
       // value — fail closed rather than swallow the next flag as the count.
-      if (typeof next === 'string' && !next.startsWith('-')) return accept(next)
+      // A `-`-prefixed token is treated as the NEXT flag (missing value) — but a
+      // negative number (`-5`) is routed to `accept()` so it throws the accurate
+      // "invalid value" error instead of a misleading "missing value" (Gemini
+      // review, PR #278). Both still fail closed; only the message differs.
+      if (typeof next === 'string' && (!next.startsWith('-') || /^-\d/.test(next))) {
+        return accept(next)
+      }
       throw new Error(`missing value for ${flag} (expected a non-negative integer)`)
     }
     if (arg.startsWith(eq)) {
@@ -2697,7 +2703,13 @@ export function parseExpectedGenesisArg(argv: ReadonlyArray<string>): string | n
     const arg = argv[i]!
     if (arg === flag) {
       const next = argv[i + 1]
-      if (typeof next === 'string' && !next.startsWith('-')) return accept(next)
+      // A `-`-prefixed token is treated as the NEXT flag (missing value) — but a
+      // negative number (`-5`) is routed to `accept()` so it throws the accurate
+      // "invalid value" error instead of a misleading "missing value" (Gemini
+      // review, PR #278). Both still fail closed; only the message differs.
+      if (typeof next === 'string' && (!next.startsWith('-') || /^-\d/.test(next))) {
+        return accept(next)
+      }
       throw new Error(`missing value for ${flag} (expected a 64-char hex SHA-256)`)
     }
     if (arg.startsWith(eq)) {

@@ -10683,14 +10683,15 @@ describe('parseMinEventsArg (ccsc-x0t.9)', () => {
     // tamper-check the flag exists for (Gemini review, PR #277). The invariant
     // that matters: a present-but-broken flag always throws, never returns null.
     const { parseMinEventsArg } = await loadLib()
-    // Non-flag-shaped garbage → "invalid value".
+    // Garbage values (incl. a negative number) → the accurate "invalid value".
     expect(() => parseMinEventsArg(['--min-events', '1.5'])).toThrow(/invalid --min-events/)
     expect(() => parseMinEventsArg(['--min-events', '1OO'])).toThrow(/invalid --min-events/)
     expect(() => parseMinEventsArg(['--min-events', 'abc'])).toThrow(/invalid --min-events/)
     expect(() => parseMinEventsArg(['--min-events='])).toThrow(/invalid --min-events/)
-    // Flag-shaped token or no token → "missing value" (a negative `-3` reads as
-    // a flag, which is also fine: a floor is non-negative by definition).
-    expect(() => parseMinEventsArg(['--min-events', '-3'])).toThrow(/missing value/)
+    // A negative number routes to the value validator for the accurate error
+    // (Gemini review, PR #278) — a floor is non-negative by definition.
+    expect(() => parseMinEventsArg(['--min-events', '-3'])).toThrow(/invalid --min-events/)
+    // A genuinely-absent value or the NEXT flag → "missing value".
     expect(() => parseMinEventsArg(['--min-events'])).toThrow(/missing value/)
     expect(() => parseMinEventsArg(['--min-events', '--verify-audit-log'])).toThrow(/missing value/)
   })
