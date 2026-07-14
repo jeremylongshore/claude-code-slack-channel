@@ -12114,15 +12114,17 @@ describe('verifyJournal', () => {
     // Shear the genesis event, then renumber survivors to seq 1.. and recompute
     // the keyless chain exactly as the writer/verifier does. The first
     // survivor's prevHash is trusted as the genesis anchor by the verifier.
+    expect(events.length).toBe(4) // assert setup before slicing (no unsafe `!`)
     const survivors = events.slice(1)
-    let prevHash = survivors[0]!.prevHash as string
+    let prevHash = survivors[0].prevHash as string
     const forged = survivors.map((ev, i) => {
       const { hash: _drop, ...rest } = ev
-      rest.seq = i + 1
-      rest.prevHash = prevHash
-      const hash = sha256Hex(prevHash + canonicalJson(rest))
+      // Build a fresh object rather than mutating `rest` in the map (Gemini
+      // review, #273). canonicalJson sorts keys, so the bytes are identical.
+      const updated = { ...rest, seq: i + 1, prevHash }
+      const hash = sha256Hex(prevHash + canonicalJson(updated))
       prevHash = hash
-      return { ...rest, hash }
+      return { ...updated, hash }
     })
     writeFileSync(logPath, `${forged.map((e) => JSON.stringify(e)).join('\n')}\n`, { mode: 0o600 })
 
@@ -12149,16 +12151,17 @@ describe('verifyJournal', () => {
       .map((l) => JSON.parse(l) as Record<string, unknown>)
     // Same shear + renumber + rechain — but the attacker holds no signing key,
     // so it can only keep each survivor's ORIGINAL signature (over the old seq).
+    expect(events.length).toBe(4) // assert setup before slicing (no unsafe `!`)
     const survivors = events.slice(1)
-    let prevHash = survivors[0]!.prevHash as string
+    let prevHash = survivors[0].prevHash as string
     const forged = survivors.map((ev, i) => {
       const { hash: _drop, signature, ...rest } = ev
-      rest.seq = i + 1
-      rest.prevHash = prevHash
-      // Recompute the hash over the same bytes verify strips (no hash, no sig).
-      const hash = sha256Hex(prevHash + canonicalJson(rest))
+      // Fresh object, not a mutated `rest` (Gemini review, #273). Recompute the
+      // hash over the same bytes verify strips (no hash, no sig).
+      const updated = { ...rest, seq: i + 1, prevHash }
+      const hash = sha256Hex(prevHash + canonicalJson(updated))
       prevHash = hash
-      return { ...rest, hash, signature } // stale signature over the old bytes
+      return { ...updated, hash, signature } // stale signature over the old bytes
     })
     writeFileSync(logPath, `${forged.map((e) => JSON.stringify(e)).join('\n')}\n`, { mode: 0o600 })
 
