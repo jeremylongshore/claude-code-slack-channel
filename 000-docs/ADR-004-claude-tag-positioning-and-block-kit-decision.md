@@ -7,9 +7,9 @@
 against the shipped Claude Tag surface, fixes the product positioning, and
 decides what to do about Block Kit. No code ships from this ADR.
 
-**Amended 2026-07-13** (`ccsc-37k`) — see [Amendment — Decision 2a](#amendment-2026-07-13--decision-2a-interactive-block-kit-output-is-in-scope):
+**Amended 2026-07-13** (`ccsc-37k`) — see [Amendment (Decision 2a)](#amendment-2026-07-13-decision-2a-interactive-block-kit-output-is-in-scope):
 interactive Block Kit *output* on the `reply` tool is recorded as in-scope, under
-a `portable ∧ journaled ∧ non-native-coupled` bright line. Triggered by the #270
+a `portable ∧ journaled ∧ non-native-component-coupled` bright line. Triggered by the #270
 review (`ccsc-ysu`).
 
 ## Context
@@ -86,7 +86,7 @@ Slack Canvas (`ccsc-ogq.1`, #247) is a reasonable *projection* enhancement
 because it never touches the signed record. That is tracked separately and is
 not gated on this ADR.
 
-## Amendment (2026-07-13) — Decision 2a: interactive Block Kit **output** is in scope
+## Amendment 2026-07-13 (Decision 2a): interactive Block Kit **output** is in scope
 
 **Status of this amendment: ACCEPTED** (`ccsc-37k`). Triggered by the 360°
 review of a cold-contributor proposal — interactive option buttons on the
@@ -121,14 +121,14 @@ the same reasoning that produced Decision 2 rather than contradicting it:
 
 **Bright line (the scope boundary for the next ask).** This blesses *interactive
 output only*. The test for any future interactive primitive is **portable ∧
-journaled ∧ not-native-component-coupled**. Each further primitive — modals,
+journaled ∧ non-native-component-coupled**. Each further primitive — modals,
 select/multi-select menus, external-data sources, or Tag-native components —
 requires its **own** decision; the kernel does not commit to matching Tag's
 interactive-teammate surface generally.
 
 **Honest cost of this amendment.** It softens Decision 2's *"record, not widget"*
 purity — it concedes that *some* widget investment is worthwhile when the widget
-is portable, journaled, and non-native-coupled. That is a **refinement, not a
+is portable, journaled, and non-native-component-coupled. That is a **refinement, not a
 reversal**: the signed record stays the moat, and every interaction this blesses
 lands in it. The cost of *not* amending is worse — an unwritten precedent that
 invites exactly the feature-parity creep the ADR exists to forbid.
@@ -154,7 +154,7 @@ decision.
   on #247).
 - No feature-parity roadmap with Tag is created. That is the point.
 - **(Amendment 2026-07-13)** Interactive Block Kit *output* is in scope under the
-  `portable ∧ journaled ∧ non-native-coupled` bright line (Decision 2a). Each
+  `portable ∧ journaled ∧ non-native-component-coupled` bright line (Decision 2a). Each
   further interactive primitive (modals, selects, native components) still needs
   its own decision. The #270 feature that triggered this is accept-with-conditions
   (`ccsc-ysu`), not a parity commitment.
