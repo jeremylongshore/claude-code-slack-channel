@@ -2171,6 +2171,124 @@ export function isDuplicateEvent(
 }
 
 // ---------------------------------------------------------------------------
+// Reconnect / startup catch-up watermarks (ccsc-reconnect-catchup)
+// ---------------------------------------------------------------------------
+//
+// Slack Socket Mode does NOT redeliver events that were sent while the app
+// was disconnected (host asleep / rebooted / crashed). The bridge therefore
+// persists a per-channel high-water mark — the `ts` of the last message it
+// finished processing in each channel — to STATE_DIR/watermarks.json. On
+// (re)connect it pulls conversations.history for everything newer than the
+// mark and replays it through the SAME gate()/handleMessage path, so nothing
+// the operator sent during the gap is silently lost. These helpers are the
+// pure, side-effect-free core (parse / advance / select); the disk I/O and
+// the conversations.history call live in server.ts.
+
+/** Per-channel high-water mark: `channel_id` → the Slack `ts` string of the
+ *  last message the bridge finished processing in that channel. Slack `ts`
+ *  is `"SSSSSSSSSS.mmmmmm"` (Unix seconds, dot, 6-digit intra-second
+ *  counter) and is globally monotonic per channel. */
+export type Watermarks = Record<string, string>
+
+/** Compare two Slack `ts` strings. Returns <0 when `a` is older than `b`,
+ *  0 when equal, >0 when `a` is newer.
+ *
+ *  `parseFloat` would lose precision at the 16th significant digit (a full
+ *  `ts` carries 16), so the two halves are compared as integers instead —
+ *  exact across the whole `ts` space. A missing or non-numeric half sorts as
+ *  0 for that component, so a malformed `ts` can't throw or sort wildly. */
+export function compareSlackTs(a: string, b: string): number {
+  const dotA = a.indexOf('.')
+  const dotB = b.indexOf('.')
+  const secA = dotA >= 0 ? a.slice(0, dotA) : a
+  const secB = dotB >= 0 ? b.slice(0, dotB) : b
+  const subA = dotA >= 0 ? a.slice(dotA + 1) : ''
+  const subB = dotB >= 0 ? b.slice(dotB + 1) : ''
+
+  const toInt = (s: string): number => {
+    const n = Number.parseInt(s, 10)
+    return Number.isFinite(n) ? n : 0
+  }
+
+  const secDiff = toInt(secA) - toInt(secB)
+  if (secDiff !== 0) return secDiff < 0 ? -1 : 1
+  // Right-pad the fractional counter to 6 digits so "5" and "500000"
+  // compare the way Slack means them (it always emits 6, but be defensive).
+  const subDiff = toInt(subA.padEnd(6, '0')) - toInt(subB.padEnd(6, '0'))
+  if (subDiff !== 0) return subDiff < 0 ? -1 : 1
+  return 0
+}
+
+/** Parse the persisted watermarks file. Tolerant by design: `undefined`,
+ *  empty, non-JSON, or a non-object JSON value all yield `{}`. Only
+ *  non-empty `string` → non-empty `string` entries survive, so a
+ *  hand-edited or half-written file cannot inject a junk channel id (which
+ *  would then be fed to conversations.history) or a non-string watermark
+ *  (which would break `compareSlackTs`). */
+export function parseWatermarks(raw: string | undefined | null): Watermarks {
+  if (typeof raw !== 'string' || raw.trim() === '') return {}
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return {}
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+  const out: Watermarks = {}
+  for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
+    if (key.length > 0 && typeof val === 'string' && val.length > 0) {
+      out[key] = val
+    }
+  }
+  return out
+}
+
+/** Return the watermark map with `channel`'s mark advanced to `ts`, but only
+ *  when `ts` is strictly newer than the stored mark — a watermark never
+ *  regresses (monotonic). Returns the SAME object reference when nothing
+ *  changed, so the caller can skip a disk write. A `channel` or `ts` that
+ *  isn't a non-empty string is ignored (input returned unchanged). */
+export function advanceWatermark(current: Watermarks, channel: string, ts: string): Watermarks {
+  if (typeof channel !== 'string' || channel.length === 0) return current
+  if (typeof ts !== 'string' || ts.length === 0) return current
+  const existing = current[channel]
+  if (existing !== undefined && compareSlackTs(ts, existing) <= 0) return current
+  return { ...current, [channel]: ts }
+}
+
+/** From one channel's conversations.history batch, select the messages that
+ *  must be replayed after a (re)connect: strictly newer than `watermarkTs`,
+ *  deduped by `ts` (first occurrence wins), returned oldest → newest so the
+ *  replay preserves conversation order.
+ *
+ *  A message without a non-empty string `ts` is dropped — it can't be
+ *  ordered, deduped, or advance the watermark. When `watermarkTs` is
+ *  `undefined` every well-formed message qualifies, but in practice the
+ *  caller only runs catch-up for channels that already have a watermark.
+ *
+ *  Note the strict `> watermarkTs` filter here is the authoritative dedup
+ *  against the boundary message: Slack's `oldest` history parameter can be
+ *  inclusive of the exact-match `ts`, and that boundary message is the one
+ *  already processed — this drops it regardless of Slack's inclusive flag. */
+export function selectCatchupMessages<T extends { ts?: unknown }>(
+  messages: readonly T[],
+  watermarkTs: string | undefined,
+): T[] {
+  const seen = new Set<string>()
+  const selected: T[] = []
+  for (const m of messages) {
+    const ts = m.ts
+    if (typeof ts !== 'string' || ts.length === 0) continue
+    if (watermarkTs !== undefined && compareSlackTs(ts, watermarkTs) <= 0) continue
+    if (seen.has(ts)) continue
+    seen.add(ts)
+    selected.push(m)
+  }
+  selected.sort((x, y) => compareSlackTs(x.ts as string, y.ts as string))
+  return selected
+}
+
+// ---------------------------------------------------------------------------
 // Audit journal path resolution (ccsc-5pi.6)
 // ---------------------------------------------------------------------------
 

@@ -21,6 +21,7 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  advanceWatermark,
   allowedSinkFor,
   assertNoSecretValues,
   assertOutboundAllowed,
@@ -32,6 +33,7 @@ import {
   type ChannelPolicy,
   chunkText,
   classifyDeliveryError,
+  compareSlackTs,
   computeBackoffMs,
   DELIVERY_METADATA_EVENT_TYPE,
   type DeliveryObligation,
@@ -63,6 +65,7 @@ import {
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
   parseSendableRoots,
+  parseWatermarks,
   pruneExpired,
   redactSecretValues,
   resolveJournalPath,
@@ -76,9 +79,11 @@ import {
   saveSession,
   secretNameFromPlaceholder,
   secretPlaceholder,
+  selectCatchupMessages,
   sessionPath,
   shouldPostAuditReceipt,
   validateSendableRoots,
+  type Watermarks,
 } from './lib.ts'
 import {
   beginDurableStream,
@@ -2360,6 +2365,205 @@ describe('isDuplicateEvent', () => {
     expect(isDuplicateEvent(event, seen, 1000, 60000)).toBe(false)
     // `app_mention` subscription fires shortly after with the same event
     expect(isDuplicateEvent(event, seen, 1050, 60000)).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reconnect / startup catch-up watermarks (ccsc-reconnect-catchup)
+// ---------------------------------------------------------------------------
+
+describe('compareSlackTs', () => {
+  test('orders by the integer (seconds) part first', () => {
+    expect(compareSlackTs('1700000001.000000', '1700000000.999999')).toBeGreaterThan(0)
+    expect(compareSlackTs('1700000000.000000', '1700000001.000000')).toBeLessThan(0)
+  })
+
+  test('orders by the fractional counter when seconds are equal', () => {
+    expect(compareSlackTs('1700000000.000200', '1700000000.000100')).toBeGreaterThan(0)
+    expect(compareSlackTs('1700000000.000100', '1700000000.000200')).toBeLessThan(0)
+  })
+
+  test('returns 0 for identical timestamps', () => {
+    expect(compareSlackTs('1700000000.000100', '1700000000.000100')).toBe(0)
+  })
+
+  test('distinguishes ts that differ only in the last microsecond digit', () => {
+    // parseFloat would collapse these (16 significant digits); the
+    // integer-halves comparison keeps them distinct.
+    expect(compareSlackTs('1700000000.000001', '1700000000.000002')).toBeLessThan(0)
+  })
+
+  test('right-pads a short fractional part before comparing', () => {
+    // "5" means .500000, which is newer than .000100
+    expect(compareSlackTs('1700000000.5', '1700000000.000100')).toBeGreaterThan(0)
+  })
+
+  test('treats a ts with no dot as a whole-seconds value', () => {
+    expect(compareSlackTs('1700000001', '1700000000.999999')).toBeGreaterThan(0)
+    expect(compareSlackTs('1700000000', '1700000000.000001')).toBeLessThan(0)
+  })
+
+  test('a malformed half sorts as 0 rather than throwing', () => {
+    expect(compareSlackTs('abc.def', 'abc.def')).toBe(0)
+    expect(compareSlackTs('1700000000.xyz', '1700000000.000000')).toBe(0)
+    expect(() => compareSlackTs('', '')).not.toThrow()
+    expect(compareSlackTs('', '')).toBe(0)
+  })
+})
+
+describe('parseWatermarks', () => {
+  test('parses a well-formed channel→ts object', () => {
+    const raw = JSON.stringify({ C1: '1700000000.000100', C2: '1700000001.000200' })
+    expect(parseWatermarks(raw)).toEqual({
+      C1: '1700000000.000100',
+      C2: '1700000001.000200',
+    })
+  })
+
+  test('returns {} for undefined / null / empty / whitespace', () => {
+    expect(parseWatermarks(undefined)).toEqual({})
+    expect(parseWatermarks(null)).toEqual({})
+    expect(parseWatermarks('')).toEqual({})
+    expect(parseWatermarks('   ')).toEqual({})
+  })
+
+  test('returns {} on invalid JSON', () => {
+    expect(parseWatermarks('{ not json')).toEqual({})
+  })
+
+  test('returns {} for a JSON value that is not a plain object', () => {
+    expect(parseWatermarks('[]')).toEqual({})
+    expect(parseWatermarks('"C1"')).toEqual({})
+    expect(parseWatermarks('42')).toEqual({})
+    expect(parseWatermarks('null')).toEqual({})
+  })
+
+  test('drops entries whose value is not a non-empty string', () => {
+    const raw = JSON.stringify({
+      C1: '1700000000.000100',
+      C2: 12345,
+      C3: null,
+      C4: '',
+      C5: { nested: true },
+    })
+    expect(parseWatermarks(raw)).toEqual({ C1: '1700000000.000100' })
+  })
+
+  test('drops an empty-string key', () => {
+    const raw = JSON.stringify({ '': '1700000000.000100', C1: '1700000000.000200' })
+    expect(parseWatermarks(raw)).toEqual({ C1: '1700000000.000200' })
+  })
+})
+
+describe('advanceWatermark', () => {
+  test('advances a channel to a strictly newer ts', () => {
+    const cur: Watermarks = { C1: '1700000000.000100' }
+    const next = advanceWatermark(cur, 'C1', '1700000000.000200')
+    expect(next).toEqual({ C1: '1700000000.000200' })
+    expect(next).not.toBe(cur) // new reference when it changes
+  })
+
+  test('adds a brand-new channel', () => {
+    const cur: Watermarks = { C1: '1700000000.000100' }
+    const next = advanceWatermark(cur, 'C2', '1700000000.000050')
+    expect(next).toEqual({ C1: '1700000000.000100', C2: '1700000000.000050' })
+    expect(next).not.toBe(cur)
+  })
+
+  test('never regresses: an older ts returns the same reference', () => {
+    const cur: Watermarks = { C1: '1700000000.000200' }
+    const next = advanceWatermark(cur, 'C1', '1700000000.000100')
+    expect(next).toBe(cur)
+  })
+
+  test('an equal ts returns the same reference (idempotent)', () => {
+    const cur: Watermarks = { C1: '1700000000.000200' }
+    const next = advanceWatermark(cur, 'C1', '1700000000.000200')
+    expect(next).toBe(cur)
+  })
+
+  test('ignores an empty channel or empty ts (same reference)', () => {
+    const cur: Watermarks = { C1: '1700000000.000200' }
+    expect(advanceWatermark(cur, '', '1700000000.000300')).toBe(cur)
+    expect(advanceWatermark(cur, 'C1', '')).toBe(cur)
+  })
+
+  test('does not mutate the input map', () => {
+    const cur: Watermarks = { C1: '1700000000.000100' }
+    advanceWatermark(cur, 'C1', '1700000000.000200')
+    expect(cur).toEqual({ C1: '1700000000.000100' })
+  })
+})
+
+describe('selectCatchupMessages', () => {
+  test('keeps only messages strictly newer than the watermark', () => {
+    const msgs = [
+      { ts: '1700000000.000100', text: 'at-watermark' },
+      { ts: '1700000000.000050', text: 'older' },
+      { ts: '1700000000.000200', text: 'newer' },
+      { ts: '1700000000.000300', text: 'newest' },
+    ]
+    const out = selectCatchupMessages(msgs, '1700000000.000100')
+    expect(out.map((m) => m.text)).toEqual(['newer', 'newest'])
+  })
+
+  test('returns messages oldest → newest regardless of input order', () => {
+    const msgs = [
+      { ts: '1700000000.000300', text: 'c' },
+      { ts: '1700000000.000100', text: 'a' },
+      { ts: '1700000000.000200', text: 'b' },
+    ]
+    const out = selectCatchupMessages(msgs, '1700000000.000000')
+    expect(out.map((m) => m.text)).toEqual(['a', 'b', 'c'])
+  })
+
+  test('dedups by ts (first occurrence wins)', () => {
+    const msgs = [
+      { ts: '1700000000.000200', text: 'first' },
+      { ts: '1700000000.000200', text: 'dup' },
+      { ts: '1700000000.000300', text: 'other' },
+    ]
+    const out = selectCatchupMessages(msgs, '1700000000.000100')
+    expect(out.map((m) => m.text)).toEqual(['first', 'other'])
+  })
+
+  test('drops messages without a usable string ts', () => {
+    const msgs = [
+      { ts: '1700000000.000200', text: 'ok' },
+      { ts: 12345, text: 'numeric-ts' },
+      { text: 'no-ts' },
+      { ts: '', text: 'empty-ts' },
+    ] as Array<{ ts?: unknown; text: string }>
+    const out = selectCatchupMessages(msgs, '1700000000.000100')
+    expect(out.map((m) => m.text)).toEqual(['ok'])
+  })
+
+  test('returns [] when nothing is newer than the watermark', () => {
+    const msgs = [
+      { ts: '1700000000.000050', text: 'a' },
+      { ts: '1700000000.000100', text: 'b' },
+    ]
+    expect(selectCatchupMessages(msgs, '1700000000.000100')).toEqual([])
+  })
+
+  test('returns [] for an empty batch', () => {
+    expect(selectCatchupMessages([], '1700000000.000100')).toEqual([])
+  })
+
+  test('an undefined watermark keeps every well-formed message', () => {
+    const msgs = [
+      { ts: '1700000000.000200', text: 'b' },
+      { ts: '1700000000.000100', text: 'a' },
+    ]
+    const out = selectCatchupMessages(msgs, undefined)
+    expect(out.map((m) => m.text)).toEqual(['a', 'b'])
+  })
+
+  test('drops the exact-watermark boundary message (Slack oldest inclusivity)', () => {
+    // Slack's `oldest` history param can echo back the boundary message;
+    // it is the one already processed, so strict filtering must drop it.
+    const msgs = [{ ts: '1700000000.000100', text: 'boundary' }]
+    expect(selectCatchupMessages(msgs, '1700000000.000100')).toEqual([])
   })
 })
 

@@ -31,6 +31,7 @@ import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
   AUDIT_RECEIPTS_MAX,
+  advanceWatermark,
   assertManifestIdentityResolved,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
@@ -67,6 +68,7 @@ import {
   parseSendableRoots,
   parseV2FloorSeqArg,
   parseVerifyArg,
+  parseWatermarks,
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
@@ -74,8 +76,10 @@ import {
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
+  selectCatchupMessages,
   stripBotMention,
   validateSendableRoots,
+  type Watermarks,
 } from './lib.ts'
 import {
   assertPublishSizeAndSerialize,
@@ -192,6 +196,8 @@ const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'cha
 const ENV_FILE = join(STATE_DIR, '.env')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+// Per-channel reconnect/startup catch-up watermarks (ccsc-reconnect-catchup).
+const WATERMARK_FILE = join(STATE_DIR, 'watermarks.json')
 const DEFAULT_CHUNK_LIMIT = 4000
 
 // File-exfil allowlist: additional roots beyond INBOX_DIR from which the
@@ -328,6 +334,38 @@ function saveAccess(access: Access): void {
   writeFileSync(tmp, JSON.stringify(access, null, 2), { mode: 0o600, flag: 'w' })
   renameSync(tmp, ACCESS_FILE)
 }
+
+// ---------------------------------------------------------------------------
+// Reconnect catch-up watermarks — load / save (ccsc-reconnect-catchup)
+// ---------------------------------------------------------------------------
+//
+// See lib.ts "Reconnect / startup catch-up watermarks" for the rationale.
+// Persistence mirrors saveAccess exactly: pid-qualified tmp file, mode 0o600
+// passed to writeFileSync so the file is never momentarily world-readable,
+// then an atomic rename. The in-memory `watermarks` map is the source of
+// truth at runtime; the file is only read at boot and after a corrupt-parse
+// it degrades to `{}` (catch-up simply finds no channels — fail-open toward
+// "no replay", never a crash).
+
+function loadWatermarks(): Watermarks {
+  if (!existsSync(WATERMARK_FILE)) return {}
+  try {
+    return parseWatermarks(readFileSync(WATERMARK_FILE, 'utf-8'))
+  } catch {
+    return {}
+  }
+}
+
+function saveWatermarks(wm: Watermarks): void {
+  const tmp = `${WATERMARK_FILE}.tmp.${process.pid}`
+  writeFileSync(tmp, JSON.stringify(wm, null, 2), { mode: 0o600, flag: 'w' })
+  renameSync(tmp, WATERMARK_FILE)
+}
+
+/** In-memory per-channel watermark map. Loaded once at boot, advanced by
+ *  handleMessage after each message is fully handled, and consulted by the
+ *  reconnect catch-up. */
+let watermarks: Watermarks = loadWatermarks()
 
 // ---------------------------------------------------------------------------
 // Static mode
@@ -3292,7 +3330,7 @@ async function handleMessage(event: unknown): Promise<void> {
         },
         ...(result.dropReason !== undefined ? { reason: result.dropReason } : {}),
       })
-      return
+      break
     }
 
     case 'pair': {
@@ -3317,18 +3355,46 @@ async function handleMessage(event: unknown): Promise<void> {
         unfurl_links: false,
         unfurl_media: false,
       })
-      return
+      break
     }
 
     case 'deliver': {
       // ccsc-0jj — admin verb detection BEFORE delivering to Claude.
       // If the message is an admin verb (!clear / !restart / !mute /
-      // !unmute), dispatch it through admin.ts and return WITHOUT
-      // also delivering to Claude (Claude shouldn't see operator
-      // verbs as chat content).
+      // !unmute), dispatch it through admin.ts and do NOT also deliver
+      // to Claude (Claude shouldn't see operator verbs as chat content).
       const handled = await tryDispatchAdminVerb(ev, result.access!)
-      if (handled) return
-      await deliverEvent(ev, result.access!)
+      if (!handled) await deliverEvent(ev, result.access!)
+      break
+    }
+  }
+
+  // Advance the per-channel catch-up watermark now that this message has been
+  // fully handled (whatever the gate decided — deliver / drop / pair). On the
+  // next startup (or a mid-session reconnect) the catch-up pulls
+  // conversations.history for everything newer than this mark and replays it
+  // through gate(), so a host that was asleep/rebooted doesn't silently lose
+  // the messages Slack didn't redeliver. We advance on drops too, so a
+  // self-echo or peer-bot message the gate rejected isn't needlessly
+  // re-fetched and re-dropped every reconnect. Reached only on a clean
+  // return from the switch — if gate() threw, the message is NOT marked
+  // processed and will be picked up by the next catch-up. Persisted
+  // atomically; the write is skipped when the mark didn't move, and a write
+  // failure is logged but never breaks message handling.
+  const wmChannel = ev.channel
+  const wmTs = ev.ts
+  if (typeof wmChannel === 'string' && typeof wmTs === 'string') {
+    const next = advanceWatermark(watermarks, wmChannel, wmTs)
+    if (next !== watermarks) {
+      watermarks = next
+      try {
+        saveWatermarks(watermarks)
+      } catch (err) {
+        console.error(
+          '[slack] failed to persist catch-up watermark:',
+          err instanceof Error ? err.message : err,
+        )
+      }
     }
   }
 }
@@ -3526,6 +3592,110 @@ socket.on('app_mention', async ({ event, ack }) => {
   } catch (err) {
     console.error('[slack] Error handling mention:', err)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Reconnect / startup catch-up (ccsc-reconnect-catchup)
+// ---------------------------------------------------------------------------
+//
+// Socket Mode does NOT redeliver events sent while the app was disconnected.
+// When the host sleeps, reboots, or crashes — or the socket briefly drops
+// mid-session — every message the operator sent in the gap is lost, because
+// the bridge never asked Slack for history on (re)connect. This closes that
+// hole: for each channel with a persisted watermark, pull
+// conversations.history since the mark and replay the missed messages
+// through the EXACT SAME handleMessage() path the live socket uses.
+//
+// SECURITY: replay MUST go through handleMessage → gate(). Nothing here
+// short-circuits the inbound gate, the self-echo triple-check, the
+// allowlist, the peer-bot filter, or admin-verb handling. A message
+// recovered from history is treated identically to one that arrived live —
+// including being dropped if the gate says so. Dedup is layered: (1)
+// selectCatchupMessages drops anything at-or-before the watermark and any
+// duplicate ts within the batch, and (2) handleMessage's isDuplicateEvent
+// guard drops anything already processed live within the dedup TTL, so a
+// message that arrived live during the catch-up window is never
+// double-handled.
+
+/** Serializes catch-up runs so the initial-connect pass and a fast
+ *  reconnect can't overlap and double-fetch. */
+let catchupInFlight = false
+/** The socket-mode client emits 'connected' on the FIRST connect as well as
+ *  on every auto-reconnect. The first 'connected' is handled by the explicit
+ *  call in main() after socket.start() resolves; this flag lets the listener
+ *  skip that first event so the initial connect doesn't run catch-up twice. */
+let sawInitialConnect = false
+
+async function runReconnectCatchup(trigger: 'startup' | 'reconnect'): Promise<void> {
+  if (catchupInFlight) {
+    console.error(`[slack] catch-up already running; skipping ${trigger} trigger`)
+    return
+  }
+  catchupInFlight = true
+  try {
+    // Snapshot the channel set up front. handleMessage mutates `watermarks`
+    // as it replays, but we always query with the pre-replay mark per
+    // channel, and selectCatchupMessages re-filters, so the live mutation
+    // can't skip or duplicate a message.
+    const channels = Object.keys(watermarks)
+    if (channels.length === 0) return
+    console.error(
+      `[slack] reconnect catch-up (${trigger}): checking ${channels.length} channel(s) for messages missed while disconnected`,
+    )
+    for (const channel of channels) {
+      const watermarkTs = watermarks[channel]
+      if (watermarkTs === undefined) continue
+      try {
+        // `oldest` bounds the fetch; selectCatchupMessages is the
+        // authoritative strictly-newer-than filter (Slack's `oldest` can be
+        // inclusive of the boundary message, which is the one we already
+        // processed).
+        const res = await web.conversations.history({ channel, oldest: watermarkTs })
+        const raw = (res.messages ?? []) as Array<Record<string, unknown>>
+        const missed = selectCatchupMessages(raw, watermarkTs)
+        if (missed.length === 0) continue
+        console.error(
+          `[slack] reconnect catch-up: replaying ${missed.length} missed message(s) in ${channel}`,
+        )
+        for (const m of missed) {
+          // conversations.history omits the channel id (it was the query
+          // param); inject it so gate()/handleMessage see the same shape a
+          // live socket event carries. Replay one at a time, oldest→newest,
+          // through the full gate path.
+          try {
+            await handleMessage({ ...m, channel })
+          } catch (err) {
+            console.error(
+              `[slack] reconnect catch-up: error replaying message in ${channel}:`,
+              err instanceof Error ? err.message : err,
+            )
+          }
+        }
+      } catch (err) {
+        // Best-effort per channel: a history error (rate limit,
+        // not_in_channel, revoked scope, transient 5xx) must never crash
+        // startup or abort catch-up for the other channels.
+        console.error(
+          `[slack] reconnect catch-up failed for ${channel}:`,
+          err instanceof Error ? err.message : err,
+        )
+      }
+    }
+  } finally {
+    catchupInFlight = false
+  }
+}
+
+// Mid-session reconnect: the client re-emits 'connected' after an
+// auto-reconnect. Skip the very first (initial) connect — that one is
+// covered by the explicit startup catch-up in main() — and run catch-up on
+// every subsequent reconnect so a brief socket drop still recovers its gap.
+socket.on('connected', () => {
+  if (!sawInitialConnect) {
+    sawInitialConnect = true
+    return
+  }
+  void runReconnectCatchup('reconnect')
 })
 
 // ---------------------------------------------------------------------------
@@ -3925,6 +4095,13 @@ async function main(): Promise<void> {
       try {
         await socket.start()
         console.error('[slack] Socket Mode connected')
+        // One-time startup catch-up: recover the messages Slack didn't
+        // redeliver while this host was down. Fire-and-forget so it never
+        // delays boot; it replays through gate() and swallows per-channel
+        // errors internally. The 'connected' listener above skips the
+        // initial connect, so this is the only catch-up for the first
+        // connection (no double-run).
+        void runReconnectCatchup('startup')
         return
       } catch (err) {
         attempt += 1
