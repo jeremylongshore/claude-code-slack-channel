@@ -383,6 +383,147 @@ for the precedent and the `.dependency-cruiser.js` rule that enforces it.
 
 ---
 
+## Interactive inbound: button clicks (ccsc-37k.1.5)
+
+Slack's `block_actions` payload is the THIRD external entry point into
+the supervisor's lifecycle — alongside inbound messages (the original
+caller) and admin verbs (the second). Each click on a button the bot
+posted carries `(channel, message_ts, action_id, action_value,
+action_label, user_id)` and is gated by `decideInteractionRoute` in
+`lib.ts` (a sibling of `gate()`) before reaching the supervisor. The
+flow:
+
+```
+operator taps a button on bot-authored message M in channel C
+   │
+   ▼
+decideInteractionRoute(envelope, access) → 'deliver' | 'drop'
+   │                                          │
+   │                            (on drop: journal gate.inbound.drop
+   │                             source='block_actions', return)
+   │
+   ▼ (on deliver)
+supervisor.activateAndTouch(sessionKey)   ← session engagement + idle-reset
+   │
+   ▼
+journal gate.inbound.deliver (source='block_actions', sessionKey)
+   │
+   ▼
+deliver as [button click] "<label>" (value: <value>) via
+   the existing notifications/claude/channel method with
+   kind='button_click' meta
+   │
+   ▼ (background)
+createConsumedClickStore.consume(message.ts, action.ts)  ← single-fire
+   │
+   ▼
+replaceClickedActionsBlock(message, actionId)            ← confirmation swap
+```
+
+### Why clicks engage the supervisor (not bypass it)
+
+A click MUST touch the supervisor for three reasons:
+
+1. **Idle-reap protection.** A click-only thread has no inbound
+   message activity, so without an `activateAndTouch` it can be
+   idle-reaped mid-interaction. The supervisor's idle timer is the
+   wrong reaper for a thread waiting on a human decision.
+2. **Thread attribution.** A click is bound to the parent message
+   thread. Without the supervisor recording the click as session
+   activity, a downstream tool call would inherit the wrong active
+   thread — the one that last received a *message*, not the one that
+   received the click.
+3. **Per-user isolation.** The supervisor's session key includes the
+   user. A click that bypasses the supervisor carries no session key,
+   so per-user isolation never sees it and a subsequent tool call
+   could attribute to the wrong principal.
+
+Implementation: ~8 lines (`activateAndTouch` + set the session key
+on the deliver journal event). The contract is unchanged — clicks are
+just another inbound-event source exercising the existing FSM.
+
+### Why consume + replace happens in the background
+
+`createConsumedClickStore` enforces single-fire at the data layer
+(single-writer, fenced) so it does NOT depend on the best-effort
+`replaceClickedActionsBlock` succeeding. If Slack's edit call fails or
+the transport drops, the click is still consumed exactly once — the
+confirmation swap is purely cosmetic.
+
+### `requireMention` strictness
+
+Clicks obey `requireMention` the same way messages do. A click in a
+`requireMention=true` channel is dropped unless the parent message
+carries the bot mention (which it does, because only the bot can post
+buttons). This is deliberately the same gate as the message gate —
+keeping two parallel routing rules (one strict, one lenient) is a
+foot-gun, and the rationale for leniency (the button is the bot's
+own invitation) is already satisfied by `requireMention` being
+satisfied at message-post time.
+
+### Why dispatch lives in `server.ts` (interactive handler), not `supervisor.ts`
+
+Same pattern as `admin.ts` — the supervisor stays in its layer
+(FSM, not Slack interaction language). The interactive handler in
+`server.ts` is the boundary translator: parses Slack
+`block_actions` envelopes into supervisor calls, the same way
+`admin.ts` parses operator text into supervisor calls. One module
+per external dialect.
+
+### What this section deliberately does NOT cover
+
+- **Select menus, multi-selects, modals, native components** — each
+  has a different payload shape and UX contract. The routing
+  function is structured to add them per-type later, but each new
+  primitive needs its own decision record (per ADR-004 amendment
+  Decision 2a scope boundary).
+- **DM pairing flow** — an unpaired DM clicker is dropped (journaled),
+  not offered a pairing code. A click carries no conversational
+  context to pair against. Tracked separately if/when DM click
+  onboarding becomes a real ask.
+- **Clicks bypassing `requireMention`** — explicitly rejected; see
+  "requireMention strictness" above.
+
+---
+
+## Obligation schema contract (ccsc-ngn)
+
+The session on-disk layout uses an **additive-tolerant** obligation
+schema. The contract is:
+
+- **New keys are silently ignored by older readers.** When a future
+  version of CCSC writes an obligation file with a field the current
+  reader doesn't know about, the reader must accept the file and
+  ignore the unknown key.
+- **Required keys are never removed.** Once a field ships, it ships.
+  Renames or removals require a major version bump and a separate
+  contract document — this section only governs additive tolerance.
+- **Rollback loses rendering, not data.** Downgrading CCSC after a
+  future version wrote a new field causes the rolled-back reader to
+  ignore the new field. The durable-delivery outbox means every
+  obligation is journaled independently before write, so a
+  rolled-back reader sees the obligation's text-fallback rather
+  than dropping the obligation entirely. Cosmetic loss only.
+
+This contract matches the journal's additive-tolerant posture from
+#278 (pinned-genesis / v2-floor), where new anchor kinds are silently
+ignored by older readers. Same precedent, same property — kernel
+field sets stay open forward.
+
+**Test:** the loader MUST pass `loadObligation(file)` on a v(n)
+obligation with an unknown key and return a parsed obligation with
+the unknown key preserved on the in-memory object (so a future
+forward-port upgrade round-trips it). The on-disk read does not
+throw and does not silently drop the unknown key.
+
+**Implication for v0.13.0 (ccsc-37k.1, blocks-reply feature):**
+the `blocks` field added to `DeliveryObligation` is the first
+exercise of this contract. Operators on v0.12.x rolling back after
+v0.13+ wrote a blocks obligation see the reply render as text
+fallback. No data loss; no obligation drops from the outbox queue.
+
+---
+
 ## Admin-verb entry points (ccsc-3w0)
 
 The `dispatchAdminCommand` function in `admin.ts` is a NEW external
