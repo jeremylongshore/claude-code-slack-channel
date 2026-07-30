@@ -3058,6 +3058,10 @@ async function handleButtonClick(body: any, action: any): Promise<void> {
   // Shares the message dedup store: keyspace is channel+ts, where ts here is
   // the click's action_ts. A collision with a message ts is astronomically
   // unlikely (both are microsecond epoch stamps) and merely drops one event.
+  // Pre-gate and unjournaled, exactly like message-event redeliveries at the
+  // top of handleMessage: a Slack transport retry is noise, not a gate
+  // decision (audit-journal-architecture.md § Relationship to other
+  // subsystems).
   if (
     isDuplicateEvent(
       { channel: channelId, ts: actionTs },
