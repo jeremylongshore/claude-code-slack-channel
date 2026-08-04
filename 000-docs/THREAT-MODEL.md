@@ -144,6 +144,7 @@ missed primitive is a bypass.
 | 6 | Pairing-code reply                 | 6-char code        | pending sender only              | code is single-use, TTL 1h, max 2 replies (`MAX_PAIRING_REPLIES`); only changes `access.json`, never delivers       |
 | 7 | Permission approval reply          | `y`/`n` + code     | prior approver only              | matched by `PERMISSION_REPLY_RE` at the gate *before* MCP sees the text; reply must carry the one-shot code          |
 | 8 | Peer-bot message (`bot_id` set)    | text               | any bot in the workspace         | dropped by default; requires explicit `allowBotIds[<channel>]` opt-in; self-echo filter on `bot_id`/`app_id`/`user` |
+| 9 | Button click (`block_actions`)     | `action_id` + `value` + label of a button **this bot posted** | any member who can see the message | same gate as messages via pure `decideInteractionRoute` — channel opt-in (`getChannelPolicy`), `allowFrom`, `requireMention` (engaged-thread only; a click can never open a thread), DM pairing + `dmPolicy`; transport-duplicate `action_ts` filtered pre-gate (unjournaled, as message redeliveries are); consumed at most once per (message, action); gate drops AND delivers journaled (`source: 'block_actions'`); outbound side: agent-authored blocks are rejected at reply time if ANY element anywhere in the payload carries a reserved `perm:` `action_id` (container-agnostic recursive walk — `actions`, `section.accessory`, `input.element`, future shapes) |
 
 ### Outbound primitives (Claude → Slack, via MCP tools)
 
@@ -593,6 +594,26 @@ Catalogued here so they appear in every later design review:
   mitigation (fail-safe thread-scoped rules to a human when >1 thread is active,
   reusing the `ccsc-x0t.5` `indeterminate` path) is designed and deferred pending
   evidence. Full analysis + decision: ADR-003.
+- **R8. Stale channel opt-in keeps old buttons live.** Slack delivers
+  `block_actions` payloads from channels the bot has since been removed
+  from, so an `access.json` entry for a departed channel keeps previously
+  posted buttons clickable (inbound primitive #9 still gates each click).
+  Mitigation is operational: remove the channel from `access.json` when
+  removing the bot. The admin `!leave` verb is the natural future home for
+  doing both atomically.
+- **R9. Empty per-channel `allowFrom` admits any member's click.** In an
+  opted-in channel with `allowFrom: []`, any member who can see the message
+  can click a button — the same bar the *message* gate sets for typing in
+  that channel, and since clicks obey `requireMention` strictly (engaged
+  thread only, never opening one), a click grants no quieter path than a
+  message. Residual: a click is lower *effort* than composing a message.
+  Scope `allowFrom` on channels where button decisions matter.
+- **R10. Click-triggered tool calls inherit R7.** A delivered click updates
+  the active channel/thread and activates its session exactly as a message
+  does, so a tool call the agent makes in response attributes under the
+  same single-active-thread assumption — and the same concurrent-thread
+  misattribution residual — as message-triggered calls (R7, ADR-003).
+  Clicks add no *new* misattribution channel; they join the existing one.
 
 ---
 

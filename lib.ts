@@ -299,6 +299,13 @@ export interface DeliveryObligation {
    *  id — plus a `(filename, size)` thread scan — is the dedup anchor). Absent
    *  until the first successful upload. */
   uploadedFileId?: string
+  /** Block Kit blocks for a rich-layout reply. When present the send includes
+   *  them in `chat.postMessage` and `payload` doubles as the notification
+   *  fallback text. Guarded against secret values at record time (like
+   *  `payload`); blocks are immutable once recorded, so redelivery needs no
+   *  re-guard (unlike `upload`, whose bytes can change on disk). Additive +
+   *  optional — text-only obligations and older records are unchanged. */
+  blocks?: Array<Record<string, unknown>>
 }
 
 /** How the delivery poller (ccsc-o7x.2.2) treats a failed send. `retryable`
@@ -330,6 +337,12 @@ export const NON_RETRYABLE_SLACK_ERRORS: ReadonlySet<string> = new Set([
   'token_revoked',
   'token_expired',
   'no_permission',
+  // Payload is structurally malformed — a retry sends the same bytes and
+  // fails the same way. Reachable via the reply tool's Block Kit `blocks`
+  // (a malformed blocks payload on the durable path must dead-letter, not
+  // become a poison obligation the poller retries forever).
+  'invalid_blocks',
+  'invalid_blocks_format',
   'ekm_access_denied',
   // Payload is malformed — the same bytes will always be rejected.
   'msg_too_long',
@@ -645,8 +658,26 @@ export const SessionSchema = z
               .strict()
               .optional(),
             uploadedFileId: z.string().optional(),
+            // Optional Block Kit blocks for a rich-layout reply. Optional so
+            // text obligations + older records validate.
+            blocks: z.array(z.record(z.string(), z.unknown())).optional(),
           })
-          .strict(),
+          // TOLERANT READER at the obligation level (#270 review, condition 3;
+          // maintainer decision ccsc-ngn Option B, recorded in
+          // 000-docs/session-state-machine.md § "Obligation schema contract").
+          // Obligation records grow by additive optional fields (`lastError`,
+          // `upload`, `blocks`, …); a `.strict()` reader turns every such
+          // addition into a downgrade landmine — a session file written by a
+          // newer version fails the older loader, which quarantines the WHOLE
+          // file and silently stops redelivery of every pending obligation in
+          // it, text and files included. `.passthrough()` loads the file,
+          // ignores fields this version doesn't know, and PRESERVES them on
+          // rewrite (must-ignore, must-preserve), so unknown-field tolerance
+          // survives a save. The top-level session object stays `.strict()`:
+          // its key set is a deliberate tamper canary, and top-level additions
+          // are rare enough to warrant an explicit versioning decision each
+          // time.
+          .passthrough(),
       )
       .optional(),
   })
@@ -2784,4 +2815,186 @@ export function formatVerifyResult(
   if (b.actual !== undefined) lines.push(`  actual:   ${b.actual}`)
   lines.push(`  events verified before break: ${result.eventsVerified}`)
   return { text: lines.join('\n'), exitCode: 1 }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive button clicks — routing + message update (pure)
+// ---------------------------------------------------------------------------
+
+/** The fields of a Slack `block_actions` interaction that routing needs.
+ *  Extracted from the raw payload by the server; kept minimal so the decision
+ *  function stays pure and exhaustively testable. */
+export interface ButtonInteraction {
+  /** `actions[0].type` — only `button` is routable today. */
+  actionType: string
+  /** Slack user id of the clicker (`body.user.id`). */
+  userId: string
+  /** Channel (or DM) the clicked message lives in (`body.channel.id`). */
+  channelId: string
+  /** `actions[0].action_ts` — unique per click; the dedup key. */
+  actionTs: string
+  /** `body.message.ts` — the clicked message. Empty for ephemeral buttons. */
+  messageTs?: string
+  /** `body.message.thread_ts` — present only when the message is in a thread. */
+  threadTs?: string
+}
+
+export type InteractionRoute = { action: 'deliver' } | { action: 'drop'; dropReason: string }
+
+/** Route a button click (pure). SAME GATE AS MESSAGES — no parallel
+ *  lenient-click rule (#270 review, maintainer design call, recorded in
+ *  000-docs/session-state-machine.md § "Interactive inbound: button clicks"):
+ *
+ *  - `requireMention` channels deliver a click only when its thread is already
+ *    engaged (a human previously mentioned the bot there) — exactly the
+ *    mention-stickiness rule a mention-less *message* gets. A click cannot
+ *    carry a mention, so it can never OPEN a thread; on an unengaged thread it
+ *    drops as `channel.require_mention`. This closes the quiet path where an
+ *    empty-`allowFrom` channel let any member click and then converse
+ *    mention-free.
+ *  - DMs require the clicker to be paired (top-level `allowFrom`), same as DM
+ *    text, and honor `dmPolicy` for the drop reason: a closed policy journals
+ *    `dm.policy_closed` (as the message gate does), an open/pairing policy
+ *    journals `dm.not_paired`. There is no pairing-code flow for clicks — a
+ *    click carries no conversational context to pair against.
+ *
+ *  Channel opt-in and per-channel `allowFrom` apply exactly as for messages,
+ *  via the same `getChannelPolicy` accessor (#275 — guards a legacy
+ *  `access.json` with no `channels` key; a bare `Object.hasOwn` would throw
+ *  and beat the journal write, breaking the every-drop-is-journaled
+ *  invariant). */
+export function decideInteractionRoute(
+  interaction: ButtonInteraction,
+  access: Access,
+  engagedThreads?: ReadonlySet<string>,
+): InteractionRoute {
+  if (interaction.actionType !== 'button') {
+    return { action: 'drop', dropReason: 'interaction.unsupported_type' }
+  }
+  if (!interaction.userId || !interaction.channelId || !interaction.actionTs) {
+    return { action: 'drop', dropReason: 'interaction.malformed' }
+  }
+
+  // DM: Slack DM channel ids start with 'D'. Clicker must already be paired.
+  if (interaction.channelId.startsWith('D')) {
+    if (access.allowFrom.includes(interaction.userId)) return { action: 'deliver' }
+    return access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled'
+      ? { action: 'drop', dropReason: 'dm.policy_closed' }
+      : { action: 'drop', dropReason: 'dm.not_paired' }
+  }
+
+  const policy = getChannelPolicy(access, interaction.channelId)
+  if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
+  if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(interaction.userId)) {
+    return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
+  }
+  if (policy.requireMention) {
+    // Thread key mirrors the message gate: thread_ts ?? message ts. An
+    // ephemeral-button click has neither → key never matches → fail closed.
+    const threadKey = deliveredThreadKey(
+      interaction.channelId,
+      interaction.threadTs ?? interaction.messageTs,
+    )
+    if (!engagedThreads?.has(threadKey)) {
+      return { action: 'drop', dropReason: 'channel.require_mention' }
+    }
+  }
+  return { action: 'deliver' }
+}
+
+/** Reserved action_id namespace on agent-authored buttons. The interactive
+ *  handler treats `perm:allow|deny|more:<id>` clicks as POLICY APPROVAL votes,
+ *  so an agent-authored button carrying a perm: action_id would let a
+ *  prompt-injected agent turn dress an approval vote up as an innocuous
+ *  option button ("Show details") and convert the owner's click into a
+ *  tool-call approval. Enforced at reply time: a blocks payload containing a
+ *  reserved action_id is rejected before record/send. */
+export const RESERVED_ACTION_ID_PREFIX = 'perm:'
+
+/** Return the first reserved (`perm:`-prefixed) action_id found ANYWHERE in
+ *  the blocks payload, or null when the payload is clean. Pure.
+ *
+ *  Container-agnostic by design (#270 review, condition 1): Slack routes
+ *  `block_actions` clicks from more containers than `actions` blocks — a
+ *  `section` block's `accessory` and an `input` block's `element` are
+ *  clickable too, and the interactive handler dispatches on `action_id`
+ *  without caring which container carried it. So the guard walks every
+ *  object/array in the payload and rejects on any `action_id` key with a
+ *  reserved value, rather than enumerating today's container shapes — new
+ *  block types are covered by default. Only the `action_id` KEY is
+ *  inspected: `perm:` as message *text* stays clean (no false positives). */
+export function findReservedActionId(blocks: ReadonlyArray<unknown>): string | null {
+  const stack: unknown[] = [...blocks]
+  while (stack.length > 0) {
+    const node = stack.pop()
+    if (Array.isArray(node)) {
+      for (const item of node) stack.push(item)
+      continue
+    }
+    if (node === null || typeof node !== 'object') continue
+    for (const [key, value] of Object.entries(node)) {
+      if (
+        key === 'action_id' &&
+        typeof value === 'string' &&
+        value.startsWith(RESERVED_ACTION_ID_PREFIX)
+      ) {
+        return value
+      }
+      stack.push(value)
+    }
+  }
+  return null
+}
+
+/** Bounded first-click registry: `consume(key)` returns true exactly once per
+ *  key (message + action), so a button relays a single click even when the
+ *  post-delivery Block Kit swap fails and the buttons stay visually live.
+ *  Insertion-ordered eviction at `max`, mirroring the engaged-threads cache. */
+export function createConsumedClickStore(max = 10_000): { consume(key: string): boolean } {
+  const seen = new Set<string>()
+  return {
+    consume(key: string): boolean {
+      if (seen.has(key)) return false
+      if (seen.size >= max) {
+        const oldest = seen.values().next().value
+        if (oldest !== undefined) seen.delete(oldest)
+      }
+      seen.add(key)
+      return true
+    },
+  }
+}
+
+/** Replace the actions block containing the clicked button with a context
+ *  block confirming the choice. Leaves every other block untouched, so a
+ *  message with several sections keeps its content and only loses the
+ *  now-consumed buttons (which also prevents double-firing). Pure — used by
+ *  the server's interactive handler after the click is delivered. */
+export function replaceClickedActionsBlock(
+  blocks: ReadonlyArray<unknown>,
+  actionId: string,
+  label: string,
+  userId: string,
+): unknown[] {
+  return blocks.map((b) => {
+    const block = b as { type?: string; elements?: Array<{ action_id?: string }> }
+    const isClickedActions =
+      block?.type === 'actions' &&
+      Array.isArray(block.elements) &&
+      block.elements.some((e) => e?.action_id === actionId)
+    return isClickedActions
+      ? {
+          type: 'context',
+          elements: [
+            {
+              type: 'mrkdwn',
+              // The label was inert plain_text on its button, but a context
+              // element is live mrkdwn — escape it so a label like
+              // "<!channel>" cannot become a real @channel ping on the swap.
+              text: `:white_check_mark: *${escMrkdwn(label)}* — <@${userId}>`,
+            },
+          ],
+        }
+      : b
+  })
 }

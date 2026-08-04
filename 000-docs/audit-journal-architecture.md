@@ -618,6 +618,21 @@ Exit codes:
 - **Inbound gate** calls `writeEvent({kind: 'gate.inbound.drop', ...})`
   on every rejected event. Drops are journaled even though they never
   reach Claude — this is how we see attack attempts.
+- **Button-click relay** (`block_actions`, inbound primitive #9 in
+  `THREAT-MODEL.md`) journals through the same two kinds with
+  `input.source: 'block_actions'`: every gate-rejected click is a
+  `gate.inbound.drop` (gate miss or `interaction.already_consumed`),
+  and every delivered click is a `gate.inbound.deliver` carrying the
+  clicked `action_id` and the session key it activated — a click is a
+  security-relevant inbound event that can trigger agent action, so it
+  leaves a chain record on both outcomes. Transport redeliveries of the
+  same click (duplicate `action_ts` within the dedup TTL) are filtered
+  *before* the gate and are not journaled — exactly as message-event
+  redeliveries are: a Slack retry is transport noise, not a gate
+  decision, and journaling it would let a flaky connection spam the
+  chain. The outbound side journals `gate.outbound.deny` when a
+  reply's blocks payload is rejected for a reserved `perm:`
+  `action_id`.
 - **Outbound gate** journals every reply attempt, allowed or refused.
 - **Policy evaluator** has no journal dependency; the caller emits the
   decision event.
