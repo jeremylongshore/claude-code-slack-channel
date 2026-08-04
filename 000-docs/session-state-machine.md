@@ -383,41 +383,51 @@ for the precedent and the `.dependency-cruiser.js` rule that enforces it.
 
 ---
 
-## Interactive inbound: button clicks (ccsc-37k.1.5)
+## Interactive inbound: button clicks (ccsc-83u, shipped #287)
 
 Slack's `block_actions` payload is the THIRD external entry point into
 the supervisor's lifecycle — alongside inbound messages (the original
-caller) and admin verbs (the second). Each click on a button the bot
-posted carries `(channel, message_ts, action_id, action_value,
-action_label, user_id)` and is gated by `decideInteractionRoute` in
-`lib.ts` (a sibling of `gate()`) before reaching the supervisor. The
-flow:
+caller) and admin verbs (the second). Shipped in PR #287 (CraigVG /
+`ccsc-n7j`). Each click on a button the bot posted carries
+`(channel, message_ts, action_id, action_value, action_label, user_id)`
+and is gated by `decideInteractionRoute` in `lib.ts` (a sibling of
+`gate()`) before reaching the supervisor. The flow (matches
+`handleButtonClick` / `deliverButtonClick` in `server.ts`):
 
 ```
 operator taps a button on bot-authored message M in channel C
    │
    ▼
-decideInteractionRoute(envelope, access) → 'deliver' | 'drop'
-   │                                          │
-   │                            (on drop: journal gate.inbound.drop
-   │                             source='block_actions', return)
+transport dedup by action_ts (pre-gate, unjournaled — noise)
+   │
+   ▼
+decideInteractionRoute(envelope, access, engagedThreads)
+   → 'deliver' | 'drop'
+   │                              │
+   │                (on drop: journal gate.inbound.drop
+   │                 source='block_actions', return)
    │
    ▼ (on deliver)
-supervisor.activateAndTouch(sessionKey)   ← session engagement + idle-reset
+createConsumedClickStore.consume(channel:message:action_id)
+   │                              │
+   │                (already consumed → journal drop
+   │                 interaction.already_consumed, return)
+   │
+   ▼
+recordEngagedThread + inboundSessionKey (per-user isolation)
    │
    ▼
 journal gate.inbound.deliver (source='block_actions', sessionKey)
    │
    ▼
-deliver as [button click] "<label>" (value: <value>) via
-   the existing notifications/claude/channel method with
-   kind='button_click' meta
-   │
-   ▼ (background)
-createConsumedClickStore.consume(message.ts, action.ts)  ← single-fire
+supervisor.activateAndTouch(sessionKey)   ← idle-reset + attribution
    │
    ▼
-replaceClickedActionsBlock(message, actionId)            ← confirmation swap
+await MCP notification [button click] "<label>" (value: …)
+   kind='button_click' meta
+   │
+   ▼ (only after MCP succeeds)
+replaceClickedActionsBlock(message, actionId)  ← ✅ confirmation
 ```
 
 ### Why clicks engage the supervisor (not bypass it)
@@ -426,101 +436,104 @@ A click MUST touch the supervisor for three reasons:
 
 1. **Idle-reap protection.** A click-only thread has no inbound
    message activity, so without an `activateAndTouch` it can be
-   idle-reaped mid-interaction. The supervisor's idle timer is the
-   wrong reaper for a thread waiting on a human decision.
-2. **Thread attribution.** A click is bound to the parent message
-   thread. Without the supervisor recording the click as session
+   idle-reaped mid-interaction.
+2. **Thread attribution.** Without recording the click as session
    activity, a downstream tool call would inherit the wrong active
-   thread — the one that last received a *message*, not the one that
-   received the click.
-3. **Per-user isolation.** The supervisor's session key includes the
-   user. A click that bypasses the supervisor carries no session key,
-   so per-user isolation never sees it and a subsequent tool call
-   could attribute to the wrong principal.
+   thread (the last *message*, not the click). The deliver path also
+   updates `lastActiveChannel` / `lastActiveThread` for the permission
+   relay (inherits R7's single-active-thread assumption — no new
+   misattribution channel).
+3. **Per-user isolation.** The session key honors `perUserSessions`;
+   a click that bypasses the supervisor never sees it.
 
-Implementation: ~8 lines (`activateAndTouch` + set the session key
-on the deliver journal event). The contract is unchanged — clicks are
-just another inbound-event source exercising the existing FSM.
+### Why consume is server-side and confirmation is post-delivery
 
-### Why consume + replace happens in the background
-
-`createConsumedClickStore` enforces single-fire at the data layer
-(single-writer, fenced) so it does NOT depend on the best-effort
-`replaceClickedActionsBlock` succeeding. If Slack's edit call fails or
-the transport drops, the click is still consumed exactly once — the
-confirmation swap is purely cosmetic.
+`createConsumedClickStore` enforces single-fire at the data layer so
+it does NOT depend on the best-effort Block Kit swap. Consume runs
+**after** the route check (a dropped non-allowlisted click must not
+burn the button for the owner) and **before** MCP delivery. The
+confirmation swap paints only after the MCP notification succeeds —
+on transport failure the buttons stay visually intact; the
+consumed-once record still stands (operator re-issues; a click never
+fires twice). Cap is 10k with insertion-ordered eviction (same bound
+as the engaged-threads cache).
 
 ### `requireMention` strictness
 
-Clicks obey `requireMention` the same way messages do. A click in a
-`requireMention=true` channel is dropped unless the parent message
-carries the bot mention (which it does, because only the bot can post
-buttons). This is deliberately the same gate as the message gate —
-keeping two parallel routing rules (one strict, one lenient) is a
-foot-gun, and the rationale for leniency (the button is the bot's
-own invitation) is already satisfied by `requireMention` being
-satisfied at message-post time.
+Clicks obey `requireMention` the **same way messages do**: via the
+engaged-threads set, keyed `thread_ts ?? message_ts`. A click in a
+`requireMention=true` channel delivers only in an **already-engaged**
+thread and can never *open* one (a click cannot carry a mention).
+Ephemeral-button clicks (no `body.message` / no thread identity) fail
+closed. A delivered click then refreshes engagement exactly as a
+delivered human message does. No parallel lenient-click rule.
 
 ### Why dispatch lives in `server.ts` (interactive handler), not `supervisor.ts`
 
 Same pattern as `admin.ts` — the supervisor stays in its layer
 (FSM, not Slack interaction language). The interactive handler in
 `server.ts` is the boundary translator: parses Slack
-`block_actions` envelopes into supervisor calls, the same way
-`admin.ts` parses operator text into supervisor calls. One module
-per external dialect.
+`block_actions` envelopes into supervisor calls. One module per
+external dialect.
 
 ### What this section deliberately does NOT cover
 
 - **Select menus, multi-selects, modals, native components** — each
-  has a different payload shape and UX contract. The routing
-  function is structured to add them per-type later, but each new
-  primitive needs its own decision record (per ADR-004 amendment
-  Decision 2a scope boundary).
-- **DM pairing flow** — an unpaired DM clicker is dropped (journaled),
-  not offered a pairing code. A click carries no conversational
-  context to pair against. Tracked separately if/when DM click
-  onboarding becomes a real ask.
-- **Clicks bypassing `requireMention`** — explicitly rejected; see
-  "requireMention strictness" above.
+  has a different payload shape and UX contract. Per ADR-004
+  Decision 2a, each new interactive primitive needs its own decision.
+- **DM pairing flow** — an unpaired DM clicker is dropped (journaled
+  with `dm.not_paired` / `dm.policy_closed`), not offered a pairing
+  code.
+- **Clicks bypassing `requireMention`** — explicitly rejected.
+
+Residuals: THREAT-MODEL.md R8 (stale opt-in keeps buttons live),
+R9 (empty `allowFrom` admits any member's click), R10 (click-
+triggered tool calls inherit R7).
 
 ---
 
-## Obligation schema contract (ccsc-ngn)
+## Obligation schema contract (ccsc-ngn / ccsc-wib, shipped #287)
 
-The session on-disk layout uses an **additive-tolerant** obligation
-schema. The contract is:
+Decision `ccsc-ngn` (maintainer, 2026-07-29, #270 condition 3):
+**tolerant reader** (Option B), following the journal's
+pinned-genesis / v2-floor precedent (#278). Implemented in PR #287.
 
-- **New keys are silently ignored by older readers.** When a future
-  version of CCSC writes an obligation file with a field the current
-  reader doesn't know about, the reader must accept the file and
-  ignore the unknown key.
-- **Required keys are never removed.** Once a field ships, it ships.
-  Renames or removals require a major version bump and a separate
-  contract document — this section only governs additive tolerance.
-- **Rollback loses rendering, not data.** Downgrading CCSC after a
-  future version wrote a new field causes the rolled-back reader to
-  ignore the new field. The durable-delivery outbox means every
-  obligation is journaled independently before write, so a
-  rolled-back reader sees the obligation's text-fallback rather
-  than dropping the obligation entirely. Cosmetic loss only.
+The contract has two layers with different postures:
 
-This contract matches the journal's additive-tolerant posture from
-#278 (pinned-genesis / v2-floor), where new anchor kinds are silently
-ignored by older readers. Same precedent, same property — kernel
-field sets stay open forward.
+- **Session file top level: strict.** The top-level key set is a
+  deliberate tamper canary — an unknown top-level key fails validation
+  and quarantines the file. Adding a top-level field is rare and takes
+  an explicit versioning decision each time.
+- **Obligation records (`outbox[]`): tolerant.** Obligations grow by
+  additive optional fields (`lastError`, `upload`, `blocks`, …). The
+  reader MUST ignore unknown obligation fields (load succeeds) and
+  MUST preserve them on rewrite (a save does not strip what a newer
+  version wrote). Implemented as `.passthrough()` on the obligation
+  object in `SessionSchema`.
 
-**Test:** the loader MUST pass `loadObligation(file)` on a v(n)
-obligation with an unknown key and return a parsed obligation with
-the unknown key preserved on the in-memory object (so a future
-forward-port upgrade round-trips it). The on-disk read does not
-throw and does not silently drop the unknown key.
+General rules:
 
-**Implication for v0.13.0 (ccsc-37k.1, blocks-reply feature):**
-the `blocks` field added to `DeliveryObligation` is the first
-exercise of this contract. Operators on v0.12.x rolling back after
-v0.13+ wrote a blocks obligation see the reply render as text
-fallback. No data loss; no obligation drops from the outbox queue.
+- **New keys are silently ignored by older readers** (from this
+  contract version forward).
+- **Required keys are never removed.** Renames or removals require a
+  major version bump and a separate contract.
+- **Rollback loses rendering, not data** — a `blocks` reply whose
+  field the reader does not know degrades to its `text` fallback.
+
+**Downgrade across the tolerance boundary.** Rolling back to a
+strict-reader version that *predates* this contract (v0.12.x as
+released) remains the original #270 finding: the strict schema fails
+on the unknown field and the loader quarantines the whole file,
+halting redelivery of every pending obligation in it. The durable-
+delivery outbox journals every obligation independently before write,
+so the journal is the recovery source across that boundary.
+
+**Test:** load a session file with an unknown obligation key — parse
+succeeds, the unknown key is preserved on the in-memory object, and a
+save round-trips it. Top-level unknown keys still fail.
+
+**First exercise:** the `blocks` field on `DeliveryObligation`
+(v0.13.0 / #287).
 
 ---
 
@@ -571,71 +584,6 @@ verb language. `admin.ts` is the boundary translator: parses operator
 text into supervisor calls, the same way `mapAcpSessionCancel` in
 `server.ts` parses ACP envelopes into supervisor calls. One module
 per external dialect.
-
----
-
-## Obligation schema contract
-
-Decision `ccsc-ngn` (maintainer, 2026-07-29, #270 condition 3): **tolerant
-reader** (Option B), following the journal's pinned-genesis / v2-floor
-precedent (#278). The contract has two layers with different postures:
-
-- **Session file top level: strict.** The top-level key set is a
-  deliberate tamper canary — an unknown top-level key fails validation and
-  quarantines the file. Adding a top-level field is rare and takes an
-  explicit versioning decision each time.
-- **Obligation records (`outbox[]`): tolerant.** Obligations grow by
-  additive optional fields (`lastError`, `upload`, `blocks`, …). The
-  reader MUST ignore unknown obligation fields (load succeeds, the field
-  is invisible to this version) and MUST preserve them on rewrite (a
-  save does not strip what a newer version wrote). Implemented as
-  `.passthrough()` on the obligation object in `SessionSchema`.
-
-**Downgrade contract.** From any version shipping this contract onward, a
-session file written by a newer version (extra obligation fields) loads
-cleanly on an older reader; a `blocks` reply whose field the reader does
-not know degrades to its `text` fallback — cosmetic loss only. Rolling
-back **across the tolerance boundary** (to a strict-reader version that
-predates this contract) remains the original #270 finding: the strict
-schema fails on the unknown field and the loader quarantines the whole
-file, halting redelivery of every pending obligation in it. The
-durable-delivery outbox journals every obligation independently before
-write, so the journal is the recovery source in that case. Follow-up
-hardening: `ccsc-wib`.
-
----
-
-## Interactive inbound: button clicks
-
-Decision `ccsc-83u` (maintainer, 2026-07-29, #270 design calls 1–2):
-clicks are wired through the supervisor, and `requireMention` applies to
-clicks strictly — the same gate as messages, no parallel lenient-click
-rule.
-
-- **Routing** is the pure `decideInteractionRoute` (lib.ts), mirroring
-  the message gate: channel opt-in via `getChannelPolicy`, per-channel
-  `allowFrom`, `requireMention` via the engaged-threads set, DM pairing +
-  `dmPolicy`. A click cannot carry a mention, so on a `requireMention`
-  channel it delivers only in an already-engaged thread and can never
-  *open* one; a delivered click then refreshes engagement exactly as a
-  delivered human message does.
-- **Session accounting** matches a delivered message: thread key is
-  `thread_ts ?? message ts` (§39 rule), the session key honors per-user
-  isolation, the `gate.inbound.deliver` journal event carries it, and the
-  supervisor `activateAndTouch`es the session — a click-only thread is a
-  live session, not an idle-reap candidate, and per-user isolation sees
-  clicks. The click also updates the active channel/thread used by the
-  permission relay, so a click-triggered tool call attributes to the
-  click's thread (inheriting the R7 single-active-thread assumption, no
-  new misattribution channel).
-- **Ephemeral-button clicks** (no `body.message`) have no thread
-  identity: no session key, no supervisor activation, and fail-closed
-  under `requireMention`.
-- **Delivery is awaited.** The confirmation swap (buttons → ✅ context
-  line) paints only after the MCP notification succeeds; on transport
-  failure the buttons stay visually intact and the consumed-once record
-  stands (a click never fires twice, even across failures — the operator
-  re-issues the prompt).
 
 ---
 

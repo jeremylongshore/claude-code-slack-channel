@@ -188,11 +188,11 @@ back.
   interactive handler — design recorded in `000-docs/session-state-machine.md`
   § "Interactive inbound: button clicks"). Clicks engage the supervisor
   via `activateAndTouch`; they do NOT bypass it. `requireMention` applies
-  to clicks the same way it applies to messages — no parallel lenient
-  rule. Implementation tracked on `ccsc-83u`.
+  to clicks via the engaged-threads set (same gate as messages — no
+  parallel lenient rule). Shipped in PR #287 / `ccsc-n7j`.
 - **Outbound replies may be Block Kit.** `slack-delivery.ts` + the
   durable-delivery outbox support blocks-replies with text fallback
-  (feature epic `ccsc-n7j`, tracked from issue #270). All interactive
+  (shipped PR #287, epic `ccsc-n7j`, issue #270). All further interactive
   Block Kit extensions require an ADR-004 Decision 2a scope check before
   shipping — see ADR-004 amendment (PR #281).
 - **Security primitives are frozen contracts.** `gate()`, `assertSendable()`,
@@ -203,12 +203,11 @@ back.
 
 ## Active rollout state (as of last commit)
 
-- **Issue #270 (CraigVG, Block Kit replies + button relay):** in flight.
-  Path A (Craig reworks) open until **2026-08-08 EOD**, then auto-pivot
-  to Path B (maintainer re-implementation). Three maintainer decisions
-  already locked: tolerant-reader schema, supervisor-wired clicks,
-  `requireMention`-strict. Do NOT re-open these without reading the
-  bead notes on `ccsc-n7j` first.
+- **Issue #270 / PR #287 (CraigVG, Block Kit replies + button relay):**
+  **SHIPPED** 2026-08-04 (merge `f7e253a`). Path A landed with Craig
+  authorship; Path B cancelled. Conditions 1–4 + design calls verified.
+  Epic `ccsc-n7j` and children settled on merge. Residuals R8–R10
+  accepted in THREAT-MODEL.md — do not re-open the shape without an ADR.
 - **Issue #11 (dedup cache tracking):** stays open by design — no
   evidence-driven action required. Don't close it as "stale."
 - **Issue #247 / `ccsc-ogq` epic (cost-cap + Slack Canvas):** queued,
