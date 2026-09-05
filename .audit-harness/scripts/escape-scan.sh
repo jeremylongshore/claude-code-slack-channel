@@ -28,6 +28,23 @@
 
 set -euo pipefail
 
+# Bash version floor: these gates rely on bash 4+ features. Refuse early with a
+# clear message on bash 3.x (e.g. macOS system bash) instead of failing later
+# with a cryptic syntax error (jcgw).
+[ "${BASH_VERSINFO:-0}" -ge 4 ] || { echo 'audit-harness requires bash >= 4' >&2; exit 3; }
+
+# Cross-platform SHA-256: `sha256sum` ships with GNU coreutils (Linux);
+# macOS only has `shasum -a 256`. Both produce identical `<hash>  <file>`
+# output, so downstream awk parsing is unchanged. Mirrors harness-hash.sh.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256_CMD=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256_CMD=(shasum -a 256)
+else
+  echo "escape-scan: neither sha256sum nor shasum found in PATH" >&2
+  exit 2
+fi
+
 DIFF_SRC=""
 VERIFY_HASH=1
 JSON_OUT=0
@@ -51,7 +68,15 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 case "$1" in
-  -) DIFF_SRC="/dev/stdin" ;;
+  -)
+    # Buffer stdin into a temp file so the diff can be read multiple times.
+    # /dev/stdin is drained by the first grep, which would leave later reads
+    # (notably the input_hash sha256) seeing an empty stream — emitting the
+    # SHA-256 of "" instead of the real diff hash.
+    DIFF_SRC=$(mktemp)
+    trap 'rm -f "$DIFF_SRC"' EXIT
+    cat > "$DIFF_SRC"
+    ;;
   --staged)
     DIFF_SRC=$(mktemp)
     trap 'rm -f "$DIFF_SRC"' EXIT
@@ -88,13 +113,38 @@ COVERAGE_LINE_FLOOR=80
 COVERAGE_BRANCH_FLOOR=70
 MUTATION_FLOOR=70
 TESTING_MD="$ROOT/tests/TESTING.md"
+# The `|| true` on each lookup is LOAD-BEARING, not defensive noise. Under
+# `set -euo pipefail` a grep that matches nothing makes the whole command
+# substitution non-zero, and `set -e` then killed this script MID-LOAD — before
+# a single check ran, with no output, exiting 1. Exit 1 is the documented code
+# for CHALLENGE, so a repo whose tests/TESTING.md omitted any one of these three
+# keys got ZERO escape scanning while appearing to merely warn. That is a
+# silent, total bypass of the gate; a blatant `fail_under` set to 5 sailed through.
+# Same reason for the trailing `|| true` on each guarded assignment: a false
+# `[[ -n ]]` test is the last command in an && list and would trip `set -e` too.
+policy_value() {
+  local raw
+  raw=$(grep -Ei "^[[:space:]]*$1[[:space:]]*:" "$TESTING_MD" 2>/dev/null \
+    | head -1 | sed -E 's/.*:[[:space:]]*([0-9]+).*/\1/' || true)
+  # The sed leaves the line UNCHANGED when it holds no number, so a typo like
+  # `coverage.line: eighty` used to become the "floor". Every later comparison
+  # then died on `[[: invalid arithmetic operator ]]` and the scan finished
+  # REFUSE=0 exit 0 — a fail-OPEN that let a blatant lowered threshold through.
+  # Anything non-numeric is discarded here so the built-in default stands.
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+  else
+    [[ -n "$raw" ]] && echo "[FLAG] tests/TESTING.md: ${1//\\/} is not a number — using the built-in default" >&2
+    printf ''
+  fi
+}
 if [[ -f "$TESTING_MD" ]]; then
-  v=$(grep -Ei '^\s*coverage\.line\s*:' "$TESTING_MD" | head -1 | sed -E 's/.*:\s*([0-9]+).*/\1/')
-  [[ -n "$v" ]] && COVERAGE_LINE_FLOOR="$v"
-  v=$(grep -Ei '^\s*coverage\.branch\s*:' "$TESTING_MD" | head -1 | sed -E 's/.*:\s*([0-9]+).*/\1/')
-  [[ -n "$v" ]] && COVERAGE_BRANCH_FLOOR="$v"
-  v=$(grep -Ei '^\s*mutation\.kill_rate\s*:' "$TESTING_MD" | head -1 | sed -E 's/.*:\s*([0-9]+).*/\1/')
-  [[ -n "$v" ]] && MUTATION_FLOOR="$v"
+  v=$(policy_value 'coverage\.line')
+  if [[ -n "$v" ]]; then COVERAGE_LINE_FLOOR="$v"; fi
+  v=$(policy_value 'coverage\.branch')
+  if [[ -n "$v" ]]; then COVERAGE_BRANCH_FLOOR="$v"; fi
+  v=$(policy_value 'mutation\.kill_rate')
+  if [[ -n "$v" ]]; then MUTATION_FLOOR="$v"; fi
 fi
 
 # Collect only added lines (prefix + but not +++)
@@ -117,8 +167,51 @@ note() {
 check_below_floor() {
   local line="$1" floor="$2"
   local n
-  n=$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1)
+  n=$(printf '%s\n' "$line" | grep -oE '[0-9]+' | head -1 || true)
   [[ -n "$n" ]] && [[ "$n" -lt "$floor" ]]
+}
+
+# Coverage-threshold keys, checked PER KEY rather than "first number on the line".
+#
+# Two bugs this replaces:
+#   1. The old pattern required DOUBLE-QUOTED keys ("lines":<N>), so it caught
+#      package.json but missed jest.config.js — `lines:<N>` unquoted, which is
+#      the standard JS-config shape and the most common Jest form there is.
+#   2. It compared only the FIRST number on the line, so
+#      `{ branches:<hi>, lines:<lo> }` tested the FIRST value, passed, and never looked at the second.
+#      That one bit the quoted form too — the "working" case was also broken.
+#
+# Quotes are now optional — BOTH kinds. `'lines': 50` is valid JS and was still
+# slipping through a double-quote-only class, which is a one-character evasion.
+# EVERY key:value pair on the line is tested, not just the first. The left
+# boundary keeps `max_lines:<N>` from matching the `lines` key.
+# Case-sensitive on purpose: Jest keys are lowercase, so `LINES:` is not a
+# working config and therefore not a successful escape.
+# A bare `lines: 3` is a coverage threshold ONLY inside a coverage config. In
+# ordinary source it is just an object key, and making quotes optional turned
+# `const x = { lines: 3 }` into a REFUSE — a false positive that would block
+# honest commits, which is worse than the gap it closed. A threshold written
+# anywhere else has no effect on coverage and therefore cannot be an escape, so
+# scoping to these filenames loses no real detection.
+is_coverage_config() {
+  case "${1##*/}" in
+    jest.config.*|vitest.config.*|karma.conf.*|nyc.config.*|jest.setup.*) return 0 ;;
+    package.json|.nycrc|.nycrc.*|.c8rc|.c8rc.*) return 0 ;;
+    .coveragerc|setup.cfg|pyproject.toml|pytest.ini|tox.ini) return 0 ;;
+  esac
+  return 1
+}
+
+check_coverage_keys_below_floor() {
+  local line="$1" floor="$2" pair n
+  while IFS= read -r pair; do
+    [[ -z "$pair" ]] && continue
+    n="${pair##*:}"; n="${n//[^0-9]/}"
+    if [[ -n "$n" ]] && [[ "$n" -lt "$floor" ]]; then return 0; fi
+  done < <(printf '%s\n' "$line" \
+      | grep -oE "(^|[^A-Za-z0-9_])[\"']?(branches|lines|functions|statements)[\"']?[[:space:]]*:[[:space:]]*[0-9]+" \
+      || true)
+  return 1
 }
 while IFS= read -r line; do
   if [[ "$line" =~ fail_under[[:space:]]*=[[:space:]]*[0-9] ]] || [[ "$line" =~ --cov-fail-under=[0-9] ]]; then
@@ -126,12 +219,20 @@ while IFS= read -r line; do
       note REFUSE "coverage fail_under lowered below policy floor ($COVERAGE_LINE_FLOOR) — escape attempt"
     fi
   fi
-  if [[ "$line" =~ \"(branches|lines|functions|statements)\"[[:space:]]*:[[:space:]]*[0-9] ]]; then
-    if check_below_floor "$line" "$COVERAGE_LINE_FLOOR"; then
-      note REFUSE "Jest/c8 coverageThreshold lowered below policy floor ($COVERAGE_LINE_FLOOR) — escape attempt"
-    fi
-  fi
 done <<< "$added_lines"
+
+# Coverage-key thresholds are checked PER FILE (see is_coverage_config above),
+# so this pass walks the diff with path context rather than the flat line list.
+while IFS=$'\t' read -r cpath cline; do
+  [[ -z "$cpath" ]] && continue
+  is_coverage_config "$cpath" || continue
+  if check_coverage_keys_below_floor "$cline" "$COVERAGE_LINE_FLOOR"; then
+    note REFUSE "coverageThreshold in $cpath lowered below policy floor ($COVERAGE_LINE_FLOOR) — escape attempt"
+  fi
+done < <(awk '
+  /^\+\+\+ / { p=$2; sub(/^b\//,"",p); next }
+  /^\+[^+]/   { if (p != "" && p != "/dev/null") print p "\t" substr($0,2) }
+' "$DIFF_SRC" || true)
 if echo "$added_lines" | grep -Eq 'coverageThreshold[[:space:]]*:[[:space:]]*0'; then
   note REFUSE "coverageThreshold set to 0 (escape attempt)"
 fi
@@ -198,10 +299,10 @@ if [[ "$JSON_OUT" -eq 1 ]]; then
   elif [[ "$FLAG" -gt 0 ]]; then
     result="ADVISORY"
   fi
-  input_hash=$(sha256sum "$DIFF_SRC" | awk '{print "sha256:"$1}')
+  input_hash=$("${SHA256_CMD[@]}" "$DIFF_SRC" | awk '{print "sha256:"$1}')
   policy_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000"
   if [[ -f "$TESTING_MD" ]]; then
-    policy_hash=$(sha256sum "$TESTING_MD" | awk '{print "sha256:"$1}')
+    policy_hash=$("${SHA256_CMD[@]}" "$TESTING_MD" | awk '{print "sha256:"$1}')
   fi
   printf '{"gate_id":"audit-harness:%s:escape-scan","result":"%s","input_hash":"%s","policy_hash":"%s","metadata":{"refuse":%d,"challenge":%d,"flag":%d,"coverage_line_floor":%d,"coverage_branch_floor":%d,"mutation_floor":%d}' \
     "${AUDIT_HARNESS_SIDE:-ci}" "$result" "$input_hash" "$policy_hash" "$REFUSE" "$CHALLENGE" "$FLAG" \

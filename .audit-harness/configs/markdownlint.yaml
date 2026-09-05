@@ -1,0 +1,41 @@
+# markdownlint base config — shared across the IEP repos.
+#
+# Vendored to a consuming repo at .audit-harness/configs/markdownlint.yaml by
+# install.sh. A consuming repo extends it from its own .markdownlint.yaml:
+#
+#   extends: .audit-harness/configs/markdownlint.yaml
+#   # repo-specific overrides below win over this base
+#
+# Lab-friendly: these repos are spec / methodology / blueprint heavy, so long
+# lines in tables and cross-references are normal. This mirrors the rule choices
+# already established in intent-eval-lab/.markdownlint-cli2.jsonc so the two do
+# not drift.
+
+# Start from markdownlint's full default rule set, then relax the rules that
+# fight long-form spec prose.
+default: true
+
+# MD013 line-length — OFF. Specs use long lines for cross-references and wide
+# tables; wrapping them hurts readability and diffs. (Matches lab config.)
+MD013: false
+
+# MD024 — allow duplicate heading text when the headings live in different
+# sections (siblings_only), e.g. repeated "## Rules" under different parents.
+MD024:
+  siblings_only: true
+
+# MD033 — inline HTML allowed (badges, <details>/<summary>, anchor spans).
+MD033: false
+
+# MD041 — first line need not be an H1 (frontmatter or a banner block may come
+# first).
+MD041: false
+
+# MD007 — unordered-list indent of 2 spaces.
+MD007:
+  indent: 2
+
+# MD026 — allow trailing punctuation in headings, including "?" for FAQ-style
+# headings.
+MD026:
+  punctuation: ".,;:!?"

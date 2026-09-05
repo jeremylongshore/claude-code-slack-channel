@@ -23,6 +23,11 @@
 
 set -euo pipefail
 
+# Bash version floor: these gates rely on bash 4+ features. Refuse early with a
+# clear message on bash 3.x (e.g. macOS system bash) instead of failing later
+# with a cryptic syntax error (jcgw).
+[ "${BASH_VERSINFO:-0}" -ge 4 ] || { echo 'audit-harness requires bash >= 4' >&2; exit 3; }
+
 # Cross-platform SHA-256: `sha256sum` ships with GNU coreutils (Linux);
 # macOS only has `shasum -a 256`. Both produce identical `<hash>  <file>`
 # output, so downstream awk parsing is unchanged.
@@ -50,6 +55,12 @@ done
 set -- "${_filtered_args[@]+"${_filtered_args[@]}"}"
 
 PATTERNS=(
+  # Wall 1: the declared test contract and package-level command surface. A
+  # coverage floor is not protected if an edit can simply replace `npm test`
+  # with a weaker command or remove the CI invocation that enforces it.
+  "TESTING.md"
+  "tests/TESTING.md"
+  "package.json"
   # Wall 1: acceptance
   "features/**/*.feature"
   "features/*.feature"
@@ -66,9 +77,39 @@ PATTERNS=(
   "test/**/*ArchTests.cs"
   "tests/**/*ArchTests.cs"
   # Coverage thresholds (edits to these are escape attempts — hash them)
+  ".c8rc"
   ".c8rc.json"
+  ".nycrc"
+  ".nycrc.json"
+  ".nycrc.yml"
+  ".nycrc.yaml"
+  ".coveragerc"
+  "coverage.toml"
+  "jest.config.js"
+  "jest.config.cjs"
+  "jest.config.mjs"
+  "jest.config.ts"
+  "vitest.config.js"
+  "vitest.config.cjs"
+  "vitest.config.mjs"
+  "vitest.config.ts"
+  "pytest.ini"
+  "pyproject.toml"
+  "setup.cfg"
+  "tox.ini"
   "stryker.conf.json"
   "stryker.config.js"
+  "stryker.config.cjs"
+  "stryker.config.mjs"
+  # Wall 1: primary CI enforcement. Workflow changes are legitimate, but they
+  # must be accompanied by an explicit re-pin so removing a test, race,
+  # mutation, or audit step cannot masquerade as an ordinary source edit.
+  ".github/workflows/*.yml"
+  ".github/workflows/*.yaml"
+  ".gitlab-ci.yml"
+  ".circleci/config.yml"
+  "azure-pipelines.yml"
+  "Jenkinsfile"
 )
 
 # Optional per-repo extra patterns appended from .harness-hash-extra-patterns

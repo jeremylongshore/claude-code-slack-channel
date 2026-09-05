@@ -35,14 +35,27 @@
 #   1 — input JSON malformed or missing required fields
 #   2 — signing requested but cosign not available
 #   3 — Rekor push requested but failed
+#   4 — production DNSSEC/CAA pre-flight FAILED (fail-closed; nothing was signed)
 #
-# CISO gate (per ISEDC v1 Q1, 2026-05-10): pushing to a public transparency log
-# (Rekor) against the predicate URI https://evals.intentsolutions.io/gate-result/v1
-# is BLOCKED until DNSSEC + CAA records are verified on the namespace. The script
-# does NOT enforce this — that is operator discipline. See bead `iel-4zr` in
-# intent-eval-platform/intent-eval-lab/.beads/.
+# CISO gate (per DR-010 Q5 / ISEDC v1 Q1, 2026-05-10): pushing to a PUBLIC
+# transparency log (Rekor) against the predicate URI
+# https://evals.intentsolutions.io/gate-result/v1 is BLOCKED until DNSSEC + CAA
+# records are verified on the namespace. This script ENFORCES that: when a
+# production Rekor push is requested (--rekor-url / non-empty REKOR_URL), it runs
+# scripts/dnssec-check.sh then scripts/caa-check.sh against the predicate
+# namespace and REFUSES to sign (exit 4) if either fails. The gate is read-only —
+# it anchors nothing and can only make signing MORE conservative.
+#
+# Opt-out (NON-PRODUCTION / staging ONLY): EVIDENCE_SKIP_DNS_PREFLIGHT=1 skips the
+# pre-flight. It is honored ONLY when no production Rekor push is requested; a
+# real Rekor push can NEVER be silently skipped.
 
 set -euo pipefail
+
+# Bash version floor: these gates rely on bash 4+ features. Refuse early with a
+# clear message on bash 3.x (e.g. macOS system bash) instead of failing later
+# with a cryptic syntax error (jcgw).
+[ "${BASH_VERSINFO:-0}" -ge 4 ] || { echo 'audit-harness requires bash >= 4' >&2; exit 3; }
 
 INPUT="-"
 OUTPUT=""
@@ -54,6 +67,9 @@ RUNNER_VERSION_OVERRIDE=""
 COMMIT_SHA_OVERRIDE=""
 PREDICATE_URI="https://evals.intentsolutions.io/gate-result/v1"
 STATEMENT_TYPE="https://in-toto.io/Statement/v1"
+# The namespace whose DNSSEC + CAA posture gates production attestations. Derived
+# from the predicate URI host; overridable for testing via EVIDENCE_PREDICATE_DOMAIN.
+PREDICATE_DOMAIN="${EVIDENCE_PREDICATE_DOMAIN:-evals.intentsolutions.io}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -122,9 +138,12 @@ TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 STATEMENT=$(GATE_JSON="$GATE_JSON" PREDICATE_URI="$PREDICATE_URI" STATEMENT_TYPE="$STATEMENT_TYPE" \
   RUNNER="$RUNNER" COMMIT_SHA="$COMMIT_SHA" TIMESTAMP="$TIMESTAMP" \
   python3 - <<'PY'
-import json, os, sys
+import json, os, re, sys
 
 gate = json.loads(os.environ["GATE_JSON"])
+
+# Kernel _common.schema.json#/$defs/semver
+_SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?(\+[A-Za-z0-9.-]+)?$")
 
 required = ["gate_id", "result", "input_hash", "policy_hash"]
 missing = [k for k in required if k not in gate]
@@ -132,20 +151,82 @@ if missing:
     sys.stderr.write(f"emit-evidence: gate-result missing required keys: {missing}\n")
     sys.exit(1)
 
-# Augment predicate with runner-supplied fields
+# Build the canonical gate-result/v1 predicate body (Blueprint B § 7.4 / kernel
+# GateResultV1Schema). The inbound gate JSON is the legacy/draft envelope
+# (gate_id/result/policy_hash/input_hash[/metadata]); map + synthesize the
+# canonical fields. The kernel schema FORBIDS additionalProperties, so the legacy
+# `result`/`timestamp` keys are REPLACED, not augmented. Mirrors the kernel-valid
+# self-gate emitter ci/emit-evidence.ts:buildGateResult.
+metadata = gate.get("metadata") or {}
+
+# result (legacy UPPERCASE) / gate_decision (canonical) -> closed enum.
+_DECISION_MAP = {"pass": "pass", "fail": "fail", "advisory": "advisory", "error": "error"}
+decision_raw = str(gate.get("gate_decision", gate.get("result", ""))).strip().lower()
+gate_decision = _DECISION_MAP.get(decision_raw, "error")
+
+# gate_name: kebab-case short name; fall back to the last ':' segment of gate_id.
+gate_name = gate.get("gate_name") or gate["gate_id"].rsplit(":", 1)[-1]
+
+# gate_version: SemVer; fall back to the runner's semver (<tool>@X.Y.Z). The
+# kernel pattern is strict, so a non-SemVer runner suffix (e.g. '@unknown')
+# degrades to 0.0.0 rather than emitting a row that fails kernel validation.
+gate_version = gate.get("gate_version")
+if not gate_version:
+    _runner = os.environ["RUNNER"]
+    gate_version = _runner.split("@", 1)[1] if "@" in _runner else ""
+if not _SEMVER_RE.match(str(gate_version)):
+    gate_version = "0.0.0"
+
+# gate_reasons: empty array permitted ONLY for unconditional pass; otherwise >=1.
+reasons = gate.get("gate_reasons")
+if not reasons:
+    if gate_decision == "pass":
+        reasons = []
+    else:
+        reasons = [str(metadata.get("reason") or gate.get("failure_mode")
+                       or f"{gate_name}: {gate_decision}")]
+
+# coverage: BOTH arrays REQUIRED. Pass an inbound coverage through only when both
+# keys are present AND lists (a half-populated dict would fail kernel validation);
+# otherwise synthesize. An indeterminate row records the dimension as skipped.
+_cov = gate.get("coverage")
+if (isinstance(_cov, dict)
+        and isinstance(_cov.get("dimensions_evaluated"), list)
+        and isinstance(_cov.get("dimensions_skipped"), list)):
+    coverage = {"dimensions_evaluated": _cov["dimensions_evaluated"],
+                "dimensions_skipped": _cov["dimensions_skipped"]}
+else:
+    _dim = str(metadata.get("kind") or gate_name)
+    if metadata.get("indeterminate"):
+        coverage = {"dimensions_evaluated": [], "dimensions_skipped": [_dim]}
+    else:
+        coverage = {"dimensions_evaluated": [_dim], "dimensions_skipped": []}
+
+# policy_ref: `sha256:<hex>:<path>` — append an artifact/schema path to policy_hash.
+policy_ref = gate.get("policy_ref")
+if not policy_ref:
+    _path = metadata.get("artifact_path") or metadata.get("schema_id") or ".harness-hash"
+    policy_ref = f'{gate["policy_hash"]}:{_path}'
+
 predicate = {
-    "gate_id":     gate["gate_id"],
-    "result":      gate["result"],
-    "policy_hash": gate["policy_hash"],
-    "input_hash":  gate["input_hash"],
-    "timestamp":   os.environ["TIMESTAMP"],
-    "runner":      os.environ["RUNNER"],
-    "commit_sha":  os.environ["COMMIT_SHA"],
+    "gate_id":      gate["gate_id"],
+    "gate_name":    gate_name,
+    "gate_version": gate_version,
+    "gate_decision": gate_decision,
+    "gate_reasons": reasons,
+    "coverage":     coverage,
+    "policy_ref":   policy_ref,
+    "policy_hash":  gate["policy_hash"],
+    "input_hash":   gate["input_hash"],
+    "evaluated_at": os.environ["TIMESTAMP"],
+    "runner":       os.environ["RUNNER"],
+    "commit_sha":   os.environ["COMMIT_SHA"],
 }
 
-# Carry forward optional fields if present
-for opt in ("metadata", "failure_mode", "advisory_severity"):
-    if opt in gate:
+# Carry forward optional canonical fields only (schema forbids unknown keys).
+for opt in ("metadata", "failure_mode", "advisory_severity", "cost_record_ref",
+            "replay_fidelity_level", "coverage_detail"):
+    if gate.get(opt) is not None:
         predicate[opt] = gate[opt]
 
 # Subject naming: subject.name MUST equal predicate.gate_id (SPEC § 6 R8)
@@ -175,16 +256,138 @@ if [[ -z "$STATEMENT" ]]; then
   exit 1
 fi
 
-# --- OTel event (best-effort no-op if collector absent) ---
-# Fire agent.rollout.gate.evaluated per intent-eval-lab/000-docs/001-DR-RFC-...md.
-# We emit a single OTLP-shaped JSON line to stderr when AUDIT_HARNESS_OTEL=1
-# OR an OTEL_EXPORTER_OTLP_ENDPOINT is set. Real exporter wiring is consumer-side;
-# we emit a structured signal that any collector can scrape via stderr capture.
+# --- OTel events (best-effort no-op if collector absent) ---
+# The gate-decision event fires per the NORMATIVE runtime event taxonomy
+# intent-eval-lab/000-docs/067-AT-SPEC-runtime-event-taxonomy-2026-06-12.md § 2.2
+# (GOVERNANCE events, `gate.*`):
+#
+#   1. agent.rollout.gate.evaluated — observability signal fired at the
+#      start/observation of a gate evaluation. NON-NORMATIVE: 067-AT-SPEC closes
+#      the `gate.*` category and does NOT define a gate-evaluated event, so this
+#      carries the legacy raw gate identity + result for collectors that already
+#      scrape it. It is NOT a 067-pinned name and a future taxonomy extension may
+#      retire or rename it; nothing should pin to it. The normative signal is (2).
+#   2. gate.decision.emitted (iah-E07b) — fired at the END of the gate
+#      evaluation. This is the NORMATIVE name from 067-AT-SPEC § 2.2: "a
+#      RolloutGate decision row is emitted under gate-result/v1". Payload per
+#      § 2.2: gate.name (string), gate.decision (enum pass|fail|advisory|error),
+#      gate.policy_ref (string). This is the one a ship-gate dashboard alerts on.
+#
+# ATTRIBUTE-SPELLING AUTHORITY (do NOT redefine here): the canonical attribute
+# names are pinned by the kernel at
+# intent-eval-core/schemas/v1/otel-attributes.yaml — OTel-idiomatic dotted
+# lowercase (e.g. gate.decision). We spell every attribute to match that file.
+# 067-AT-SPEC § 2.2 is the EVENT-NAME authority for gate.decision.emitted and its
+# payload schema; the gate.decision enum {pass, fail, advisory, error} is the
+# closed gate-result/v1 verdict enum (Blueprint B § 7.4 / kernel gate-result
+# schema) — NOT the RolloutGateDecision ship/no_ship vocabulary.
+#
+# We emit OTLP-shaped JSON lines to stderr when AUDIT_HARNESS_OTEL=1 OR an
+# OTEL_EXPORTER_OTLP_ENDPOINT is set. Real exporter wiring is consumer-side; we
+# emit a structured signal any collector can scrape via stderr capture. The path
+# is fully best-effort: a collector being absent is the no-op default, and a
+# python failure (||) degrades to an empty line that is simply not printed —
+# the gate's own exit status is never affected by OTel emission (iah-E07c).
 if [[ "${AUDIT_HARNESS_OTEL:-0}" == "1" ]] || [[ -n "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" ]]; then
-  GATE_ID=$(echo "$GATE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('gate_id',''))" 2>/dev/null || echo "")
-  RESULT=$(echo "$GATE_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',''))" 2>/dev/null || echo "")
-  printf '[OTEL] {"name":"agent.rollout.gate.evaluated","attributes":{"gate.id":"%s","gate.result":"%s","gate.runner":"%s","gate.commit_sha":"%s"},"timestamp":"%s"}\n' \
-    "$GATE_ID" "$RESULT" "$RUNNER" "$COMMIT_SHA" "$TIMESTAMP" >&2
+  # Compose the JSON via python so every attribute value is JSON-escaped.
+  # printf-interpolating gate_id/result/runner into a JSON format string
+  # emitted structurally invalid JSON whenever a value carried a double quote
+  # (e.g. AUDIT_HARNESS_SIDE='ci"injection' flowing into gate_id).
+  OTEL_LINES=$(GATE_JSON="$GATE_JSON" RUNNER="$RUNNER" COMMIT_SHA="$COMMIT_SHA" TIMESTAMP="$TIMESTAMP" \
+    python3 - <<'PY' 2>/dev/null || echo ""
+import json, os
+try:
+    gate = json.loads(os.environ["GATE_JSON"])
+except (json.JSONDecodeError, ValueError):
+    gate = {}
+
+runner = os.environ["RUNNER"]
+commit_sha = os.environ["COMMIT_SHA"]
+timestamp = os.environ["TIMESTAMP"]
+gate_id = str(gate.get("gate_id", ""))
+# The canonical gate-result/v1 verdict field is gate_decision (lowercase enum,
+# Blueprint B § 7.4); the legacy draft envelope used `result` (UPPERCASE). Read
+# the canonical field first, fall back to the legacy field.
+gate_decision_raw = str(gate.get("gate_decision", gate.get("result", "")))
+
+# gate.name / gate.policy_ref per 067-AT-SPEC § 2.2 payload schema. The canonical
+# envelope carries gate_name (kebab-case) + policy_ref; fall back to gate_id /
+# policy_hash for legacy draft envelopes that predate Blueprint B § 7.4.
+gate_name = str(gate.get("gate_name", gate_id))
+policy_ref = str(gate.get("policy_ref", gate.get("policy_hash", "")))
+
+# Map the inbound verdict to the closed gate.decision enum {pass, fail,
+# advisory, error} (gate-result/v1 / kernel gate-result schema). This is the
+# 067-AT-SPEC § 2.2 enum — NOT the RolloutGateDecision ship/no_ship vocabulary.
+# Canonical lowercase values pass straight through; legacy UPPERCASE results map
+# down; an unrecognized/missing verdict is `error` (the gate could not affirm a
+# decision — an error condition, not a clean `fail`).
+_DECISION_MAP = {
+    "pass": "pass",
+    "fail": "fail",
+    "advisory": "advisory",
+    "error": "error",
+}
+decision = _DECISION_MAP.get(gate_decision_raw.strip().lower(), "error")
+# An advisory_severity hint on a non-fail/non-error row signals an advisory row
+# even when the legacy `result` field only said PASS.
+if decision in ("pass",) and gate.get("advisory_severity"):
+    decision = "advisory"
+
+reasons = []
+if decision == "pass":
+    reasons.append(f"gate '{gate_id}' decision: pass")
+else:
+    reasons.append(
+        f"gate '{gate_id}' decision: {decision} "
+        f"(verdict={gate_decision_raw or 'NO_VERDICT'})"
+    )
+fm = gate.get("failure_mode")
+if fm:
+    reasons.append(f"failure_mode: {fm}")
+
+# Event 1: agent.rollout.gate.evaluated (NON-NORMATIVE observability signal;
+# unchanged shape — not a 067-AT-SPEC-pinned name, see header note).
+evaluated = {
+    "name": "agent.rollout.gate.evaluated",
+    "attributes": {
+        "gate.id": gate_id,
+        "gate.result": gate_decision_raw,
+        "gate.runner": runner,
+        "gate.commit_sha": commit_sha,
+    },
+    "timestamp": timestamp,
+}
+
+# Event 2: gate.decision.emitted (iah-E07b) — NORMATIVE per 067-AT-SPEC § 2.2.
+# Payload: gate.name (string) + gate.decision (enum pass|fail|advisory|error) +
+# gate.policy_ref (string). The reasons / runner / commit_sha are additive
+# diagnostic attributes carried for dashboards; they do not contradict the
+# § 2.2 required payload.
+decision_event = {
+    "name": "gate.decision.emitted",
+    "attributes": {
+        "gate.name": gate_name,
+        "gate.decision": decision,
+        "gate.policy_ref": policy_ref,
+        "gate.id": gate_id,
+        "gate.reasons": reasons,
+        "gate.runner": runner,
+        "gate.commit_sha": commit_sha,
+    },
+    "timestamp": timestamp,
+}
+
+for ev in (evaluated, decision_event):
+    print(json.dumps(ev, separators=(",", ":")))
+PY
+)
+  # Print each emitted OTLP line with the [OTEL] marker the collector scrapes.
+  if [[ -n "$OTEL_LINES" ]]; then
+    while IFS= read -r _otel_line; do
+      [[ -n "$_otel_line" ]] && printf '[OTEL] %s\n' "$_otel_line" >&2
+    done <<< "$OTEL_LINES"
+  fi
 fi
 
 # --- Sign + emit ---
@@ -210,6 +413,40 @@ fi
 if ! command -v cosign >/dev/null 2>&1; then
   echo "emit-evidence: --sign requested but cosign is not installed (https://docs.sigstore.dev/cosign/installation/)" >&2
   exit 2
+fi
+
+# --- Production DNSSEC + CAA pre-flight gate (CISO binding DR-010 Q5) ----------
+# A "production" signing event is one that pushes a signed Statement to a PUBLIC
+# transparency log (Rekor) — i.e. REKOR_URL is non-empty. Before that irreversible
+# anchor, the predicate namespace MUST be DNSSEC-signed AND CAA-pinned. We run the
+# two read-only checks; if EITHER fails we REFUSE to sign and exit 4.
+#
+# The opt-out EVIDENCE_SKIP_DNS_PREFLIGHT=1 is honored ONLY for non-production
+# (no Rekor push). A real Rekor push can never be silently skipped.
+if [[ -n "$REKOR_URL" ]]; then
+  PREFLIGHT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  if [[ "${EVIDENCE_SKIP_DNS_PREFLIGHT:-0}" == "1" ]]; then
+    echo "emit-evidence: IGNORING EVIDENCE_SKIP_DNS_PREFLIGHT=1 — a Rekor push (REKOR_URL=$REKOR_URL) is a production attestation and CANNOT skip the DNSSEC/CAA pre-flight." >&2
+  fi
+  echo "emit-evidence: production Rekor push requested — running DNSSEC + CAA pre-flight on '$PREDICATE_DOMAIN'" >&2
+
+  if ! bash "$PREFLIGHT_DIR/dnssec-check.sh" "$PREDICATE_DOMAIN" >&2; then
+    echo "emit-evidence: REFUSING TO SIGN — DNSSEC pre-flight FAILED for '$PREDICATE_DOMAIN'." >&2
+    echo "emit-evidence: remediation: pin DNSSEC + CAA on $PREDICATE_DOMAIN before any production attestation." >&2
+    echo "emit-evidence:   see intent-eval-platform/intent-eval-lab/000-docs (DR-010 Q5 CISO binding) + the iah-E06 runbook." >&2
+    exit 4
+  fi
+  if ! bash "$PREFLIGHT_DIR/caa-check.sh" "$PREDICATE_DOMAIN" >&2; then
+    echo "emit-evidence: REFUSING TO SIGN — CAA pre-flight FAILED for '$PREDICATE_DOMAIN'." >&2
+    echo "emit-evidence: remediation: pin DNSSEC + CAA on $PREDICATE_DOMAIN before any production attestation." >&2
+    echo "emit-evidence:   set EXPECTED_CAA_ISSUER to the published CA, then publish a CAA record pinning it." >&2
+    exit 4
+  fi
+  echo "emit-evidence: DNSSEC + CAA pre-flight PASSED for '$PREDICATE_DOMAIN' — proceeding to sign." >&2
+elif [[ "${EVIDENCE_SKIP_DNS_PREFLIGHT:-0}" == "1" ]]; then
+  # Non-production sign (no Rekor push) with the explicit opt-out set: keep
+  # existing staging flows green without running the network-bound checks.
+  echo "emit-evidence: non-production sign (no Rekor push); DNSSEC/CAA pre-flight skipped per EVIDENCE_SKIP_DNS_PREFLIGHT=1." >&2
 fi
 
 # Stage the Statement to a temp file for cosign to consume
