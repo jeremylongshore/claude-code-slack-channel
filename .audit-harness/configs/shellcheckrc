@@ -1,0 +1,27 @@
+# shellcheck base config — shared across the IEP repos.
+#
+# Vendored to a consuming repo at .audit-harness/configs/shellcheckrc by
+# install.sh. shellcheck has no first-class `extends`: a consuming repo's own
+# .shellcheckrc is the small superset. Copy the directives you want from this
+# reference shape into the repo-root .shellcheckrc and add repo-specific lines;
+# keep the codes in sync via PR review.
+#
+# Conventions mirrored from the audit-harness repo's own scripts (which lint
+# clean under the pinned shellcheck in .github/workflows/ci.yml): follow sourced
+# files, default to bash, and do NOT globally silence real checks — the scripts
+# carry per-line `# shellcheck disable=SCxxxx  # reason` directives instead.
+
+# Follow `source`/`.` into sibling files so cross-file checks work (e.g. a
+# script that sources a shared lib). Off by default in shellcheck; the IEP
+# scripts rely on it being on.
+external-sources=true
+
+# These repos are bash (not POSIX sh / dash). Setting the dialect here keeps
+# bashisms from being flagged in files that lack a shebang.
+shell=bash
+
+# NOTE: no global `disable=` lines on purpose. Suppress a specific finding at
+# its site with a per-line directive carrying a justification, e.g.:
+#   # shellcheck disable=SC2016  # single quotes are intentional (no expansion)
+# A repo that genuinely needs a project-wide exception adds it to its OWN
+# .shellcheckrc with a comment — never to this shared base.

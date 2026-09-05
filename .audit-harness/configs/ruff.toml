@@ -1,0 +1,27 @@
+# ruff base config — shared across the IEP repos.
+#
+# Vendored to a consuming repo at .audit-harness/configs/ruff.toml by install.sh.
+# A consuming repo extends it from its own ruff.toml (or pyproject.toml):
+#
+#   # ruff.toml
+#   extend = ".audit-harness/configs/ruff.toml"
+#   line-length = 100   # repo-specific overrides win over this base
+#
+# This mirrors the rule choices in the audit-harness repo's own top-level
+# ruff.toml so the shared base and the repo that produces it do not drift.
+
+# Modern Python default; PEP-8's 79 is too narrow for IEP naming conventions.
+line-length = 120
+
+# Conservative floor — the oldest interpreter any IEP Python wrapper targets.
+# Consumers on a newer floor can override with their own `target-version`.
+target-version = "py38"
+
+[lint]
+# Permissive base ruleset; ratchet up per-repo as the codebase warrants:
+#   B — flake8-bugbear   (Python-specific bugs: mutable default args, etc.)
+#   E — pycodestyle      (syntax-level style errors)
+#   F — pyflakes         (dead imports, unused variables)
+# Add I (import order), UP (pyupgrade), etc. in a per-repo ratchet — never
+# silence by editing this shared base.
+select = ["B", "E", "F"]
