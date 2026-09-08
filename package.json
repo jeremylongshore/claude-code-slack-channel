@@ -9,7 +9,7 @@
     "start:node": "npx tsx server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "prepare": "husky"
+    "hooks:install": "husky"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
