@@ -8,7 +8,7 @@ compatibility: Requires Claude Code with the slack-channel plugin and a Slack ap
 tags: [slack, tokens, configuration, security]
 user-invocable: true
 argument-hint: "<bot-token> <app-token>"
-allowed-tools: [Write, "Bash(chmod:*)", "Bash(mkdir:*)", "Bash(mv:*)"]
+allowed-tools: [Write, "Bash(chmod:*)", "Bash(mkdir:*)", "Bash(mv:*)", "Bash(rm:*)"]
 model: inherit
 effort: medium
 ---
@@ -69,10 +69,13 @@ rotating, revoking, or diagnosing either token type.
    Usage: /slack-channel:configure xoxb-... xapp-...
    ```
 
-3. Create the state directory if it doesn't exist:
+3. Create the state directory if it doesn't exist, then make the directory
+   owner-only **before writing any secret-bearing file**:
 
-   ```
-   ~/.claude/channels/slack/
+   ```bash
+   mkdir -p ~/.claude/channels/slack
+   # 0700 = owner may read/write/traverse; no group or other access
+   chmod 700 ~/.claude/channels/slack
    ```
 
 4. Write the complete candidate to
@@ -83,7 +86,10 @@ rotating, revoking, or diagnosing either token type.
    SLACK_APP_TOKEN=<app-token>
    ```
 
-5. Set the candidate file to owner-only, then atomically replace `.env`:
+5. Set the candidate file to owner-only, then atomically replace `.env`. If
+   `Write`, `chmod`, or `mv` fails before replacement, remove only the exact
+   candidate path `~/.claude/channels/slack/.env.tmp`; leave the prior `.env`
+   untouched.
 
    ```bash
    # 0600 = owner read/write; no group or other access
@@ -122,8 +128,9 @@ rotating, revoking, or diagnosing either token type.
   first.
 - **Existing `.env`** — re-running atomically replaces it; this is the
   supported token-rotation path (rotation happens at api.slack.com/apps).
-- **Write, permission, or move failure** — leave the previous `.env` intact,
-  remove no files, and report only the failed stage without printing values.
+- **Write, permission, or move failure** — remove only the fixed candidate
+  `~/.claude/channels/slack/.env.tmp`, leave the previous `.env` intact, and
+  report only the failed stage without printing values.
 - **Revoked/invalid tokens** — this skill only validates prefixes, not
   liveness. If the server later fails auth, run
   `/slack-channel:install doctor` (checks 4–5 test both tokens live against
@@ -145,7 +152,15 @@ Both flows are the same command — the second run simply overwrites `.env`:
 
 - Never echo the tokens back in the confirmation message
 - Never log tokens to stdout or any file other than `.env`
+- Secure the state directory as `0700` before writing the candidate
 - Always set `0600` on the candidate before atomically moving it into place
+
+## Safety justification
+
+`rm` is permitted only to clean the single fixed candidate path
+`~/.claude/channels/slack/.env.tmp` after a failed rotation. Never pass a
+variable, glob, directory, recursive flag, or any other path to `rm`; never
+remove the previous `.env`.
 
 ## Resources
 
