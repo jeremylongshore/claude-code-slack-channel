@@ -8,7 +8,7 @@ compatibility: Requires Claude Code with the slack-channel plugin and a Slack ap
 tags: [slack, tokens, configuration, security]
 user-invocable: true
 argument-hint: "<bot-token> <app-token>"
-allowed-tools: [Write, "Bash(chmod:*)", "Bash(mkdir:*)", "Bash(mv:*)", "Bash(rm:*)"]
+allowed-tools: [Write, "Bash(chmod:*)", "Bash(install:*)", "Bash(mkdir:*)", "Bash(mv:*)", "Bash(rm:*)"]
 model: inherit
 effort: medium
 ---
@@ -78,8 +78,16 @@ rotating, revoking, or diagnosing either token type.
    chmod 700 ~/.claude/channels/slack
    ```
 
-4. Write the complete candidate to
-   `~/.claude/channels/slack/.env.tmp`:
+4. Pre-create the fixed candidate path with owner-only permissions, then use
+   `Write` to replace its complete contents. This makes the file `0600` from
+   the instant it exists, independent of the process umask:
+
+   ```bash
+   # 0600 = owner read/write; no group or other access
+   install -m 600 /dev/null ~/.claude/channels/slack/.env.tmp
+   ```
+
+   Write this complete content to `~/.claude/channels/slack/.env.tmp`:
 
    ```
    SLACK_BOT_TOKEN=<bot-token>
