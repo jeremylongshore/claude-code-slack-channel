@@ -12,6 +12,23 @@
 
 set -euo pipefail
 
+# Bash version floor: these gates rely on bash 4+ features. Refuse early with a
+# clear message on bash 3.x (e.g. macOS system bash) instead of failing later
+# with a cryptic syntax error (jcgw).
+[ "${BASH_VERSINFO:-0}" -ge 4 ] || { echo 'audit-harness requires bash >= 4' >&2; exit 3; }
+
+# Cross-platform SHA-256: `sha256sum` ships with GNU coreutils (Linux);
+# macOS only has `shasum -a 256`. Both produce identical `<hash>  <file>`
+# output, so downstream awk parsing is unchanged. Mirrors harness-hash.sh.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256_CMD=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256_CMD=(shasum -a 256)
+else
+  echo "bias-count: neither sha256sum nor shasum found in PATH" >&2
+  exit 2
+fi
+
 JSON_OUT=0
 TEST_DIR="tests"
 
@@ -36,7 +53,7 @@ if [ ! -d "$TEST_DIR" ]; then
 fi
 
 # Hash the test directory tree as the "input"
-INPUT_HASH=$(find "$TEST_DIR" -type f \( -name "*.py" -o -name "*.ts" -o -name "*.js" -o -name "*.tsx" -o -name "*.jsx" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.kt" -o -name "*.cs" -o -name "*.php" -o -name "*.rb" \) -exec sha256sum {} + 2>/dev/null | sort | sha256sum | awk '{print "sha256:"$1}')
+INPUT_HASH=$(find "$TEST_DIR" -type f \( -name "*.py" -o -name "*.ts" -o -name "*.js" -o -name "*.tsx" -o -name "*.jsx" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.kt" -o -name "*.cs" -o -name "*.php" -o -name "*.rb" \) -exec "${SHA256_CMD[@]}" {} + 2>/dev/null | sort | "${SHA256_CMD[@]}" | awk '{print "sha256:"$1}')
 
 if [[ "$JSON_OUT" -eq 1 ]]; then
   exec 3>&1   # save stdout for the JSON object
@@ -54,7 +71,11 @@ count_pattern() {
   local label="$1"
   local pattern="$2"
   local count
-  count=$(grep -rn "$pattern" "$TEST_DIR" 2>/dev/null | wc -l)
+  # `|| true`: under pipefail a zero-match grep exits 1, which killed the whole
+  # scan mid-report (truncated output, exit 1) on any clean directory — the
+  # "gate that looks like it ran" failure class from 1.3.1. wc's count is
+  # captured either way.
+  count=$(grep -rn "$pattern" "$TEST_DIR" 2>/dev/null | wc -l) || true
   TOTAL_BIAS=$((TOTAL_BIAS + count))
   printf "  %-30s %d\n" "$label" "$count"
 }
@@ -71,13 +92,20 @@ count_pattern "Symmetric input (1,1)" "(1, 1)"
 count_pattern "Symmetric input (100,100)" "(100, 100)"
 count_pattern "Range-only assertion" "assert.*<=.*<="
 count_pattern 'Substring check (in str)' '" in '
+# Source-introspection tests: a test whose evidence is reading the
+# implementation source (inspect.getsource, reading files under src/) instead
+# of asserting observable behaviour of a public interface. Deterministic
+# counterpart of the prose rule in auto-remediation.md; advisory like every
+# other bias pattern here (promotion to blocking goes through fp-rate).
+count_pattern "Source-introspection (getsource)" "inspect\.getsource\|getsource("
+count_pattern "Source-read test (src/ file)" "readFileSync([^)]*src/\|open([^)]*['\"]src/"
 echo
 
-# Count test functions
-TEST_COUNT=$(grep -rn "def test_\|it('\|it(\"\\|test('\|test(\"" "$TEST_DIR" 2>/dev/null | wc -l)
+# Count test functions (`|| true` — see count_pattern)
+TEST_COUNT=$(grep -rn "def test_\|it('\|it(\"\\|test('\|test(\"" "$TEST_DIR" 2>/dev/null | wc -l) || true
 
-# Count total assertions
-ASSERT_COUNT=$(grep -rn "assert\b\|assertEqual\|expect(" "$TEST_DIR" 2>/dev/null | wc -l)
+# Count total assertions (`|| true` — see count_pattern)
+ASSERT_COUNT=$(grep -rn "assert\b\|assertEqual\|expect(" "$TEST_DIR" 2>/dev/null | wc -l) || true
 
 # Assertion density
 if [ "$TEST_COUNT" -gt 0 ]; then

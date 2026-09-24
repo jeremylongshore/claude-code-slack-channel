@@ -17,6 +17,24 @@
 
 set -euo pipefail
 
+# Bash version floor: these gates rely on bash 4+ features. Refuse early with a
+# clear message on bash 3.x (e.g. macOS system bash) instead of failing later
+# with a cryptic syntax error (jcgw).
+[ "${BASH_VERSINFO:-0}" -ge 4 ] || { echo 'audit-harness requires bash >= 4' >&2; exit 3; }
+
+# Cross-platform SHA-256: `sha256sum` ships with GNU coreutils (Linux);
+# macOS only has `shasum -a 256`. Both produce identical `<hash>  <file>`
+# output, so downstream awk parsing is unchanged. Same pattern as
+# harness-hash.sh / escape-scan.sh / bias-count.sh.
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256_CMD=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256_CMD=(shasum -a 256)
+else
+  echo "arch-check: neither sha256sum nor shasum found in PATH" >&2
+  exit 2
+fi
+
 ROOT="${ROOT:-$(pwd)}"
 JSON_OUT=0
 REPORT_DIR="${ROOT}/reports/arch"
@@ -51,12 +69,12 @@ emit_result() {
     local policy_hash="sha256:0000000000000000000000000000000000000000000000000000000000000000"
     # Best-effort: input_hash is the source tree fingerprint when running against ROOT/src
     if [[ -d "${ROOT}/src" ]]; then
-      input_hash=$(find "${ROOT}/src" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.kt" -o -name "*.cs" -o -name "*.php" \) -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print "sha256:"$1}')
+      input_hash=$(find "${ROOT}/src" -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.kt" -o -name "*.cs" -o -name "*.php" \) -exec "${SHA256_CMD[@]}" {} \; 2>/dev/null | sort | "${SHA256_CMD[@]}" | awk '{print "sha256:"$1}')
     fi
     # Hash the architecture rule config (whichever tool's config was used)
     for cfg in .dependency-cruiser.js .dependency-cruiser.cjs .importlinter deptrac.yaml arch-go.yml; do
       if [[ -f "${ROOT}/${cfg}" ]]; then
-        policy_hash=$(sha256sum "${ROOT}/${cfg}" | awk '{print "sha256:"$1}')
+        policy_hash=$("${SHA256_CMD[@]}" "${ROOT}/${cfg}" | awk '{print "sha256:"$1}')
         break
       fi
     done

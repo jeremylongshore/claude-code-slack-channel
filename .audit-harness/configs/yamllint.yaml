@@ -1,0 +1,52 @@
+# yamllint base config — shared across the IEP repos.
+#
+# Vendored to a consuming repo at .audit-harness/configs/yamllint.yaml by
+# install.sh. A consuming repo extends it from its own .yamllint.yaml:
+#
+#   extends: .audit-harness/configs/yamllint.yaml
+#   rules:
+#     # repo-specific overrides below win over this base
+#     line-length:
+#       max: 140
+#
+# Tuned for GitHub Actions workflow YAML + polyglot manifests: 2-space indent
+# (matches .editorconfig), no required document-start marker, and a relaxed
+# line-length because `uses:` refs and `curl ... | tar` one-liners run long.
+
+extends: default
+
+rules:
+  # 2-space indent, matching .editorconfig [*.{yml,yaml}]. `indent-sequences:
+  # consistent` lets a file pick block- or in-line-style sequences as long as it
+  # stays consistent within itself.
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+
+  # Workflow files rarely carry a leading `---`; don't require it.
+  document-start: disable
+
+  # Long `uses:` refs, pinned action SHAs, and shell one-liners in `run:` blocks
+  # routinely exceed 80 cols. Warn (don't error) past 120 so genuine runaway
+  # lines still surface without gating the workflow YAML everyone already writes.
+  line-length:
+    max: 120
+    level: warning
+    allow-non-breakable-words: true
+    allow-non-breakable-inline-mappings: true
+
+  # GitHub Actions uses `on:` as a key; yamllint's truthy check otherwise flags
+  # it as the boolean `on`. Allow the documented GHA truthy tokens.
+  truthy:
+    allowed-values: ["true", "false", "on", "off"]
+    check-keys: false
+
+  # Comments: require a space after `#`, but allow inline comments closer than
+  # the default 2 spaces (we use single-space inline comments throughout).
+  comments:
+    require-starting-space: true
+    min-spaces-from-content: 1
+
+  # Trailing empty lines / spaces are caught by .editorconfig + git; keep the
+  # newline-at-EOF check on (matches insert_final_newline = true).
+  new-line-at-end-of-file: enable
