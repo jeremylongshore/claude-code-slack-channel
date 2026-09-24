@@ -39,10 +39,12 @@ but are actually unstated prerequisites:
    open the channel → channel name → Integrations → Add an App → select the bot.
 2. **Bun must be installed.** README Option B falls back to Node.js via npx,
    but requires editing `.mcp.json`. Default path is Bun; install from https://bun.sh.
-3. **Claude Code v2.1.80+ with `claude.ai` login is required.** This is a
-   Research Preview constraint — API-key-only auth does not work for Channels.
-   If a user has `ANTHROPIC_API_KEY` set and no `claude.ai` session, the
-   plugin fails to load with a non-obvious error.
+3. **Claude Code must support Channels and use a supported Anthropic login.**
+   The current Channels contract accepts either a `claude.ai` account or an
+   Anthropic Console API key. Team and Enterprise organizations must also have
+   Channels enabled by an Owner or through managed settings. Channels are not
+   available through Bedrock, Google Cloud's Agent Platform, or Microsoft
+   Foundry; do not misdiagnose those platform limits as a Slack token failure.
 
 ## Build / test / dev commands
 
