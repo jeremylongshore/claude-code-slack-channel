@@ -49,7 +49,8 @@ but are actually unstated prerequisites:
 ## Build / test / dev commands
 
 ```bash
-bun install                                              # Install deps
+bun install                                              # Install deps (no lifecycle hook mutation)
+bun run hooks:install                                    # Explicitly install maintainer Git hooks
 bun run typecheck                                        # tsc --noEmit
 bun test --timeout 15000                                 # Full suite (~1170 tests)
 bun test server.test.ts                                  # Unit + integration suite
