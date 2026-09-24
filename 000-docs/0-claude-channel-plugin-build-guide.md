@@ -428,9 +428,10 @@ Five defense layers required for chat channel plugins:
 
 ## Research Preview Constraints
 
-- Channels require Claude Code v2.1.80+
-- Requires claude.ai login (no API key auth)
+- Channels require a current Claude Code build with Channels support
+- Authentication may use a claude.ai account or an Anthropic Console API key
 - Team/Enterprise orgs must enable `channelsEnabled` in managed settings
+- Channels are unavailable through Bedrock, Google Cloud Agent Platform, and Microsoft Foundry
 - `--channels` only accepts plugins from Anthropic's allowlist
 - Custom channels use `--dangerously-load-development-channels` for testing
 - Protocol contract may change during preview
