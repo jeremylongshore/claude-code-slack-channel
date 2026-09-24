@@ -44,6 +44,7 @@ Bun ≥ 1.0, Claude Code ≥ v2.1.80, `claude.ai` login.
 git clone https://github.com/jeremylongshore/claude-code-slack-channel.git
 cd claude-code-slack-channel
 bun install
+bun run hooks:install # Explicitly enable the repository's Husky quality gates
 bun run typecheck   # sanity check
 bun test            # 986+ tests should pass green
 ```
