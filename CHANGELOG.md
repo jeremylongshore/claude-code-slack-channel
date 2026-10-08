@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency advisories cleared (#298).** `@modelcontextprotocol/sdk` 1.29.0 → 1.32.1 (GHSA-6qxp-vccf-f47h, OAuth client credential redirection; not used by this server). The `axios` override floor `^1.18.1` → `^1.20.0` closes 7 high advisories in `@slack/web-api`'s HTTP client, including redirect-based SSRF (GHSA-r4gj-5m52-g5wh). A new `proxy-addr` `^2.0.8` floor clears a critical advisory on the SDK → express path. `bun audit --audit-level=high` is clean again.
+
 ### Docs
 
 - **All four public operator skills refreshed for the current Claude Code Channels contract** (`ccsc-7l9`). `access`, `configure`, `install`, and `policy` now document both supported Claude authentication paths (claude.ai or Anthropic Console API key), the organization-policy requirement, unsupported hosted-provider environments, exact Slack token roles, rollback paths, and security boundaries. Each skill is versioned `1.1.0`, scores Grade A under the marketplace rubric, and passes the Tier-2 production gate. The plugin manifest now matches release `0.12.0` and carries the marketplace-tier homepage/commands fields. The dependency lock also lifts transitive `fast-uri` and `browserslist` to patched releases so the existing high-severity audit gate remains green.

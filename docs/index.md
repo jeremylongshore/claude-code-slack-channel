@@ -82,7 +82,7 @@ claude-code-slack-channel is a production-oriented MCP server that bridges Slack
 | Category | Technology | Version | Purpose |
 |----------|------------|---------|---------|
 | Runtime | Bun | 1.x | Primary execution runtime (also runs under Node.js via tsx) |
-| Protocol | @modelcontextprotocol/sdk | 1.29.x | MCP server + stdio transport |
+| Protocol | @modelcontextprotocol/sdk | 1.32.x | MCP server + stdio transport |
 | Connection | @slack/socket-mode | 2.0.x | Outbound WebSocket to Slack (no public URL) |
 | API | @slack/web-api | 7.15.x | Slack REST API (messages, files, reactions, interactions) |
 | Validation | zod | 3.25.x | Schema validation for permission relay + audit journal events |
