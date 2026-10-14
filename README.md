@@ -1,5 +1,11 @@
 # claude-code-slack-channel v0.12.0
 
+<!-- intent-select-partner:start -->
+<p><a href="https://intentsolutions.io/"><img src="https://raw.githubusercontent.com/intent-solutions-io/.github/b82af5d3e7951d85e39ea9e65cc24ee8278722a7/assets/brand/claude-select-partner.svg" alt="Intent Solutions: Claude Partner Network Select Services Partner" width="300" height="95" /></a></p>
+
+Intent Solutions is a Claude Partner Network Select Services Partner.
+<!-- intent-select-partner:end -->
+
 The Slack-native governance substrate for Claude Code — the kernel other governance tooling builds on. Humans, Claude Code sessions, and peer agents converse safely in shared channels: every tool call passes through a declarative, tier-aware policy engine; every decision lands in a hash-chained, **Ed25519-signed** audit journal you can verify offline. Per-thread session isolation, identity-aware permission gates, operator admin commands with cross-channel approval, multi-agent loop control + backpressure, **lease-fenced sessions that survive a process crash with loss-proof reply delivery**, and defense-in-depth against prompt injection. The policy/journal/relay kernel here is the substrate that the companion **[agent-governance-plane (AGP)](#companion-tooling)** reimplements for cross-runtime governance.
 
 [![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
