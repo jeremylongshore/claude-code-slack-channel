@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Display-name control cleanup** (`claude-2y7y.6`): `sanitizeDisplayName` now strips C1 controls (U+0080–U+009F, including CSI) alongside C0 and DEL before names enter channel metadata. Regression tests cover every code point in these ranges, control-only names, and ordinary Unicode preservation. This is display-name cleanup, not message-body sanitization or a general prompt-injection defense.
+- **Required audit gate repair**: the lockfile lifts runtime transitive `@slack/web-api` → `axios` → `follow-redirects` from 1.16.0 to 1.16.1, resolving GHSA-q3jh-wrc6-jgq8 and GHSA-8r9p-f939-6h3c. The existing dependency ranges and audit exceptions are unchanged.
+
 - **Dependency advisories cleared (#298).** `@modelcontextprotocol/sdk` 1.29.0 → 1.32.1 (GHSA-6qxp-vccf-f47h, OAuth client credential redirection; not used by this server). The `axios` override floor `^1.18.1` → `^1.20.0` closes 7 high advisories in `@slack/web-api`'s HTTP client, including redirect-based SSRF (GHSA-r4gj-5m52-g5wh). A new `proxy-addr` `^2.0.8` floor clears a critical advisory on the SDK → express path. `bun audit --audit-level=high` is clean again.
 
 ### Docs
