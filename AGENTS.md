@@ -10,7 +10,8 @@ If you are an AI assistant helping a user with this repo, read this file FIRST.
 ## What this repo is
 
 CCSC is a two-way Slack ↔ Claude Code bridge via Slack Socket Mode and MCP stdio.
-A local TypeScript MCP server (Bun runtime) speaks Socket Mode to Slack and the
+A local TypeScript MCP server (Bun for source development, bundled Node.js >= 20
+for copied-plugin execution) speaks Socket Mode to Slack and the
 Model Context Protocol over stdio to a Claude Code session. The whole codebase
 is a security substrate: every inbound message passes a five-layer prompt-injection
 defense, every tool call is gated by a declarative policy engine, and every
@@ -37,8 +38,9 @@ but are actually unstated prerequisites:
    because DMs auto-route, but a channel test message will hit silence because
    the bot literally isn't in the channel to see the event. Fix: in Slack,
    open the channel → channel name → Integrations → Add an App → select the bot.
-2. **Bun must be installed.** README Option B falls back to Node.js via npx,
-   but requires editing `.mcp.json`. Default path is Bun; install from https://bun.sh.
+2. **Node.js >= 20 must be installed.** The copied plugin launches its committed
+   `scripts/slack-channel-runtime.mjs`; no dependency installation or config edit
+   is needed. Bun is required for source development and the existing test suite.
 3. **Claude Code must support Channels and use a supported Anthropic login.**
    The current Channels contract accepts either a `claude.ai` account or an
    Anthropic Console API key. Team and Enterprise organizations must also have
@@ -51,6 +53,8 @@ but are actually unstated prerequisites:
 ```bash
 bun install                                              # Install deps (no lifecycle hook mutation)
 bun run hooks:install                                    # Explicitly install maintainer Git hooks
+node scripts/build-runtime.mjs                           # Rebuild committed distribution
+node scripts/build-runtime.mjs --check                   # Fail on generated artifact drift
 bun run typecheck                                        # tsc --noEmit
 bun test --timeout 15000                                 # Full suite (~1170 tests)
 bun test server.test.ts                                  # Unit + integration suite

@@ -3,6 +3,9 @@
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
   "files": {
     "includes": [
+      "scripts/build-runtime.mjs",
+      "slack-runtime.test.ts",
+      "slack-runtime-build.test.ts",
       "lib.ts",
       "server.ts",
       "policy.ts",

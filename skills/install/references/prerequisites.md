@@ -3,63 +3,30 @@
 Reference for the `install` mode's Step 0. Each check has a
 deterministic detection command and a copy-pasteable recovery.
 
-## 1. Bun ≥ 1.0
-
-**Detect:**
+## 1. Node.js ≥ 20
 
 ```bash
-bun --version
+command -v node
+node --version
 ```
 
-Expected: `1.x.x` or higher. If the command is not found, Bun is not
-installed.
+The version command requires normal approval because the install skill does not
+preapprove Node execution. If Node is missing or older than 20, stop and ask the
+operator to provision a supported Node runtime. Do not install packages or edit
+`.mcp.json` to work around the missing prerequisite.
 
-**Install:**
+The copied plugin launches its committed `scripts/slack-channel-runtime.mjs`
+through Node. It does not depend on local or ancestor `node_modules`, Bun, npx,
+or an install/build lifecycle. The adjacent provenance and full license notices
+identify the distribution inputs. External SOPS/tmux requirements still apply
+when their existing optional audit-signing/admin features are configured.
 
-```bash
-curl -fsSL https://bun.sh/install | bash
-```
+### Source development
 
-After install, restart your shell (or `source ~/.bashrc` / `source ~/.zshrc`)
-and re-run `bun --version` to confirm.
-
-### Node.js fallback
-
-If the user prefers Node.js (or Bun install fails on their platform):
-
-```bash
-node --version    # need ≥ 20.x
-```
-
-Then edit `.mcp.json` in the repo root to change the runner:
-
-```diff
-- "command": "bun",
-- "args": ["server.ts"]
-+ "command": "npx",
-+ "args": ["tsx", "server.ts"]
-```
-
-Run `npm install` (instead of `bun install`) on the next install step.
-Performance is ~2× slower than Bun but functionally identical.
-
-### Docker fallback
-
-If neither Bun nor a recent Node is available:
-
-```bash
-docker --version  # need ≥ 24.x
-docker build -t claude-slack-channel .
-```
-
-Edit `.mcp.json`:
-
-```diff
-- "command": "bun",
-- "args": ["server.ts"]
-+ "command": "docker",
-+ "args": ["run", "--rm", "-i", "-v", "~/.claude/channels/slack:/state", "claude-slack-channel"]
-```
+Maintainers use Bun with `bun install --frozen-lockfile` and `bun server.ts`.
+Rebuild the distribution with `npm run build:runtime`; `npm run check:runtime`
+fails on missing or stale generated files. The Dockerfile is a separate source
+recipe, not a tested installed-plugin fallback in this procedure.
 
 ## 2. Claude Code with Channels support
 
