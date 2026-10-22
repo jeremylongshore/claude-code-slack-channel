@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Copied-plugin startup** (`ccsc-udf`, marketplace `claude-e1mk.10`): the native command uses a committed Node.js >=20 bundle instead of an absent local tsx executable. A pinned build/check records consumed inputs and full dependency notices; isolated copied-tree protocol and failure tests cover startup without dependency installation. The Slack SDK, Channels capabilities, authorization/security primitives, and source-development Bun workflow are unchanged. ws uses its documented portable implementations instead of optional native accelerators. This packages the bridge; it does not configure Slack credentials, grant Channels access, or certify a live round trip.
+
 ### Security
 
 - **Display-name control cleanup** (`claude-2y7y.6`): `sanitizeDisplayName` now strips C1 controls (U+0080–U+009F, including CSI) alongside C0 and DEL before names enter channel metadata. Regression tests cover every code point in these ranges, control-only names, and ordinary Unicode preservation. This is display-name cleanup, not message-body sanitization or a general prompt-injection defense.
