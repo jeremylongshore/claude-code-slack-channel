@@ -62,19 +62,15 @@ If authentication is valid, ask an organization Owner to check **Admin
 settings → Claude Code → Channels**, or inspect managed settings for
 `channelsEnabled`. Do not rotate Slack tokens to fix an Anthropic policy block.
 
-## 4. Bun not installed
+## 4. Node missing or too old
 
-**Symptom**: `bun: command not found` when starting the MCP server.
+**Symptom**: the installed MCP command cannot find `node`, or reports unsupported
+syntax/runtime APIs.
 
-**Fix**:
-
-```bash
-curl -fsSL https://bun.sh/install | bash
-# restart shell, then re-run install
-```
-
-Or fall back to Node.js + edit `.mcp.json` per
-[`references/prerequisites.md`](prerequisites.md#nodejs-fallback).
+With normal tool approval, check `node --version` and require Node.js ≥ 20. Ask
+the operator to provision it if missing; the copied plugin does not install it.
+Do not run npm/Bun installation or rewrite the native command to npx. The shipped
+bundle includes its JavaScript dependencies; Bun is for source development.
 
 ## 5. Wrong file permissions on `.env`
 
@@ -153,7 +149,7 @@ specific `xapp-` token was revoked / deleted.
 
 ## 10. Audit log hash break
 
-**Symptom**: `bun server.ts --verify-audit-log <path>` reports
+**Symptom**: `node scripts/slack-channel-runtime.mjs --verify-audit-log <path>` reports
 `broken at line N`.
 
 **Why**: either a write to the log was lost (rare — filesystem issue,
