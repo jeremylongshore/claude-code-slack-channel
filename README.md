@@ -40,7 +40,7 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
 
 Before step 1, confirm you have:
 
-- **Bun ≥ 1.0** — install with `curl -fsSL https://bun.sh/install | bash`. Node.js / Docker fallbacks are documented in [Option B](#option-b-nodejs--npx) / [Option C](#option-c-docker) below.
+- **Node.js ≥ 20** on PATH — the copied plugin ships its executable JavaScript and dependencies. No package installation or build runs at channel startup. Bun is used for source development, not required for this installed entry.
 - **A current Claude Code build with Channels support** — upgrade through the
   [official install guide](https://code.claude.com/docs/en/setup).
 - **Supported Anthropic authentication** — use either a `claude.ai` account or
@@ -75,34 +75,40 @@ Before step 1, confirm you have:
 
 ### 3. Run
 
-Pick your runtime:
-
 <a id="option-a-bun-recommended"></a>
-#### Option A: Bun (recommended)
-
-```bash
-bun install
-# Current (claude-code-plugins marketplace):
-claude --channels plugin:slack-channel@claude-code-plugins
-```
-
 <a id="option-b-nodejs--npx"></a>
-#### Option B: Node.js / npx
+#### Installed plugin: Node.js
 
 ```bash
-npm install
-# In .mcp.json, change command to: "npx", args: ["tsx", "server.ts"]
+node --version # >= 20
 claude --channels plugin:slack-channel@claude-code-plugins
 ```
+
+The native `.mcp.json` launches `node` with the plugin-root-anchored
+`scripts/slack-channel-runtime.mjs`. It works from an unrelated working directory
+without `node_modules`, `npx`, or an install lifecycle. Slack tokens and Channels
+access are still required; shipping a bundle does not configure or authorize them.
+
+#### Source development: Bun
+
+```bash
+bun install --frozen-lockfile
+bun server.ts
+```
+
+Maintainers rebuild with `npm run build:runtime` and check committed bytes with
+`npm run check:runtime`. The build uses pinned esbuild, includes dependency JSON
+assets and full license texts, and records input hashes in the adjacent provenance
+file. The portable ws implementations are selected instead of optional native
+addons. SOPS for configured audit signing and tmux for configured admin commands
+remain external prerequisites. The bundle does not change either feature's guards.
 
 <a id="option-c-docker"></a>
-#### Option C: Docker
+#### Docker source development
 
-```bash
-docker build -t claude-slack-channel .
-# In .mcp.json, change command to: "docker", args: ["run", "--rm", "-i", "-v", "~/.claude/channels/slack:/state", "claude-slack-channel"]
-claude --channels plugin:slack-channel@claude-code-plugins
-```
+The repository's Dockerfile is a separate source-development recipe. This bundle
+change does not validate or alter that recipe; the installed launch above uses
+Node directly. Do not replace the installed command as part of normal setup.
 
 ### 3.5. Add the bot to your Slack channel
 
@@ -142,7 +148,7 @@ The five silent-failure modes that cover ~95% of fresh-install issues:
    with `claude.ai` or a Console API key. Team and Enterprise Owners must also
    enable Channels; Bedrock, Google Cloud Agent Platform, and Microsoft
    Foundry authentication are not supported for Channels.
-4. **Bun not installed** — `bun: command not found`. Install with `curl -fsSL https://bun.sh/install | bash` or use the Node.js fallback in Option B.
+4. **Node missing or too old** — verify `node --version` is at least 20. The installed command needs Node on PATH; it does not download a runtime or dependencies. Bun remains a source-development requirement only.
 5. **Wrong file permissions on `.env`** — must be `0600`. Run `chmod 0600 ~/.claude/channels/slack/.env`, or run `/slack-channel:install repair`.
 
 Full troubleshooting matrix (10 failure modes): [`skills/install/references/troubleshooting.md`](skills/install/references/troubleshooting.md).
@@ -248,7 +254,7 @@ Every decision the gate makes is journaled to `~/.claude/channels/slack/audit.lo
 
 ```bash
 # Verify a journal end-to-end (hash chain + signatures):
-bun server.ts --verify-audit-log ~/.claude/channels/slack/audit.log
+node scripts/slack-channel-runtime.mjs --verify-audit-log ~/.claude/channels/slack/audit.log
 
 # Operator key lifecycle (Ed25519 over RFC 8785 JCS):
 bun audit-key-cli.ts init       # generate keypair, encrypt private half to .env, print public key

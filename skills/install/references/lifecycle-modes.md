@@ -22,8 +22,10 @@ true` and a `wss://` URL, but never print the URL because it is temporary
    connection material.
 6. `access.json` exists, has mode `0600`, and parses as valid JSON with `jq`.
 7. `allowFrom` contains at least one paired user.
-8. If `audit.log` exists, run `bun server.ts --verify-audit-log PATH` and report
-   the hash-chain result.
+8. If `audit.log` exists, request approval to run
+   `node "${CLAUDE_PLUGIN_ROOT}/scripts/slack-channel-runtime.mjs" --verify-audit-log PATH`
+   and report the hash-chain result. Node is not preapproved by this skill; do
+   not route it through another allowed tool to bypass approval.
 9. Claude Code exposes `--channels`, uses `claude.ai` or Anthropic Console
    authentication, and is not blocked by organization policy.
 10. For each opted-in channel, use Slack `conversations.members` to confirm the

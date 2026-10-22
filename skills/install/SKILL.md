@@ -1,10 +1,10 @@
 ---
 name: install
 description: Detect installation failures and install, verify, repair, reset, or uninstall the CCSC Slack channel. Use when setting up the Slack channel, checking an existing installation, exporting its Slack app manifest, or safely tearing it down. Trigger with "/slack-channel:install", "install the slack channel", "slack channel doctor", or "uninstall the slack channel".
-version: 1.1.0
+version: 1.1.1
 author: Jeremy Longshore <jeremy@intentsolutions.io>
 license: Apache-2.0
-compatibility: Requires a current Claude Code build with Channels support and either claude.ai or Anthropic Console authentication, Bun >= 1.0 (Node.js fallback supported), and a Slack workspace where you can create apps. Doctor mode additionally uses curl and jq.
+compatibility: Requires a current Claude Code build with Channels support and either claude.ai or Anthropic Console authentication, Node.js >= 20 for the bundled entry (Bun for source development), and a Slack workspace where you can create apps. Doctor mode additionally uses curl and jq.
 tags: [slack, mcp, install, doctor, lifecycle]
 user-invocable: true
 argument-hint: "[install | doctor | verify | repair | manifest | reset | tour | uninstall]"
@@ -51,8 +51,8 @@ Delegate token storage to `/slack-channel:configure` and pairing to
 
 Before installation, verify:
 
-1. **Runtime:** Bun 1.0 or newer. Node.js 20+ and Docker 24+ are documented
-   fallbacks.
+1. **Runtime:** Node.js 20 or newer on PATH. The installed plugin ships its
+   runtime bundle; source development separately uses Bun.
 2. **Claude Code:** use a current build whose `claude --help` includes
    `--channels`.
 3. **Anthropic authentication:** use either a `claude.ai` account or an
@@ -95,8 +95,10 @@ Verify current rules in the
 
 ### Step 0: Check prerequisites
 
-Use `command -v`, `bun --version`, `claude --version`, and the installed
-Claude CLI's help/auth surfaces. If a requirement fails, show its documented
+Use `command -v node`, an approved `node --version`, `claude --version`, and
+the installed Claude CLI's help/auth surfaces. Node commands are not preapproved
+by this skill's allowed-tools list; obtain normal tool approval or have the
+operator run them. Do not substitute another allowed executable to bypass approval. If a requirement fails, show its documented
 recovery and stop until the operator resolves it. Do not infer an Anthropic
 policy failure from Slack token state.
 
@@ -133,8 +135,8 @@ token-writing path in this skill.
 
 ### Step 4: Start the channel
 
-From the plugin directory, install dependencies with `bun install`, then start
-a normal registered channel:
+The copied plugin includes `scripts/slack-channel-runtime.mjs`. Do not run a
+package install or rewrite `.mcp.json`; start a normal registered channel:
 
 ```bash
 set -e
@@ -178,7 +180,7 @@ boundaries are:
 
 | Mode        | Permitted implementation surface                                                 |
 | ----------- | -------------------------------------------------------------------------------- |
-| `doctor`    | `Read`, `command`, `curl`, `jq`, `bun`, and `claude`; no writes                  |
+| `doctor`    | `Read`, `command`, `curl`, `jq`, and `claude`; Node checks require approval; no writes                  |
 | `verify`    | `Read` the audit journal for a bounded 30-second observation                     |
 | `repair`    | `chmod`, `mkdir`, `mv`, `date`, and `Write` for an operator-approved replacement |
 | `manifest`  | `Write` one credential-free `slack-app-manifest.json`                            |
