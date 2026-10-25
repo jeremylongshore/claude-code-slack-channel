@@ -18,6 +18,20 @@ import {
   DEFAULT_PEER_BOT_RATE_LIMIT,
 } from './peer-bot-rate-limit.ts'
 
+/** Shared pure fetch-input schema: tests exercise the production boundary. */
+export const FetchMessagesInput = z
+  .object({
+    channel: z.string().min(1),
+    // ADR-005: preserve the prior integer domain; the handler retains its cap.
+    limit: z
+      .number()
+      .positive()
+      .refine(Number.isInteger, { message: 'Expected integer' })
+      .optional(),
+    thread_ts: z.string().optional(),
+  })
+  .strict()
+
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
 // ---------------------------------------------------------------------------

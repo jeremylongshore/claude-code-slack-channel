@@ -64,6 +64,12 @@ string-format and diagnostic changes; no universal equivalence or DoD/STIG
 compliance claim follows. Required local and hosted gates, frozen installs,
 and exact dependency graph review remain release conditions.
 
+The fetch-input schema is shared from `lib.ts` by production and the existing
+S5 tests. Its large-integer acceptance case first fails against the stale test
+copy, then passes against the shared production schema; fraction and zero
+rejection cases continue to pass. This removes that duplicated boundary
+instead of making another test copy agree with the implementation.
+
 ## Rollback
 
 Revert the focused migration through a reviewed PR, restoring its source and
