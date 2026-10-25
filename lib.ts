@@ -617,7 +617,7 @@ export const SessionSchema = z
     createdAt: z.number(),
     lastActiveAt: z.number(),
     ownerId: z.string(),
-    data: z.record(z.unknown()),
+    data: z.record(z.string(), z.unknown()),
     // ccsc-o7x.1.2 — optional crash-recovery marker. Optional so existing
     // session files (written before this field existed) still validate under
     // the outer `.strict()`.
