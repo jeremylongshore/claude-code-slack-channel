@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Validation dependency migration** (`claude-4l09.11`, ADR-005): Zod 4.6.6 and body-parser 2.4.0 replace vulnerable resolutions, including nested SDK/mutation-tool Zod copies. The session data record uses explicit key/value schemas. Journal sequence, policy priority and fetch-message limit retain their legacy integer domain instead of silently acquiring a safe-integer ceiling. Seven bounded migration checks preserve session/outbox, policy, journal and ACP contracts and distinguish patched collection rejection from the old per-item issue accumulation. Diagnostic issue formatting follows Zod 4. No tool, authorization, native configuration or on-disk field/version changes.
+
 - **Display-name control cleanup** (`claude-2y7y.6`): `sanitizeDisplayName` now strips C1 controls (U+0080–U+009F, including CSI) alongside C0 and DEL before names enter channel metadata. Regression tests cover every code point in these ranges, control-only names, and ordinary Unicode preservation. This is display-name cleanup, not message-body sanitization or a general prompt-injection defense.
 - **Required audit gate repair**: the lockfile lifts runtime transitive `@slack/web-api` → `axios` → `follow-redirects` from 1.16.0 to 1.16.1, resolving GHSA-q3jh-wrc6-jgq8 and GHSA-8r9p-f939-6h3c. The existing dependency ranges and audit exceptions are unchanged.
 
