@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "claude-channel-slack",
+      "name": "claude-code-slack-channel",
       "dependencies": {
         "@modelcontextprotocol/sdk": "1.32.1",
         "@slack/socket-mode": "2.0.6",

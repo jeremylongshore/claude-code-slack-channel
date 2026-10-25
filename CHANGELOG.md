@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Package identity** (`claude-2y7y.8`): the package name now matches the repository, `claude-code-slack-channel`. The explicit `bin` map keeps `claude-channel-slack` as an executable alias alongside `claude-code-slack-channel`, both pointing to `server.ts`. The Claude plugin remains `slack-channel`; its commands, MCP server identity, state paths and dependency versions are unchanged. This source change does not publish or rename an npm registry package.
+
 ### Security
 
 - **Validation dependency migration** (`claude-4l09.11`, ADR-005): Zod 4.6.6 and body-parser 2.4.0 replace vulnerable resolutions, including nested SDK/mutation-tool Zod copies. The session data record uses explicit key/value schemas. Journal sequence, policy priority and fetch-message limit retain their legacy integer domain instead of silently acquiring a safe-integer ceiling. Seven bounded migration checks preserve session/outbox, policy, journal and ACP contracts and distinguish patched collection rejection from the old per-item issue accumulation. Diagnostic issue formatting follows Zod 4. No tool, authorization, native configuration or on-disk field/version changes.
