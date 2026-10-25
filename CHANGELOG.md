@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Package identity** (`claude-2y7y.8`): the package name now matches the repository, `claude-code-slack-channel`. The explicit `bin` map keeps `claude-channel-slack` as an executable alias alongside `claude-code-slack-channel`, both pointing to `server.ts`. The Claude plugin remains `slack-channel`; its commands, MCP server identity, state paths and dependency versions are unchanged. This source change does not publish or rename an npm registry package.
+
 ### Security
 
 - **Display-name control cleanup** (`claude-2y7y.6`): `sanitizeDisplayName` now strips C1 controls (U+0080–U+009F, including CSI) alongside C0 and DEL before names enter channel metadata. Regression tests cover every code point in these ranges, control-only names, and ordinary Unicode preservation. This is display-name cleanup, not message-body sanitization or a general prompt-injection defense.

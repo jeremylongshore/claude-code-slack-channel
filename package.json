@@ -1,9 +1,12 @@
 {
-  "name": "claude-channel-slack",
+  "name": "claude-code-slack-channel",
   "version": "0.12.0",
   "description": "Slack channel for Claude Code — two-way chat via Socket Mode",
   "type": "module",
-  "bin": "./server.ts",
+  "bin": {
+    "claude-code-slack-channel": "./server.ts",
+    "claude-channel-slack": "./server.ts"
+  },
   "scripts": {
     "start": "bun install --frozen-lockfile --no-summary && bun server.ts",
     "start:node": "npx tsx server.ts",

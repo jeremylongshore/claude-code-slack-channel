@@ -109,6 +109,11 @@ Tells Claude Code how to spawn the MCP server subprocess.
 
 ### 3. `package.json` — Dependencies and Metadata
 
+The example below illustrates the upstream naming convention. This repository
+uses `claude-code-slack-channel` to match its GitHub identity, with an explicit
+`bin` map retaining `claude-channel-slack` as a compatibility alias. The Claude
+plugin name remains `slack-channel`.
+
 ```json
 {
   "name": "claude-channel-slack",
